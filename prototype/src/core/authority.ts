@@ -1,0 +1,1122 @@
+import { execFileSync } from 'node:child_process';
+import { basename, join } from 'node:path';
+import type {
+  ApprovalDecisionKind,
+  ApprovalRequest,
+  BudgetLedger,
+  DoctorCheck,
+  FileTreeEntry,
+  PatchArtifact,
+  PatchDecisionKind,
+  PlanRevision,
+  ProjectRef,
+  RepositoryHarnessProfile,
+  RepositorySnapshot,
+  RunEventKind,
+  RunStatus,
+  RunView,
+  SubPackageCandidate,
+  TaskSpec,
+  ToolCallResolution,
+  ToolCallView,
+  ToolRisk,
+  VerificationRun,
+} from '@shared/domain';
+import { EMPTY_LEDGER, isTerminal } from '@shared/domain';
+import { sha256 } from '@shared/ids';
+import type { ImportOutcome, PatchExportResult, PlatformError, PushEvent } from '@shared/protocol';
+import { digestOf, newId, nowIso } from '@shared/ids';
+import { AgentCancelled, PlanningFailed, runAgent } from './agent';
+import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
+import { DEFAULT_MUTATION_POLICY } from './mutation';
+import { applyPatchWithGit, sealPatch } from './patch';
+import {
+  type ImportOptions,
+  RepositoryImportError,
+  findSubPackages,
+  importSnapshot,
+  resolveProfile,
+} from './repo';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { EventStore, readJson, writeJsonAtomic } from './store';
+import { PATHS, ensureDataRoot, snapshotDir } from './paths';
+import { compareVerification } from './verify';
+import {
+  MaterializedWorkspace,
+  fileDigestAt,
+  isGeneratedPath,
+  listTree,
+  resolveManaged,
+} from './workspace';
+
+/** 单个文件预览上限；超出只给前面这些字节 */
+const MAX_VIEW_BYTES = 400_000;
+
+const APPROVAL_TTL_MS = 30 * 60 * 1000;
+
+interface ProjectRecord {
+  readonly ref: ProjectRef;
+  /** 宿主绝对路径只存在于这里，永不出现在任何投影里 */
+  readonly hostPath: string;
+}
+
+interface PendingApproval {
+  readonly request: ApprovalRequest;
+  readonly resolve: (decision: ApprovalDecisionKind) => void;
+}
+
+interface RunRecord {
+  view: RunView;
+  readonly task: TaskSpec;
+  readonly snapshot: RepositorySnapshot;
+  readonly profile: RepositoryHarnessProfile;
+  readonly workspace: MaterializedWorkspace;
+  readonly events: EventStore;
+  readonly abort: AbortController;
+  readonly toolCalls: Map<string, ToolCallView>;
+  readonly verifications: VerificationRun[];
+  readonly approvals: Map<string, PendingApproval>;
+  plan: PlanRevision | null;
+  patch: PatchArtifact | null;
+}
+
+export class RunAuthority {
+  private readonly projects = new Map<string, ProjectRecord>();
+  private readonly snapshots = new Map<string, RepositorySnapshot>();
+  private readonly profiles = new Map<string, RepositoryHarnessProfile>();
+  private readonly runs = new Map<string, RunRecord>();
+  private readonly gateway = new ModelGateway();
+
+  constructor(private readonly push: (event: PushEvent) => void) {
+    ensureDataRoot();
+    for (const rec of readJson<ProjectRecord[]>(PATHS.projects, [])) {
+      this.projects.set(rec.ref.projectId, rec);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 请求分发
+  // -------------------------------------------------------------------------
+
+  async handle(method: string, payload: Record<string, unknown>): Promise<unknown> {
+    switch (method) {
+      case 'doctor.run':
+        return { checks: this.doctor() };
+
+      case '__project.register':
+        return { project: this.registerProject(String(payload.hostPath)) };
+
+      case 'project.list':
+        return { projects: [...this.projects.values()].map((p) => p.ref) };
+
+      case 'project.import':
+        return this.importProject(String(payload.projectId), {
+          subPath: payload.subPath ? String(payload.subPath) : undefined,
+        });
+
+      case 'model.listProfiles':
+        return { profiles: this.gateway.listProfiles(), secureStorage: true };
+
+      // Main 解密后注入；Core 只在内存持有，绝不落盘
+      case '__credentials.sync':
+        this.gateway.syncCredentials(payload.keys as Record<string, string>);
+        return { profiles: this.gateway.listProfiles() };
+
+      case 'model.addProvider': {
+        try {
+          this.gateway.addCustomProvider({
+            id: String(payload.id),
+            name: String(payload.name ?? ''),
+            api: String(payload.api),
+            ...(payload.wire ? { wire: payload.wire as 'anthropic' | 'openai' } : {}),
+            ...(Array.isArray(payload.models) ? { models: payload.models as string[] } : {}),
+            ...(payload.doc ? { doc: String(payload.doc) } : {}),
+          });
+        } catch (err) {
+          throw platformError('BAD_REQUEST', (err as Error).message);
+        }
+        return { profiles: this.gateway.listProfiles() };
+      }
+
+      case 'model.removeProvider':
+        this.gateway.removeCustomProvider(String(payload.providerId));
+        return { profiles: this.gateway.listProfiles() };
+
+      case 'model.updateProfile': {
+        this.gateway.updateProfile(String(payload.profileId), {
+          ...(payload.modelId !== undefined ? { modelId: String(payload.modelId) } : {}),
+          ...(payload.baseUrlOverride !== undefined
+            ? { baseUrlOverride: String(payload.baseUrlOverride) }
+            : {}),
+        });
+        return { profiles: this.gateway.listProfiles() };
+      }
+
+      case 'model.testProfile': {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 30_000);
+        try {
+          return await this.gateway.testProfile(String(payload.profileId), ac.signal);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      case 'task.create':
+        return this.createTask(payload as never);
+
+      case 'run.get':
+        return { run: this.runs.get(String(payload.runId))?.view ?? null };
+
+      case 'run.list':
+        return {
+          runs: [...this.runs.values()]
+            .map((r) => r.view)
+            .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)),
+        };
+
+      case 'run.events': {
+        const rec = this.require(String(payload.runId));
+        return { events: rec.events.after(Number(payload.afterSeq ?? 0)) };
+      }
+
+      case 'run.toolCalls': {
+        const rec = this.require(String(payload.runId));
+        return { toolCalls: [...rec.toolCalls.values()] };
+      }
+
+      case 'run.cancel':
+        return { run: this.cancel(String(payload.runId), String(payload.reason ?? '用户取消')) };
+
+      case 'plan.get':
+        return { plan: this.runs.get(String(payload.runId))?.plan ?? null };
+
+      case 'approval.pending': {
+        const rec = this.require(String(payload.runId));
+        return { approvals: [...rec.approvals.values()].map((a) => a.request) };
+      }
+
+      case 'approval.decide':
+        return this.decideApproval(payload as never);
+
+      case 'patch.get':
+        return { patch: this.runs.get(String(payload.runId))?.patch ?? null };
+
+      case 'patch.decide':
+        return this.decidePatch(payload as never);
+
+      case 'verification.list': {
+        const rec = this.require(String(payload.runId));
+        return { verifications: rec.verifications };
+      }
+
+      case 'files.tree':
+        return this.fileTree(String(payload.snapshotId), payload.runId ? String(payload.runId) : null);
+
+      case 'files.read':
+        return this.readFile(
+          String(payload.snapshotId),
+          String(payload.path),
+          payload.runId ? String(payload.runId) : null,
+        );
+
+      // Main 需要补丁正文来存文件 / 写剪贴板；这两件事是原生能力，由 Main 做
+      case '__patch.content': {
+        const rec = this.require(String(payload.runId));
+        if (!rec.patch || rec.patch.patchId !== String(payload.patchId)) {
+          throw platformError('NOT_FOUND', '补丁不存在或已变化');
+        }
+        return {
+          filename: suggestPatchFilename(rec),
+          content: renderPatchFile(rec),
+          digest: rec.patch.digest,
+        };
+      }
+
+      case '__patch.applyToRepo':
+        return this.applyPatchToRepo(String(payload.runId), String(payload.patchId));
+
+      default:
+        throw platformError('BAD_REQUEST', `未知方法: ${method}`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 环境自检
+  // -------------------------------------------------------------------------
+
+  private doctor(): DoctorCheck[] {
+    const checks: DoctorCheck[] = [
+      {
+        checkId: 'node',
+        label: 'Node 运行时',
+        status: 'READY',
+        detail: `${process.version} / ${process.platform}-${process.arch}`,
+        remediation: null,
+      },
+      {
+        checkId: 'dataRoot',
+        label: '本地数据根',
+        status: 'READY',
+        detail: PATHS.root,
+        remediation: null,
+      },
+    ];
+
+    try {
+      const v = execFileSync('git', ['--version'], { encoding: 'utf8' }).trim();
+      checks.push({ checkId: 'git', label: 'Git', status: 'READY', detail: v, remediation: null });
+    } catch {
+      checks.push({
+        checkId: 'git',
+        label: 'Git',
+        status: 'BLOCKED',
+        detail: '未找到 git 可执行文件',
+        remediation: '安装 Xcode Command Line Tools: xcode-select --install',
+      });
+    }
+
+    const profiles = this.gateway.listProfiles();
+    const enabled = profiles.filter((p) => p.enabled);
+    checks.push({
+      checkId: 'modelProfile',
+      label: '模型连接（BYOK）',
+      status: enabled.length > 0 ? 'READY' : 'BLOCKED',
+      detail:
+        enabled.length > 0
+          ? `已启用 ${enabled.length} 个: ${enabled.map((p) => `${p.label}(${p.modelId})`).join(', ')}`
+          : '没有可用的模型 Profile',
+      remediation:
+        enabled.length > 0
+          ? null
+          : `设置以下任一环境变量后重启应用: ${profiles.map((p) => p.credentialEnvVar).join(' / ')}`,
+    });
+
+    return checks;
+  }
+
+  // -------------------------------------------------------------------------
+  // 项目 / 导入
+  // -------------------------------------------------------------------------
+
+  private registerProject(hostPath: string): ProjectRef {
+    for (const rec of this.projects.values()) {
+      if (rec.hostPath === hostPath) return rec.ref;
+    }
+    const ref: ProjectRef = {
+      projectId: newId('proj'),
+      name: basename(hostPath),
+      displayPath: shortenPath(hostPath),
+      createdAt: nowIso(),
+    };
+    this.projects.set(ref.projectId, { ref, hostPath });
+    writeJsonAtomic(PATHS.projects, [...this.projects.values()]);
+    return ref;
+  }
+
+  /**
+   * 把用户手填的验证命令并入 profile。
+   *
+   * 这是「任何仓库都能用」的关键：检测不出命令时，用户可以自己说明怎么验证。
+   * 命令仍然是结构化 argv，不是自由 shell 字符串 —— 模型依旧只能按 id 引用，
+   * 无法构造新命令。
+   */
+  private withUserCommands(
+    profile: RepositoryHarnessProfile,
+    custom: ReadonlyArray<{ label: string; argv: string[] }>,
+  ): RepositoryHarnessProfile {
+    if (custom.length === 0) return profile;
+    const commands = { ...profile.commands };
+    custom.forEach((c, i) => {
+      const argv = c.argv.map((a) => a.trim()).filter(Boolean);
+      if (argv.length === 0) return;
+      const commandId = `user${i + 1}`;
+      commands[commandId] = {
+        commandId,
+        label: c.label.trim() || argv.join(' '),
+        argv,
+        cwdRelative: '.',
+        timeoutMs: 600_000,
+        risk: 'R1',
+        source: 'USER',
+      };
+    });
+    return { ...profile, profileId: newId('prof'), commands };
+  }
+
+  private importProject(projectId: string, options: ImportOptions): ImportOutcome {
+    const project = this.projects.get(projectId);
+    if (!project) throw platformError('NOT_FOUND', '项目不存在');
+
+    // 子包候选与导入是否成功无关：即使被阻断，用户也需要看到"可以换成哪个子包"
+    let candidates: SubPackageCandidate[] = [];
+    try {
+      candidates = findSubPackages(project.hostPath);
+    } catch {
+      candidates = [];
+    }
+
+    let snapshot: RepositorySnapshot;
+    try {
+      snapshot = importSnapshot(projectId, project.hostPath, options);
+    } catch (err) {
+      if (err instanceof RepositoryImportError) {
+        // 被阻断是正常终态，作为数据返回，不作为异常抛出
+        return {
+          outcome: 'BLOCKED',
+          code: err.code,
+          message: err.message,
+          detail: err.detail,
+          candidates,
+        };
+      }
+      throw err;
+    }
+
+    const profile = resolveProfile(snapshot);
+    this.snapshots.set(snapshot.snapshotId, snapshot);
+    this.profiles.set(profile.profileId, profile);
+    return { outcome: 'IMPORTED', snapshot, profile, candidates };
+  }
+
+  // -------------------------------------------------------------------------
+  // 任务 / Run
+  // -------------------------------------------------------------------------
+
+  private createTask(input: {
+    projectId: string;
+    snapshotId: string;
+    profileId: string;
+    modelProfileId: string;
+    goal: string;
+    taskClass: TaskSpec['taskClass'];
+    allowedPaths: string[];
+    acceptance: string[];
+    verificationCommandIds: string[];
+    customCommands?: Array<{ label: string; argv: string[] }>;
+  }): { task: TaskSpec; run: RunView } {
+    const project = this.projects.get(input.projectId);
+    const snapshot = this.snapshots.get(input.snapshotId);
+    const profile = this.profiles.get(input.profileId);
+    if (!project || !snapshot || !profile) throw platformError('NOT_FOUND', '项目/快照/Profile 不存在');
+
+    /*
+     * 这里**不再有 profile 门禁**。任何导入进来的项目都可以创建任务。
+     *
+     * 唯一还成立的约束不是"能不能跑"，而是"能不能声称成功"：
+     * 没有验证命令时 Run 仍然照常执行、照常产出补丁，只是终态只能是
+     * `ACCEPTED_UNVERIFIED` 而不是 `SUCCEEDED`。约束在终态处强制，不在入口处拦人。
+     */
+    const effectiveProfile = this.withUserCommands(profile, input.customCommands ?? []);
+    const unknownCommands = input.verificationCommandIds.filter(
+      (id) => !effectiveProfile.commands[id],
+    );
+    if (unknownCommands.length > 0) {
+      throw platformError('BAD_REQUEST', `未登记的验证命令: ${unknownCommands.join(', ')}`);
+    }
+    this.profiles.set(effectiveProfile.profileId, effectiveProfile);
+
+    const resolution = this.gateway.freezeRoute(input.modelProfileId);
+
+    const task: TaskSpec = {
+      taskId: newId('task'),
+      projectId: input.projectId,
+      snapshotId: input.snapshotId,
+      profileId: effectiveProfile.profileId,
+      goal: input.goal,
+      taskClass: input.taskClass,
+      // 不再默认收窄到 src/**：用户信任的是整个项目
+      allowedPaths: input.allowedPaths.length ? input.allowedPaths : ['**'],
+      protectedPaths: effectiveProfile.protectedPaths,
+      nonGoals: [],
+      acceptance: input.acceptance,
+      verificationCommandIds: input.verificationCommandIds,
+      budget: {
+        maxModelTurns: 40,
+        maxToolCalls: 80,
+        maxSelfFixRounds: 2,
+        maxWallClockMs: 20 * 60 * 1000,
+        maxTotalTokens: 600_000,
+      },
+      createdAt: nowIso(),
+    };
+
+    const runId = newId('run');
+    const attemptId = newId('att');
+    // 依赖复用要指向快照对应的那个目录：子包导入时是子包自己的 node_modules
+    const depsRoot = snapshot.subPath ? join(project.hostPath, snapshot.subPath) : project.hostPath;
+    const workspace = MaterializedWorkspace.create(runId, snapshot.snapshotId, depsRoot);
+
+    const view: RunView = {
+      runId,
+      taskId: task.taskId,
+      projectId: input.projectId,
+      title: task.goal.length > 60 ? `${task.goal.slice(0, 60)}…` : task.goal,
+      attemptId,
+      attemptNo: 1,
+      status: 'CREATED',
+      statusReason: null,
+      ledger: EMPTY_LEDGER,
+      limits: task.budget,
+      workspaceGeneration: workspace.activeGeneration,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      terminalFacts: null,
+    };
+
+    const record: RunRecord = {
+      view,
+      task,
+      snapshot,
+      profile: effectiveProfile,
+      workspace,
+      events: new EventStore(runId),
+      abort: new AbortController(),
+      toolCalls: new Map(),
+      verifications: [],
+      approvals: new Map(),
+      plan: null,
+      patch: null,
+    };
+    this.runs.set(runId, record);
+
+    this.emit(record, 'RUN_CREATED', `任务已创建：${task.goal}`, {
+      taskId: task.taskId,
+      snapshotId: snapshot.snapshotId,
+      route: { providerId: resolution.providerId, modelId: resolution.modelId, origin: resolution.origin },
+      // 越过默认门禁的事实必须留在事件里，不能只存在于当时那次点击
+      baseKind: snapshot.baseKind,
+      dirtyFileCount: snapshot.dirtyFileCount,
+      subPath: snapshot.subPath || null,
+      profileSupportStatus: effectiveProfile.supportStatus,
+      verificationCommands: input.verificationCommandIds,
+      userDefinedCommands: (input.customCommands ?? []).length,
+    });
+
+    // 这些不是拦截，是**如实标注**：任何影响"成功意味着什么"的事实都进事件
+    if (snapshot.baseKind === 'DIRTY_WORKTREE') {
+      this.emit(
+        record,
+        'NOTE',
+        `基线是工作区快照而非干净 commit（${snapshot.dirtyFileCount} 项本地改动）：补丁的 base 无法被他人从 ${snapshot.baseSha.slice(0, 12)} 重建`,
+      );
+    }
+    if (snapshot.baseKind === 'NO_VCS') {
+      this.emit(record, 'NOTE', '该项目不在版本控制下：基线是导入当时的目录内容，没有可回溯的 commit');
+    }
+    if (input.verificationCommandIds.length === 0) {
+      this.emit(
+        record,
+        'NOTE',
+        '本次任务没有选择任何验证命令：改动不会被机器验证，接受后终态为 ACCEPTED_UNVERIFIED 而不是 SUCCEEDED',
+      );
+    }
+
+    // 异步启动，不阻塞 IPC 响应
+    void this.execute(record, resolution);
+
+    return { task, run: view };
+  }
+
+  private async execute(record: RunRecord, resolution: ReturnType<ModelGateway['freezeRoute']>): Promise<void> {
+    const startedAt = Date.now();
+    const deadline = setTimeout(() => {
+      if (!isTerminal(record.view.status)) {
+        record.abort.abort();
+        this.setStatus(record, 'TIMED_OUT', '超过任务时间预算');
+      }
+    }, record.task.budget.maxWallClockMs);
+    deadline.unref?.();
+
+    try {
+      const result = await runAgent({
+        task: record.task,
+        snapshot: record.snapshot,
+        profile: record.profile,
+        workspace: record.workspace,
+        gateway: this.gateway,
+        resolution,
+        mutationPolicy: {
+          ...DEFAULT_MUTATION_POLICY,
+          allowedPaths: record.task.allowedPaths,
+          protectedPaths: record.task.protectedPaths,
+        },
+        runId: record.view.runId,
+        attemptId: record.view.attemptId,
+        signal: record.abort.signal,
+        host: this.hostFor(record, startedAt),
+      });
+
+      for (const v of [result.baseline, result.finalVerification]) {
+        if (v && !record.verifications.some((x) => x.verificationRunId === v.verificationRunId)) {
+          record.verifications.push(v);
+        }
+      }
+
+      switch (result.kind) {
+        case 'PATCH_READY': {
+          const comparison =
+            result.baseline && result.finalVerification
+              ? compareVerification(result.baseline, result.finalVerification)
+              : null;
+          const patch = sealPatch(
+            record.workspace,
+            record.view.runId,
+            record.view.attemptId,
+            record.snapshot.baseSha,
+            result.finalVerification,
+            comparison,
+            result.unverifiedItems,
+          );
+          record.patch = patch;
+          this.emit(
+            record,
+            'PATCH_SEALED',
+            `补丁已封存：${patch.files.length} 个文件，+${patch.files.reduce((n, f) => n + f.addedLines, 0)}/-${patch.files.reduce((n, f) => n + f.removedLines, 0)}`,
+            { patchId: patch.patchId, digest: patch.digest, files: patch.files.map((f) => f.path) },
+          );
+          this.setStatus(record, 'AWAITING_PATCH_REVIEW', result.detail);
+          break;
+        }
+        case 'PLAN_REJECTED':
+          this.setStatus(record, 'BLOCKED', result.detail);
+          break;
+        case 'NO_CHANGES':
+          this.setStatus(record, 'FAILED', result.detail);
+          break;
+        case 'VERIFICATION_FAILED':
+          this.setStatus(record, 'FAILED', result.detail);
+          break;
+        case 'BLOCKED':
+          this.setStatus(record, 'BLOCKED', result.detail);
+          break;
+      }
+    } catch (err) {
+      if (err instanceof AgentCancelled || record.abort.signal.aborted) {
+        if (!isTerminal(record.view.status)) this.setStatus(record, 'CANCELLED', '已取消');
+      } else if (err instanceof EgressBlocked) {
+        this.setStatus(record, 'BLOCKED', `模型出站被阻断：${err.reason}`);
+      } else if (err instanceof InvocationFailed) {
+        this.setStatus(record, 'FAILED', `模型调用失败：${err.cause.kind} — ${err.message}`);
+      } else if (err instanceof PlanningFailed) {
+        this.setStatus(record, 'FAILED', `规划失败：${err.message}`);
+      } else {
+        this.setStatus(record, 'FAILED', `运行时异常：${(err as Error).message}`);
+      }
+    } finally {
+      clearTimeout(deadline);
+      this.cleanupPendingApprovals(record);
+      if (isTerminal(record.view.status) && record.view.status !== 'AWAITING_PATCH_REVIEW') {
+        this.emit(record, 'CLEANUP_SUMMARY', '已释放模型流、子进程与审批等待', {
+          workspaceRetained: record.view.status === 'SUCCEEDED',
+        });
+      }
+    }
+  }
+
+  private hostFor(record: RunRecord, startedAt: number) {
+    return {
+      emit: (kind: RunEventKind, summary: string, payload: Record<string, unknown> = {}) =>
+        this.emit(record, kind, summary, payload),
+
+      setStatus: (status: RunStatus, reason: string | null) => this.setStatus(record, status, reason),
+
+      awaitPlanApproval: (plan: PlanRevision): Promise<ApprovalDecisionKind> => {
+        record.plan = plan;
+        const request: ApprovalRequest = {
+          approvalId: newId('appr'),
+          runId: record.view.runId,
+          attemptId: record.view.attemptId,
+          kind: 'PLAN',
+          risk: 'R1',
+          title: '批准执行计划',
+          detail: plan.summary,
+          subjectDigest: plan.digest,
+          requestedAt: nowIso(),
+          expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
+        };
+        return new Promise<ApprovalDecisionKind>((resolve) => {
+          record.approvals.set(request.approvalId, { request, resolve });
+          this.pushApprovals(record);
+        });
+      },
+
+      beginToolCall: (input: {
+        toolName: string;
+        risk: ToolRisk;
+        argsSummary: string;
+        argsDigest: string;
+      }): string => {
+        const view: ToolCallView = {
+          toolCallId: newId('tc'),
+          runId: record.view.runId,
+          attemptId: record.view.attemptId,
+          toolName: input.toolName,
+          risk: input.risk,
+          argsSummary: input.argsSummary,
+          argsDigest: input.argsDigest,
+          resolution: null,
+          resolutionReason: null,
+          preview: null,
+          previewTruncated: false,
+          artifactRef: null,
+          startedAt: nowIso(),
+          resolvedAt: null,
+          durationMs: null,
+        };
+        record.toolCalls.set(view.toolCallId, view);
+        this.emit(record, 'TOOL_CALL_PROPOSED', `${input.toolName}: ${input.argsSummary}`, {
+          toolCallId: view.toolCallId,
+          risk: input.risk,
+        });
+        this.push({ type: 'toolcall.updated', toolCall: view });
+        return view.toolCallId;
+      },
+
+      endToolCall: (
+        toolCallId: string,
+        resolution: ToolCallResolution,
+        reason: string | null,
+        preview: string,
+        previewTruncated: boolean,
+        artifactRef: string | null,
+      ): void => {
+        const prev = record.toolCalls.get(toolCallId);
+        if (!prev) return;
+        const updated: ToolCallView = {
+          ...prev,
+          resolution,
+          resolutionReason: reason,
+          preview,
+          previewTruncated,
+          artifactRef,
+          resolvedAt: nowIso(),
+          durationMs: Date.now() - Date.parse(prev.startedAt),
+        };
+        record.toolCalls.set(toolCallId, updated);
+        this.emit(record, 'TOOL_CALL_RESOLVED', `${prev.toolName} → ${resolution}`, {
+          toolCallId,
+          resolution,
+          reason,
+        });
+        this.push({ type: 'toolcall.updated', toolCall: updated });
+      },
+
+      chargeModelTurn: (inputTokens: number, outputTokens: number) =>
+        this.charge(record, startedAt, {
+          modelTurns: 1,
+          inputTokens,
+          outputTokens,
+        }),
+
+      chargeToolCall: () => this.charge(record, startedAt, { toolCalls: 1 }),
+
+      chargeSelfFixRound: () => this.charge(record, startedAt, { selfFixRounds: 1 }),
+
+      budgetExceeded: () => {
+        const l = record.view.ledger;
+        const lim = record.task.budget;
+        if (l.modelTurns >= lim.maxModelTurns) return { exceeded: true, reason: `模型轮次达上限 ${lim.maxModelTurns}` };
+        if (l.toolCalls >= lim.maxToolCalls) return { exceeded: true, reason: `工具调用达上限 ${lim.maxToolCalls}` };
+        if (l.inputTokens + l.outputTokens >= lim.maxTotalTokens) {
+          return { exceeded: true, reason: `token 达上限 ${lim.maxTotalTokens}` };
+        }
+        if (Date.now() - startedAt >= lim.maxWallClockMs) return { exceeded: true, reason: '超过时间预算' };
+        return { exceeded: false, reason: '' };
+      },
+    };
+  }
+
+  /** 账本只增不减 —— retry / deny / cancel 都不回退已消耗量 */
+  private charge(record: RunRecord, startedAt: number, delta: Partial<BudgetLedger>): void {
+    const l = record.view.ledger;
+    record.view = {
+      ...record.view,
+      ledger: {
+        modelTurns: l.modelTurns + (delta.modelTurns ?? 0),
+        toolCalls: l.toolCalls + (delta.toolCalls ?? 0),
+        selfFixRounds: l.selfFixRounds + (delta.selfFixRounds ?? 0),
+        elapsedMs: Date.now() - startedAt,
+        inputTokens: l.inputTokens + (delta.inputTokens ?? 0),
+        outputTokens: l.outputTokens + (delta.outputTokens ?? 0),
+      },
+      workspaceGeneration: record.workspace.activeGeneration,
+      updatedAt: nowIso(),
+    };
+    this.push({ type: 'run.updated', run: record.view });
+  }
+
+  // -------------------------------------------------------------------------
+  // 审批
+  // -------------------------------------------------------------------------
+
+  private decideApproval(input: {
+    approvalId: string;
+    decision: ApprovalDecisionKind;
+    subjectDigest: string;
+    note: string;
+  }): { accepted: boolean; reason: string | null } {
+    for (const record of this.runs.values()) {
+      const pending = record.approvals.get(input.approvalId);
+      if (!pending) continue;
+
+      // digest 不匹配 = 审批对象已变化，旧审批失效（PRD-APPR-002）
+      if (pending.request.subjectDigest !== input.subjectDigest) {
+        return { accepted: false, reason: '审批对象已变化，请重新查看后再决定' };
+      }
+      if (Date.parse(pending.request.expiresAt) < Date.now()) {
+        record.approvals.delete(input.approvalId);
+        this.pushApprovals(record);
+        return { accepted: false, reason: '审批已过期' };
+      }
+
+      record.approvals.delete(input.approvalId);
+      this.pushApprovals(record);
+      pending.resolve(input.decision);
+      return { accepted: true, reason: null };
+    }
+    return { accepted: false, reason: '审批请求不存在或已被处理' };
+  }
+
+  private pushApprovals(record: RunRecord): void {
+    this.push({
+      type: 'approval.updated',
+      runId: record.view.runId,
+      approvals: [...record.approvals.values()].map((a) => a.request),
+    });
+  }
+
+  private cleanupPendingApprovals(record: RunRecord): void {
+    for (const [id, pending] of record.approvals) {
+      record.approvals.delete(id);
+      pending.resolve('REJECT');
+    }
+    this.pushApprovals(record);
+  }
+
+  // -------------------------------------------------------------------------
+  // 补丁决定 —— 唯一能进入 SUCCEEDED 的入口
+  // -------------------------------------------------------------------------
+
+  private decidePatch(input: {
+    runId: string;
+    patchId: string;
+    decision: PatchDecisionKind;
+    patchDigest: string;
+    note: string;
+  }): { run: RunView; reason: string | null } {
+    const record = this.require(input.runId);
+    if (!record.patch) throw platformError('CONFLICT', '当前 Run 没有可决定的补丁');
+    if (record.patch.patchId !== input.patchId || record.patch.digest !== input.patchDigest) {
+      return { run: record.view, reason: '补丁已变化，请刷新后重新决定' };
+    }
+    if (record.view.status !== 'AWAITING_PATCH_REVIEW') {
+      return { run: record.view, reason: `当前状态 ${record.view.status} 不接受补丁决定` };
+    }
+
+    const acceptanceId = newId('acc');
+    this.emit(record, 'PATCH_DECISION', `用户决定：${input.decision}`, {
+      patchId: record.patch.patchId,
+      decision: input.decision,
+      note: input.note,
+      acceptanceId,
+    });
+
+    if (input.decision === 'ACCEPT') {
+      /*
+       * 这是整套设计里最后一条不肯让步的规则：
+       *   有通过的验证 + 用户接受 → SUCCEEDED
+       *   只有用户接受            → ACCEPTED_UNVERIFIED
+       *
+       * 两者都是"接受了补丁"，但只有前者能说"这是被证明过的"。
+       * 门禁全部放开之后，正是这条区分让 SUCCEEDED 还剩下意义。
+       */
+      const verified =
+        record.patch.verificationRunId !== null &&
+        record.verifications.some(
+          (v) => v.verificationRunId === record.patch!.verificationRunId && v.passed,
+        );
+
+      record.view = {
+        ...record.view,
+        terminalFacts: {
+          verificationRunId: verified ? record.patch.verificationRunId : null,
+          patchAcceptanceId: acceptanceId,
+        },
+      };
+      this.setStatus(
+        record,
+        verified ? 'SUCCEEDED' : 'ACCEPTED_UNVERIFIED',
+        verified
+          ? '验证通过且用户已接受补丁（补丁未写回宿主仓库，需另行导出）'
+          : '用户已接受补丁，但没有通过的机器验证支撑 —— 正确性仅由人工判断',
+      );
+    } else if (input.decision === 'REJECT') {
+      this.setStatus(record, 'BLOCKED', `用户拒绝了补丁：${input.note || '未填写原因'}`);
+    } else {
+      this.setStatus(record, 'BLOCKED', `用户要求修改：${input.note || '未填写反馈'}（原型暂未实现新 Attempt）`);
+    }
+
+    return { run: record.view, reason: null };
+  }
+
+  // -------------------------------------------------------------------------
+  // 文件浏览（只读）
+  // -------------------------------------------------------------------------
+
+  /** 选定读取根：有 Run 就看它工作区的当前代，否则看快照原貌 */
+  private browseRoot(
+    snapshotId: string,
+    runId: string | null,
+  ): { root: string; baselineRoot: string | null; source: 'SNAPSHOT' | 'WORKSPACE'; generation: number | null } {
+    if (runId) {
+      const record = this.runs.get(runId);
+      if (record) {
+        return {
+          root: record.workspace.activePath,
+          baselineRoot: record.workspace.baselinePath(),
+          source: 'WORKSPACE',
+          generation: record.workspace.activeGeneration,
+        };
+      }
+    }
+    if (!this.snapshots.has(snapshotId)) throw platformError('NOT_FOUND', '快照不存在');
+    return { root: snapshotDir(snapshotId), baselineRoot: null, source: 'SNAPSHOT', generation: null };
+  }
+
+  private fileTree(snapshotId: string, runId: string | null) {
+    const { root, baselineRoot, source, generation } = this.browseRoot(snapshotId, runId);
+    const baseline = baselineRoot
+      ? new Map(listTree(baselineRoot).map((f) => [f.path, f.digest]))
+      : null;
+
+    const entries: FileTreeEntry[] = listTree(root)
+      .filter((f) => !isGeneratedPath(f.path))
+      .map((f) => ({
+        path: f.path,
+        bytes: f.bytes,
+        changed: baseline ? baseline.get(f.path) !== f.digest : false,
+      }));
+
+    return { entries, source, generation };
+  }
+
+  private readFile(snapshotId: string, path: string, runId: string | null) {
+    const { root, baselineRoot } = this.browseRoot(snapshotId, runId);
+    let abs: string;
+    try {
+      abs = resolveManaged(root, path); // 拒绝绝对路径 / `..` / symlink
+    } catch (err) {
+      throw platformError('POLICY_DENIED', (err as Error).message);
+    }
+    if (!existsSync(abs) || !statSync(abs).isFile()) {
+      throw platformError('NOT_FOUND', `文件不存在: ${path}`);
+    }
+
+    const raw = readFileSync(abs);
+    // 含 NUL 字节就当二进制处理，不往 Renderer 塞乱码
+    const binary = raw.subarray(0, 8000).includes(0);
+    const truncated = raw.byteLength > MAX_VIEW_BYTES;
+    const changed = baselineRoot
+      ? (fileDigestAt(baselineRoot, path) ?? null) !== sha256(raw)
+      : false;
+
+    return {
+      path,
+      content: binary ? '' : raw.subarray(0, MAX_VIEW_BYTES).toString('utf8'),
+      bytes: raw.byteLength,
+      truncated,
+      binary,
+      changed,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // 补丁交付
+  // -------------------------------------------------------------------------
+
+  /**
+   * 把补丁真正应用回宿主仓库。
+   *
+   * 这是整个原型里**唯一**会写用户仓库的路径，因此：
+   *   - 交给 `git apply` 做，不自己实现 patch 应用逻辑。
+   *   - 先 `--check` 干跑一遍；有任何一处冲突就整笔拒绝，不做部分应用。
+   *   - 子包导入时用 `--directory` 把坐标系还原回仓库根。
+   *   - 结果如实回报，失败时原样带出 git 的错误。
+   */
+  private applyPatchToRepo(runId: string, patchId: string): PatchExportResult {
+    const record = this.require(runId);
+    if (!record.patch || record.patch.patchId !== patchId) {
+      return { ok: false, reason: 'PATCH_CHANGED', detail: '补丁不存在或已变化，请刷新' };
+    }
+    const project = this.projects.get(record.task.projectId);
+    if (!project) return { ok: false, reason: 'PROJECT_MISSING', detail: '项目不存在' };
+    if (record.snapshot.baseKind === 'NO_VCS') {
+      return {
+        ok: false,
+        reason: 'NOT_A_GIT_REPO',
+        detail: '该项目不在 git 管理下，无法用 git apply 安全应用。请改用「保存为文件」。',
+      };
+    }
+    if (record.patch.files.length === 0) {
+      return { ok: false, reason: 'EMPTY_PATCH', detail: '补丁为空' };
+    }
+    if (record.patch.files.some((f) => f.diffTruncated)) {
+      return {
+        ok: false,
+        reason: 'PATCH_TRUNCATED',
+        detail: '补丁中有被截断的 diff，应用会产生不完整结果。请改用「保存为文件」后手工处理。',
+      };
+    }
+
+    const paths = record.patch.files.map((f) => f.path);
+    const result = applyPatchWithGit(
+      project.hostPath,
+      record.snapshot.subPath,
+      record.patch.unifiedDiff,
+      join(PATHS.artifacts, `${record.patch.patchId}.diff`),
+      paths,
+    );
+
+    if (!result.ok) {
+      this.emit(record, 'NOTE', `补丁应用被拒绝（${result.stage}）：${result.detail.slice(0, 300)}`);
+      return result.stage === 'CHECK'
+        ? {
+            ok: false,
+            reason: 'APPLY_CONFLICT',
+            detail: `git 认为这个补丁无法干净应用，已整笔拒绝、未改动任何文件：\n\n${result.detail}`,
+          }
+        : {
+            ok: false,
+            reason: 'APPLY_FAILED',
+            detail: `--check 通过但实际应用失败（文件可能在这期间被改动）：\n\n${result.detail}`,
+          };
+    }
+
+    this.emit(record, 'NOTE', `补丁已应用到宿主仓库：${paths.join(', ')}`, {
+      applied: paths,
+      subPath: record.snapshot.subPath || null,
+    });
+    return {
+      ok: true,
+      mode: 'APPLY_TO_REPO',
+      detail: `已写入 ${paths.length} 个文件。改动尚未 commit，你可以用 git diff 复核，或 git checkout -- . 撤销。`,
+      target: project.ref.displayPath,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // 通用
+  // -------------------------------------------------------------------------
+
+  private cancel(runId: string, reason: string): RunView {
+    const record = this.require(runId);
+    if (isTerminal(record.view.status)) return record.view;
+    record.abort.abort();
+    this.cleanupPendingApprovals(record);
+    this.setStatus(record, 'CANCELLED', reason);
+    return record.view;
+  }
+
+  private setStatus(record: RunRecord, status: RunStatus, reason: string | null): void {
+    if (isTerminal(record.view.status)) return; // 终态不可逆
+    const facts = record.view.terminalFacts;
+    if (status === 'SUCCEEDED' && !(facts?.verificationRunId && facts.patchAcceptanceId)) {
+      throw new Error('内部不变式违规：SUCCEEDED 必须同时绑定通过的 verification 与 patch acceptance');
+    }
+    if (status === 'ACCEPTED_UNVERIFIED' && !facts?.patchAcceptanceId) {
+      throw new Error('内部不变式违规：ACCEPTED_UNVERIFIED 必须绑定 patch acceptance');
+    }
+    const previous = record.view.status;
+    record.view = {
+      ...record.view,
+      status,
+      statusReason: reason,
+      workspaceGeneration: record.workspace.activeGeneration,
+      updatedAt: nowIso(),
+    };
+    this.emit(record, 'STATUS_CHANGED', `${previous} → ${status}${reason ? `（${reason}）` : ''}`, {
+      from: previous,
+      to: status,
+      reason,
+    });
+    this.push({ type: 'run.updated', run: record.view });
+  }
+
+  private emit(
+    record: RunRecord,
+    kind: RunEventKind,
+    summary: string,
+    payload: Record<string, unknown> = {},
+  ): void {
+    const event = record.events.append(record.view.attemptId, kind, summary, payload);
+    this.push({ type: 'run.event', runId: record.view.runId, event });
+  }
+
+  private require(runId: string): RunRecord {
+    const record = this.runs.get(runId);
+    if (!record) throw platformError('NOT_FOUND', `Run 不存在: ${runId}`);
+    return record;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
+export class CoreError extends Error {
+  constructor(readonly payload: PlatformError) {
+    super(payload.message);
+  }
+}
+
+export function platformError(
+  code: PlatformError['code'],
+  message: string,
+  detail: string | null = null,
+): CoreError {
+  return new CoreError({ code, message, detail });
+}
+
+function ensureTrailingNewline(text: string): string {
+  return text.endsWith('\n') ? text : `${text}\n`;
+}
+
+function suggestPatchFilename(record: RunRecord): string {
+  const stamp = record.patch!.sealedAt.replace(/[:.]/g, '-').slice(0, 19);
+  const scope = record.snapshot.subPath ? record.snapshot.subPath.replace(/\//g, '-') : 'repo';
+  return `repopilot-${scope}-${stamp}.patch`;
+}
+
+/** 补丁文件带头部元信息：光有 diff 没法说明它是基于什么、验证过没有 */
+function renderPatchFile(record: RunRecord): string {
+  const p = record.patch!;
+  const verified = p.verificationRunId !== null;
+  const header = [
+    `# RepoPilot patch`,
+    `# patchId:     ${p.patchId}`,
+    `# digest:      ${p.digest}`,
+    `# sealedAt:    ${p.sealedAt}`,
+    `# base:        ${record.snapshot.baseKind === 'NO_VCS' ? '(no vcs)' : p.baseSha}`,
+    `# baseKind:    ${record.snapshot.baseKind}${
+      record.snapshot.dirtyFileCount ? ` (${record.snapshot.dirtyFileCount} uncommitted changes at snapshot time)` : ''
+    }`,
+    `# scope:       ${record.snapshot.subPath || '(repository root)'}`,
+    `# verified:    ${verified ? `yes (${p.verificationRunId})` : 'NO — accepted without machine verification'}`,
+    `# task:        ${record.task.goal.replace(/\n/g, ' ')}`,
+    `#`,
+    `# apply with:  git apply -p1${record.snapshot.subPath ? ` --directory=${record.snapshot.subPath}` : ''} <this-file>`,
+    `# revert with: git checkout -- ${p.files.map((f) => f.path).join(' ')}`,
+    `#`,
+    ...p.unverifiedItems.map((u) => `# unverified: ${u}`),
+    '',
+  ].join('\n');
+  return `${header}${ensureTrailingNewline(p.unifiedDiff)}`;
+}
+
+function shortenPath(hostPath: string): string {
+  const home = process.env.HOME ?? '';
+  const shown = home && hostPath.startsWith(home) ? `~${hostPath.slice(home.length)}` : hostPath;
+  const parts = shown.split('/');
+  return parts.length <= 4 ? shown : `${parts[0]}/…/${parts.slice(-2).join('/')}`;
+}
+
+export { digestOf };
