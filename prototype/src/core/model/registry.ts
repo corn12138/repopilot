@@ -226,14 +226,28 @@ function normalizeCustom(c: CustomProviderInput): ProviderDescriptor {
 }
 
 export function loadCustomProviders(): CustomProviderInput[] {
-  return readJson<CustomProviderInput[]>(CUSTOM_PATH, []);
+  // readJson 只在"文件不存在"或"parse 抛错"时降级。合法 JSON 但不是数组
+  // （`{}`、`null`、手工编辑过）会原样返回，随后 for...of 抛 "not iterable"，
+  // 把整个 provider 列表打崩。这里显式守住形状。
+  const v = readJson<unknown>(CUSTOM_PATH, []);
+  return Array.isArray(v) ? (v as CustomProviderInput[]) : [];
 }
 
 export function saveCustomProvider(input: CustomProviderInput): void {
   const id = slugify(input.id);
   if (!id) throw new Error('provider id 不能为空');
   if (BUILT_IN.some((b) => b.id === id)) throw new Error(`${id} 与内置 provider 重名`);
-  if (!/^https:\/\//.test(input.api.trim())) throw new Error('API 地址必须是 https://');
+  // 前缀正则会放过字符串 'https://' 本身，normalizeBaseUrl 随后把它变成 'https:'
+  // 存进配置，之后每次调用都拼出一个无效地址。用 URL 解析真正校验。
+  let parsed: URL;
+  try {
+    parsed = new URL(input.api.trim());
+  } catch {
+    throw new Error('API 地址不是合法 URL');
+  }
+  if (parsed.protocol !== 'https:' || !parsed.host) {
+    throw new Error('API 地址必须是带主机名的 https:// 地址');
+  }
 
   const list = loadCustomProviders().filter((c) => c.id !== id);
   list.push({ ...input, id, api: normalizeBaseUrl(input.api) });
@@ -303,6 +317,11 @@ export function normalizeBaseUrl(raw: string): string {
   if (!trimmed) return trimmed;
   try {
     const url = new URL(trimmed);
+    // 非特殊协议下 URL.origin 是字符串 "null"：'localhost:3000' 会被拼成 'null3000'。
+    // 这种输入按"非法 URL"原样返回，与 catch 分支保持一致
+    if (url.origin === 'null' || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
+      return trimmed;
+    }
     if (url.pathname === '' || url.pathname === '/') return `${url.origin}/v1`;
     return `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
   } catch {

@@ -150,6 +150,9 @@ export class MaterializedWorkspace {
   commit(stagedGeneration: number, expectedActive: number): boolean {
     if (this.active !== expectedActive) return false;
     if (stagedGeneration !== expectedActive + 1) return false;
+    // 代号算术对不代表目录还在：stage() → discard(n) → commit(n) 之前会把
+    // active 切到一个已被删掉的目录，此后所有读写都在不存在的路径上
+    if (!existsSync(this.generationPath(stagedGeneration))) return false;
     this.active = stagedGeneration;
     // 切代后此前的 receipt 全部作废：它们绑定的是旧 generation
     this.receipts.clear();
@@ -173,17 +176,25 @@ export class MaterializedWorkspace {
    * 它们不是 Agent 的修改意图，不应进入 PatchArtifact。但也**不能静默丢掉** ——
    * 生成文件的数量和路径会随补丁一起展示（PRD-DIFF-001：任何省略都要说明）。
    */
-  changedVsBaseline(): { authored: string[]; generated: string[] } {
+  changedVsBaseline(): { authored: string[]; generated: string[]; deleted: string[] } {
     const base = listTree(this.generationPath(0));
     const now = listTree(this.activePath);
     const baseMap = new Map(base.map((f) => [f.path, f.digest]));
+    const nowSet = new Set(now.map((f) => f.path));
     const authored: string[] = [];
     const generated: string[] = [];
+    const deleted: string[] = [];
+
     for (const f of now) {
       if (baseMap.get(f.path) === f.digest) continue;
       (isGeneratedPath(f.path) ? generated : authored).push(f.path);
     }
-    return { authored: authored.sort(), generated: generated.sort() };
+    // 只遍历"当前存在"的文件会让被删掉的文件在补丁里彻底消失且无任何说明 ——
+    // 那正是本文件和 patch.ts 都声明过不允许的"静默省略"
+    for (const f of base) {
+      if (!nowSet.has(f.path) && !isGeneratedPath(f.path)) deleted.push(f.path);
+    }
+    return { authored: authored.sort(), generated: generated.sort(), deleted: deleted.sort() };
   }
 
   changedFilesVsBaseline(): string[] {

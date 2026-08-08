@@ -229,12 +229,15 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
   });
 
   let finalVerification: VerificationRun | null = null;
+  /** 最后一轮执行是怎么结束的 —— 供收尾时判断"是不是被预算掐断的" */
+  let lastEnd: ExecutionEnd | null = null;
   let round = 0;
   const maxRounds = task.budget.maxSelfFixRounds;
 
   for (;;) {
     throwIfCancelled(signal);
-    await executionTurns(deps, conversation);
+    const ended = await executionTurns(deps, conversation);
+    lastEnd = ended;
     throwIfCancelled(signal);
 
     if (workspace.changedFilesVsBaseline().length === 0) {
@@ -249,12 +252,20 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
 
     // 未验证模式：改完就出补丁，没有重验也没有自修复
     if (!verificationEnabled) {
+      const truncated = ended.kind === 'BUDGET_EXHAUSTED';
       return {
         kind: 'PATCH_READY',
-        detail: `产生了 ${workspace.changedFilesVsBaseline().length} 个文件变更（本次运行没有任何机器验证）。`,
+        detail:
+          `产生了 ${workspace.changedFilesVsBaseline().length} 个文件变更（本次运行没有任何机器验证）。` +
+          (truncated ? ` ⚠ 执行被预算截断：${ended.reason}，改动很可能是半成品。` : ''),
         baseline: null,
         finalVerification: null,
-        unverifiedItems: buildUnverifiedItems(task, profile, null),
+        unverifiedItems: [
+          ...(truncated
+            ? [`⚠ 执行未跑完就被预算截断（${ended.reason}）—— 改动可能只做了一半`]
+            : []),
+          ...buildUnverifiedItems(task, profile, null),
+        ],
       };
     }
 
@@ -317,11 +328,22 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
   }
 
   const comparison = compareVerification(baseline!, finalVerification);
-  const unverified = buildUnverifiedItems(task, profile, comparison);
+  // 拿成 const 才能让 TS 收窄；lastEnd 是 let，不能跨语句窄化
+  const end = lastEnd;
+  const truncationReason = end?.kind === 'BUDGET_EXHAUSTED' ? end.reason : null;
+  const unverified = [
+    ...(truncationReason ? [`⚠ 执行曾被预算截断（${truncationReason}）`] : []),
+    ...(comparison.notRerun.length > 0
+      ? [`以下基线失败的命令本次未重跑，状态未知：${comparison.notRerun.join(', ')}`]
+      : []),
+    ...buildUnverifiedItems(task, profile, comparison),
+  ];
 
   return {
     kind: 'PATCH_READY',
-    detail: `验证通过（修复 ${comparison.fixed.join(', ') || '无'}），共 ${workspace.changedFilesVsBaseline().length} 个文件变更。`,
+    detail:
+      `验证通过（修复 ${comparison.fixed.join(', ') || '无'}），共 ${workspace.changedFilesVsBaseline().length} 个文件变更。` +
+      (truncationReason ? ' ⚠ 但执行过程曾被预算截断。' : ''),
     baseline,
     finalVerification,
     unverifiedItems: unverified,
@@ -409,7 +431,7 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
         };
       }
 
-      const outcome = await dispatchTool(deps, use.name, use.input);
+      const outcome = await dispatchTool(deps, use.name, use.input, 'PLANNING');
       results.push({
         type: 'tool_result',
         toolUseId: use.id,
@@ -430,7 +452,19 @@ export class PlanningFailed extends Error {}
 // 执行
 // ---------------------------------------------------------------------------
 
-async function executionTurns(deps: AgentDeps, conversation: ModelMessage[]): Promise<void> {
+/**
+ * 执行阶段的一轮循环。
+ *
+ * 返回值必须区分"模型自己说完了"和"预算把它掐断了" —— 之前两者用同一个 return，
+ * 上游看到的都是"executionTurns 结束了"，于是被预算截断的执行会被当成正常完工，
+ * 补丁照发、文案照写"已完成"。
+ */
+type ExecutionEnd = { kind: 'MODEL_ENDED_TURN' } | { kind: 'BUDGET_EXHAUSTED'; reason: string };
+
+async function executionTurns(
+  deps: AgentDeps,
+  conversation: ModelMessage[],
+): Promise<ExecutionEnd> {
   const { host } = deps;
   const tools = TOOLS;
 
@@ -439,7 +473,7 @@ async function executionTurns(deps: AgentDeps, conversation: ModelMessage[]): Pr
     const budget = host.budgetExceeded();
     if (budget.exceeded) {
       host.emit('BUDGET_EXHAUSTED', budget.reason);
-      return;
+      return { kind: 'BUDGET_EXHAUSTED', reason: budget.reason };
     }
 
     const response = await callModel(deps, conversation, tools, 'EXECUTION');
@@ -449,13 +483,13 @@ async function executionTurns(deps: AgentDeps, conversation: ModelMessage[]): Pr
     if (uses.length === 0) {
       const said = textOf(response.content);
       if (said) host.emit('NOTE', said.slice(0, 400));
-      return; // 模型主动结束本轮
+      return { kind: 'MODEL_ENDED_TURN' };
     }
 
     const results: ContentBlock[] = [];
     for (const use of uses) {
       throwIfCancelled(deps.signal);
-      const outcome = await dispatchTool(deps, use.name, use.input);
+      const outcome = await dispatchTool(deps, use.name, use.input, 'EXECUTION');
       results.push({
         type: 'tool_result',
         toolUseId: use.id,
@@ -471,10 +505,13 @@ async function executionTurns(deps: AgentDeps, conversation: ModelMessage[]): Pr
 // 工具分发 —— 每次调用都有且只有一个 resolution
 // ---------------------------------------------------------------------------
 
+type Phase = 'PLANNING' | 'EXECUTION';
+
 async function dispatchTool(
   deps: AgentDeps,
   toolName: string,
   rawInput: unknown,
+  phase: Phase,
 ): Promise<{ ok: boolean; text: string }> {
   const { host } = deps;
   const def = TOOLS_BY_NAME.get(toolName);
@@ -513,6 +550,32 @@ async function dispatchTool(
     argsSummary: def.summarize(args),
     argsDigest: digestOf(args),
   });
+
+  /*
+   * 阶段闸门：规划期只允许 R0。
+   *
+   * 这一道必须在**平台侧**，不能只靠"给模型少看几个 schema"。
+   * PLANNING_TOOLS 决定的是模型看得见什么，但 dispatchTool 查的是全局
+   * TOOLS_BY_NAME —— 模型只要凭记忆点名 workspace_mutate，之前就会真的执行。
+   * PRD-PLAN-001 要求的是 capability envelope 强制，不是 prompt 自律。
+   */
+  if (phase === 'PLANNING' && def.risk !== 'R0') {
+    host.endToolCall(
+      toolCallId,
+      'DENIED',
+      'PHASE_READONLY',
+      `规划阶段被平台强制为只读，${def.risk} 工具不可用`,
+      false,
+      null,
+    );
+    return {
+      ok: false,
+      text:
+        `工具 ${toolName} 在规划阶段不可用 —— 这一阶段由平台强制为只读，` +
+        `不是提示词约束。请先用只读工具把问题看清楚，再调用 submit_plan 提交计划；` +
+        `用户批准后才会进入可以修改文件的执行阶段。`,
+    };
+  }
 
   // 风险门：R3/R4 在首个切片直接拒绝，不提供"逐项审批后继续"的入口
   if (def.risk === 'R3' || def.risk === 'R4') {

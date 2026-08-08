@@ -351,7 +351,9 @@ export function resolveProfile(snapshot: RepositorySnapshot): RepositoryHarnessP
   if (packageManager === 'unknown') notes.push('未找到 lockfile，包管理器不确定');
 
   const scripts = pkg.scripts ?? {};
-  const commands: Record<string, CommandDefinition> = {};
+  // 用无原型对象：commandId 是模型可控的字符串，普通对象字面量会让
+  // 'constructor' / 'toString' 这类 key 命中 Object.prototype 并被当成"已登记命令"
+  const commands: Record<string, CommandDefinition> = Object.create(null);
   const runner = packageManager === 'unknown' ? 'npm' : packageManager;
 
   if (scripts.build) {

@@ -180,6 +180,25 @@ export interface RequestMap {
    * 传 `runId` 时读的是该 Run 工作区的**当前 generation** —— 也就是 Agent 改过之后的样子；
    * 不传则读导入时的快照原貌。两者都只读，且都在受管根内解析路径。
    */
+  /**
+   * 本地数据保留策略与清理。
+   *
+   * 分类保留：工作区在 Run 终态后短期回收，证据（事件/状态/补丁）保留 N 天。
+   * 清理结果是**逐项**的，任何一项失败或被上限截断，整体只能是 INCOMPLETE。
+   */
+  'retention.get': {
+    req: Record<string, never>;
+    res: { policy: RetentionPolicyView; usage: DiskUsage; lastSummary: PurgeSummaryView | null };
+  };
+  'retention.update': {
+    req: { evidenceDays?: number; workspaceGraceMinutes?: number };
+    res: { policy: RetentionPolicyView; usage: DiskUsage; lastSummary: PurgeSummaryView | null };
+  };
+  'retention.sweepNow': {
+    req: Record<string, never>;
+    res: { summary: PurgeSummaryView; usage: DiskUsage; policy: RetentionPolicyView };
+  };
+
   'files.tree': {
     req: { snapshotId: string; runId?: string };
     res: {
@@ -210,6 +229,35 @@ export interface RequestMap {
     req: { runId: string; patchId: string; mode: 'SAVE_FILE' | 'COPY' | 'APPLY_TO_REPO' };
     res: PatchExportResult;
   };
+}
+
+export interface RetentionPolicyView {
+  readonly schemaVersion: number;
+  readonly evidenceDays: number;
+  readonly workspaceGraceMinutes: number;
+  readonly maxItemsPerSweep: number;
+  readonly maxDurationMs: number;
+}
+
+export type DiskUsage = Record<string, { bytes: number; entries: number }>;
+
+export interface PurgeItemView {
+  readonly domain: 'WORKSPACE' | 'SNAPSHOT' | 'RUN_EVIDENCE' | 'ARTIFACT';
+  readonly target: string;
+  readonly outcome: 'DELETED' | 'KEPT_REFERENCED' | 'KEPT_NOT_DUE' | 'FAILED';
+  readonly bytesFreed: number;
+  readonly reason: string | null;
+}
+
+export interface PurgeSummaryView {
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly scanned: number;
+  readonly deleted: number;
+  readonly bytesFreed: number;
+  readonly status: 'COMPLETE' | 'INCOMPLETE';
+  readonly incompleteReason: string | null;
+  readonly items: readonly PurgeItemView[];
 }
 
 export type PatchExportResult =
@@ -254,6 +302,7 @@ export type PushEvent =
   | { readonly type: 'run.updated'; readonly run: RunView }
   | { readonly type: 'toolcall.updated'; readonly toolCall: ToolCallView }
   | { readonly type: 'approval.updated'; readonly runId: string; readonly approvals: ApprovalRequest[] }
+  | { readonly type: 'retention.swept'; readonly summary: PurgeSummaryView }
   | { readonly type: 'core.status'; readonly status: 'READY' | 'RESTARTING' | 'DOWN'; readonly detail: string };
 
 // ---------------------------------------------------------------------------

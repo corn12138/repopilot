@@ -488,11 +488,18 @@ export interface VerificationComparison {
   readonly fixed: readonly string[];
   readonly stillFailing: readonly string[];
   readonly newlyFailing: readonly string[];
+  /**
+   * 基线里失败过、但本次**根本没跑**的命令。
+   *
+   * 必须与 fixed 分开：没跑过就说"修好了"是一句没有证据的谎话，
+   * 而 fixed 会直接进补丁摘要。
+   */
+  readonly notRerun: readonly string[];
 }
 
 export interface PatchFileEntry {
   readonly path: string;
-  readonly changeKind: 'MODIFIED' | 'ADDED';
+  readonly changeKind: 'MODIFIED' | 'ADDED' | 'DELETED';
   readonly addedLines: number;
   readonly removedLines: number;
   readonly diff: string;

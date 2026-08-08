@@ -1,4 +1,5 @@
 import { readFileSync, statSync, writeFileSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import { join, relative, sep } from 'node:path';
 import { z } from 'zod';
 import type { CommandOutcome, MutationOperation, RepositoryHarnessProfile, ToolRisk } from '@shared/domain';
@@ -57,7 +58,8 @@ export function project(full: string, label: string): {
   const byLines = lines.length > PREVIEW_MAX_LINES;
   if (!byBytes && !byLines) return { preview: full, truncated: false, artifactRef: null };
 
-  const head = lines.slice(0, PREVIEW_MAX_LINES).join('\n').slice(0, PREVIEW_MAX_BYTES);
+  // 按字节切，不按 UTF-16 code unit —— 否则中文内容下 4000 字节的预算会被撑到 12000
+  const head = headBytes(lines.slice(0, PREVIEW_MAX_LINES).join('\n'), PREVIEW_MAX_BYTES);
   const artifactId = newId('art');
   const file = join(PATHS.artifacts, `${artifactId}.txt`);
   writeFileSync(file, full, 'utf8');
@@ -66,6 +68,13 @@ export function project(full: string, label: string): {
     truncated: true,
     artifactRef: artifactId,
   };
+}
+
+/** 从头部按字节截断到最近的完整码点边界 */
+function headBytes(text: string, maxBytes: number): string {
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.byteLength <= maxBytes) return text;
+  return new StringDecoder('utf8').write(buf.subarray(0, maxBytes));
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +102,15 @@ const fsRead: ToolDefinition<typeof readSchema> = {
   async execute(args, ctx) {
     if (!ctx.workspace.exists(args.path)) {
       return fail(`文件不存在: ${args.path}`);
+    }
+    // exists() 对目录也返回 true，随后 readFileSync 会抛 EISDIR 穿透到 agent，
+    // 模型只收到一句裸 errno。工具的失败必须走自己的契约。
+    try {
+      if (!statSync(ctx.workspace.resolveInActive(args.path)).isFile()) {
+        return fail(`${args.path} 是目录，不是文件。要看目录内容请用 fs_list。`);
+      }
+    } catch (err) {
+      return fail(`无法读取 ${args.path}: ${(err as Error).message}`);
     }
     const { content, receipt } = ctx.workspace.issueReceipt(args.path);
     const numbered = content
@@ -162,11 +180,20 @@ const fsGrep: ToolDefinition<typeof grepSchema> = {
       return fail(`无效正则: ${(err as Error).message}`);
     }
     const hits: string[] = [];
+    const skippedLarge: string[] = [];
     const MAX_HITS = 200;
+    let cancelled = false;
     for (const entry of listTree(ctx.workspace.activePath)) {
-      if (ctx.signal.aborted) break;
+      if (ctx.signal.aborted) {
+        cancelled = true;
+        break;
+      }
       if (args.pathGlob && !globMatch(args.pathGlob, entry.path)) continue;
-      if (entry.bytes > 500_000) continue;
+      if (entry.bytes > 500_000) {
+        // 静默跳过等于把命中悄悄丢掉，最后还回一句"（无匹配）"
+        skippedLarge.push(entry.path);
+        continue;
+      }
       let content: string;
       try {
         content = readFileSync(join(ctx.workspace.activePath, entry.path), 'utf8');
@@ -184,12 +211,25 @@ const fsGrep: ToolDefinition<typeof grepSchema> = {
     }
     const text = hits.length ? hits.join('\n') : '（无匹配）';
     const p = project(text, 'fs_grep');
+
+    // 任何"没搜全"都必须说出来 —— 否则"搜完了没找到"和"没搜完"长得一样
+    const caveats: string[] = [];
+    if (cancelled) caveats.push('搜索被取消，结果不完整');
+    if (hits.length >= MAX_HITS) caveats.push(`已达 ${MAX_HITS} 条命中上限，结果不完整`);
+    if (skippedLarge.length > 0) {
+      caveats.push(
+        `${skippedLarge.length} 个文件因超过 500KB 未搜索：${skippedLarge.slice(0, 5).join(', ')}` +
+          (skippedLarge.length > 5 ? ' …' : ''),
+      );
+    }
+
     return {
-      ok: true,
-      modelText: hits.length >= MAX_HITS ? `${p.preview}\n[已达 ${MAX_HITS} 条命中上限，结果不完整]` : p.preview,
+      ok: !cancelled,
+      modelText: caveats.length ? `${p.preview}\n[${caveats.join('；')}]` : p.preview,
       preview: p.preview,
       previewTruncated: p.truncated,
       artifactRef: p.artifactRef,
+      ...(cancelled ? { failureReason: 'CANCELLED' } : {}),
     };
   },
 };
@@ -342,7 +382,9 @@ const runProfileCommand: ToolDefinition<typeof commandSchema> = {
   },
   summarize: (a) => `运行命令 ${a.commandId}`,
   async execute(args, ctx) {
-    const def = ctx.profile.commands[args.commandId];
+    const def = Object.prototype.hasOwnProperty.call(ctx.profile.commands, args.commandId)
+      ? ctx.profile.commands[args.commandId]
+      : undefined;
     if (!def) {
       return fail(
         `未登记的 commandId: ${args.commandId}。可用: ${Object.keys(ctx.profile.commands).join(', ') || '（无）'}`,

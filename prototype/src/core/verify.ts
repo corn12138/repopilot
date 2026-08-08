@@ -29,7 +29,12 @@ export async function runVerification(
   const outcomes: CommandOutcome[] = [];
 
   for (const id of commandIds) {
-    const def = profile.commands[id];
+    // hasOwnProperty 而不是直接取值：commandId 来自模型，'constructor' 之类的
+    // key 会取到原型上的成员（truthy），随后 def.argv 为 undefined 直接抛 TypeError，
+    // 让整个 runVerification reject —— 违反本模块"命令不存在时记为 SPAWN_ERROR"的不变式
+    const def = Object.prototype.hasOwnProperty.call(profile.commands, id)
+      ? profile.commands[id]
+      : undefined;
     if (!def) {
       outcomes.push({
         commandId: id,
@@ -86,23 +91,40 @@ export function compareVerification(
     current.commands.filter((c) => c.outcome !== 'EXIT_ZERO').map((c) => c.commandId),
   );
 
+  // 只在两次都跑过的命令上做 fixed/stillFailing 分类。
+  // 否则"这次压根没跑"会因为不在当前失败集合里而被算成 fixed —— 一句没有证据的谎话。
+  const currentIds = new Set(current.commands.map((c) => c.commandId));
+
   const fixed: string[] = [];
   const stillFailing: string[] = [];
   const newlyFailing: string[] = [];
+  const notRerun: string[] = [];
 
   for (const id of baseFailed) {
-    if (nowFailed.has(id)) stillFailing.push(id);
+    if (!currentIds.has(id)) notRerun.push(id);
+    else if (nowFailed.has(id)) stillFailing.push(id);
     else fixed.push(id);
   }
   for (const id of nowFailed) {
     if (!baseFailed.has(id)) newlyFailing.push(id);
   }
 
-  return { fixed: fixed.sort(), stillFailing: stillFailing.sort(), newlyFailing: newlyFailing.sort() };
+  return {
+    fixed: fixed.sort(),
+    stillFailing: stillFailing.sort(),
+    newlyFailing: newlyFailing.sort(),
+    notRerun: notRerun.sort(),
+  };
 }
 
 /** 给模型看的失败摘要：只保留有用部分，避免把整份构建日志塞回上下文 */
 export function summarizeFailures(run: VerificationRun): string {
+  // 一条都没跑过时说"全部通过"，与 runVerification 里 `outcomes.length > 0` 的
+  // passed 判定自相矛盾 —— 同一个 run，passed=false 摘要却说通过。
+  // 这段文字既进模型上下文也展示给用户，等于零证据下声称成功。
+  if (run.commands.length === 0) {
+    return '本次没有执行任何验证命令 —— 没有任何证据支持或否定这次改动。';
+  }
   const failed = run.commands.filter((c) => c.outcome !== 'EXIT_ZERO');
   if (failed.length === 0) return '全部验证命令通过。';
   return failed

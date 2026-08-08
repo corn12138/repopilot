@@ -45,6 +45,16 @@ import {
   readRunState,
   writeRunState,
 } from './persistence';
+import {
+  type LiveReferences,
+  type PurgeSummary,
+  type RetentionPolicy,
+  diskUsage,
+  loadLastSummary,
+  loadPolicy,
+  savePolicy,
+  sweep,
+} from './retention';
 import { PATHS, ensureDataRoot, snapshotDir, workspaceDir } from './paths';
 import { compareVerification } from './verify';
 import {
@@ -103,6 +113,7 @@ export class RunAuthority {
       this.projects.set(rec.ref.projectId, rec);
     }
     this.rehydrateRuns();
+    this.startRetentionSchedule();
   }
 
   // -------------------------------------------------------------------------
@@ -384,6 +395,30 @@ export class RunAuthority {
         return { verifications: rec.verifications };
       }
 
+      case 'retention.get':
+        return {
+          policy: loadPolicy(),
+          usage: diskUsage(),
+          lastSummary: loadLastSummary(),
+        };
+
+      case 'retention.update':
+        return {
+          policy: savePolicy({
+            ...(payload.evidenceDays !== undefined ? { evidenceDays: Number(payload.evidenceDays) } : {}),
+            ...(payload.workspaceGraceMinutes !== undefined
+              ? { workspaceGraceMinutes: Number(payload.workspaceGraceMinutes) }
+              : {}),
+          }),
+          usage: diskUsage(),
+          lastSummary: loadLastSummary(),
+        };
+
+      case 'retention.sweepNow': {
+        const summary = this.runSweep('manual');
+        return { summary, usage: diskUsage(), policy: loadPolicy() };
+      }
+
       case 'files.tree':
         return this.fileTree(String(payload.snapshotId), payload.runId ? String(payload.runId) : null);
 
@@ -583,7 +618,8 @@ export class RunAuthority {
      */
     const effectiveProfile = this.withUserCommands(profile, input.customCommands ?? []);
     const unknownCommands = input.verificationCommandIds.filter(
-      (id) => !effectiveProfile.commands[id],
+      // hasOwnProperty：否则 'constructor' 这类 id 能通过这道校验，一路走到运行时崩溃
+      (id) => !Object.prototype.hasOwnProperty.call(effectiveProfile.commands, id),
     );
     if (unknownCommands.length > 0) {
       throw platformError('BAD_REQUEST', `未登记的验证命令: ${unknownCommands.join(', ')}`);
@@ -1050,6 +1086,83 @@ export class RunAuthority {
   }
 
   // -------------------------------------------------------------------------
+  // 保留期与清理
+  // -------------------------------------------------------------------------
+
+  /**
+   * 当前还活着的引用。清理器据此决定什么能删。
+   *
+   * 之所以由权威层提供而不是让 retention 自己扫：只有这里知道 Run 的终态、
+   * 以及 toolCall/patch 引用了哪些 artifact。让清理器反向依赖 authority 会绕成环。
+   */
+  private liveReferences(): LiveReferences {
+    const runs = new Map<string, { terminal: boolean; terminalAt: number | null; updatedAt: number }>();
+    const snapshots = new Set<string>();
+    const artifacts = new Set<string>();
+
+    for (const [runId, record] of this.runs) {
+      const terminal = isTerminal(record.view.status);
+      runs.set(runId, {
+        terminal,
+        terminalAt: terminal ? Date.parse(record.view.updatedAt) : null,
+        updatedAt: Date.parse(record.view.updatedAt),
+      });
+      if (record.snapshot?.snapshotId) snapshots.add(record.snapshot.snapshotId);
+      for (const tc of record.toolCalls.values()) {
+        if (tc.artifactRef) artifacts.add(tc.artifactRef);
+      }
+      if (record.patch) artifacts.add(record.patch.patchId);
+    }
+    return { runs, snapshots, artifacts };
+  }
+
+  /**
+   * 跑一轮清理，并把结果写进相关 Run 的事件流。
+   *
+   * 被清理掉的 Run 要从内存里一并移除 —— 否则 UI 上还挂着一个已经没有任何
+   * 磁盘数据支撑的条目，那是另一种形式的说谎。
+   */
+  private runSweep(trigger: string): PurgeSummary {
+    const summary = sweep(this.liveReferences());
+
+    for (const item of summary.items) {
+      if (item.outcome !== 'DELETED') continue;
+      if (item.domain === 'RUN_EVIDENCE') {
+        this.runs.delete(item.target);
+      } else if (item.domain === 'WORKSPACE') {
+        const record = this.runs.get(item.target);
+        if (record) {
+          // 工作区没了，但 Run 记录还在：如实记一笔，别让用户以为文件树只是加载失败
+          record.events.append(
+            record.view.attemptId,
+            'CLEANUP_SUMMARY',
+            `工作区副本已按保留策略回收（释放 ${formatBytes(item.bytesFreed)}）`,
+            { domain: 'WORKSPACE', trigger },
+          );
+        }
+      }
+    }
+
+    if (summary.deleted > 0 || summary.status === 'INCOMPLETE') {
+      console.log(
+        `[core] 清理(${trigger}): 扫描 ${summary.scanned} 项，删除 ${summary.deleted} 项，` +
+          `释放 ${formatBytes(summary.bytesFreed)}，结果 ${summary.status}` +
+          `${summary.incompleteReason ? ` —— ${summary.incompleteReason}` : ''}`,
+      );
+    }
+    this.push({ type: 'retention.swept', summary });
+    return summary;
+  }
+
+  /** 启动时跑一次，之后每 6 小时一次。不做高频轮询。 */
+  private startRetentionSchedule(): void {
+    // 启动时延后一点，别和 rehydrate、首屏加载抢 I/O
+    setTimeout(() => this.runSweep('startup'), 5_000).unref?.();
+    const timer = setInterval(() => this.runSweep('scheduled'), 6 * 60 * 60 * 1000);
+    timer.unref?.();
+  }
+
+  // -------------------------------------------------------------------------
   // 文件浏览（只读）
   // -------------------------------------------------------------------------
 
@@ -1250,6 +1363,11 @@ export class RunAuthority {
     });
     this.persist(record); // 事件已 append，此刻状态快照才允许追上
     this.push({ type: 'run.updated', run: record.view });
+
+    // Run 刚终态，它的工作区通常是最大的一块 —— 过了宽限期就该回收
+    if (isTerminal(status)) {
+      setTimeout(() => this.runSweep('run-terminal'), 30_000).unref?.();
+    }
   }
 
   private emit(
@@ -1290,6 +1408,12 @@ function abortedController(): AbortController {
   const ac = new AbortController();
   ac.abort();
   return ac;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function ensureTrailingNewline(text: string): string {

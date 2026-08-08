@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
@@ -33,19 +34,37 @@ export function sealPatch(
 ): PatchArtifact {
   const baselineRoot = workspace.baselinePath();
   const activeRoot = workspace.activePath;
-  const { authored, generated } = workspace.changedVsBaseline();
+  const { authored, generated, deleted } = workspace.changedVsBaseline();
 
   const files: PatchFileEntry[] = [];
   const chunks: string[] = [];
+
+  // 被删除的文件也要进补丁。只遍历"当前存在"的文件会让它们彻底消失，
+  // 那正是本函数 docblock 里说过不允许的静默省略。
+  for (const rel of deleted) {
+    const before = join(baselineRoot, rel);
+    const raw = gitDiffNoIndex(before, '/dev/null', rel);
+    files.push({
+      path: rel,
+      changeKind: 'DELETED',
+      addedLines: 0,
+      removedLines: countPrefix(raw, '-'),
+      diff: raw,
+      diffTruncated: false,
+    });
+    chunks.push(raw);
+  }
 
   for (const rel of authored) {
     const before = join(baselineRoot, rel);
     const after = join(activeRoot, rel);
     const existedBefore = existsSync(before);
     const raw = gitDiffNoIndex(existedBefore ? before : '/dev/null', after, rel);
+    // 按字节判、按字节切。原本是"按字节判阈值、按字符切片"，
+    // 中文 diff 下 truncated 标 true 却一个字都没切掉 —— 上限失效，提示还是假的
     const truncated = Buffer.byteLength(raw, 'utf8') > MAX_DIFF_BYTES_PER_FILE;
     const diff = truncated
-      ? `${raw.slice(0, MAX_DIFF_BYTES_PER_FILE)}\n… [diff 过大已截断，完整内容见工作区 gen-${workspace.activeGeneration}]`
+      ? `${headBytes(raw, MAX_DIFF_BYTES_PER_FILE)}\n… [diff 过大已截断，完整内容见工作区 gen-${workspace.activeGeneration}]`
       : raw;
 
     files.push({
@@ -122,6 +141,14 @@ function runGit(cwd: string, args: string[]): { ok: boolean; detail: string } {
   }
 }
 
+/** 从头部按字节截断到最近的完整码点边界 */
+function headBytes(text: string, maxBytes: number): string {
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.byteLength <= maxBytes) return text;
+  const decoder = new StringDecoder('utf8');
+  return decoder.write(buf.subarray(0, maxBytes));
+}
+
 function gitDiffNoIndex(before: string, after: string, label: string): string {
   try {
     execFileSync('git', ['diff', '--no-index', '--no-color', '-U3', '--', before, after], {
@@ -152,10 +179,26 @@ function normalizeHeaders(diff: string, rel: string): string {
     .join('\n');
 }
 
+/**
+ * 统计增删行数。
+ *
+ * 只在 `@@` hunk 内计数，不用 `'+++'`/`'---'` 的形状去猜文件头 ——
+ * 顶格的内容行会误命中：`-- 注释` 变成 `--- 注释`、`++i;` 变成 `+++i;`，
+ * 于是一增一删的改动会被报成 0/0。SQL 注释、YAML 分隔符、C 风格自增都会触发。
+ */
 function countPrefix(diff: string, prefix: '+' | '-'): number {
   let n = 0;
+  let inHunk = false;
   for (const line of diff.split('\n')) {
-    if (line.startsWith(prefix) && !line.startsWith(`${prefix}${prefix}${prefix}`)) n += 1;
+    if (line.startsWith('@@')) {
+      inHunk = true;
+      continue;
+    }
+    if (line.startsWith('diff --git ')) {
+      inHunk = false;
+      continue;
+    }
+    if (inHunk && line.startsWith(prefix)) n += 1;
   }
   return n;
 }

@@ -173,6 +173,9 @@ const ALLOWED_METHODS = new Set([
   'verification.list',
   'files.tree',
   'files.read',
+  'retention.get',
+  'retention.update',
+  'retention.sweepNow',
 ]);
 
 const MAX_PAYLOAD_BYTES = 256 * 1024;
