@@ -191,7 +191,14 @@ export type RunStatus =
   | 'FAILED'
   | 'BLOCKED'
   | 'CANCELLED'
-  | 'TIMED_OUT';
+  | 'TIMED_OUT'
+  /**
+   * 进程退出时该 Run 还在执行中，重启后无法续跑。
+   *
+   * 与 CANCELLED / FAILED 严格区分：那两者是**在运行中做出的决定**，
+   * 这个是"没来得及有结论"。混用会让事后审计分不清"用户取消了"和"应用被关了"。
+   */
+  | 'INTERRUPTED';
 
 export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
   'SUCCEEDED',
@@ -200,6 +207,7 @@ export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
   'BLOCKED',
   'CANCELLED',
   'TIMED_OUT',
+  'INTERRUPTED',
 ];
 
 export function isTerminal(status: RunStatus): boolean {
@@ -235,6 +243,21 @@ export interface RunView {
   readonly createdAt: Iso8601;
   readonly updatedAt: Iso8601;
   readonly terminalFacts: RunTerminalFacts | null;
+  /**
+   * 该 Run 是从磁盘恢复的，不是本次进程创建的。
+   *
+   * 恢复出来的 Run 没有活的 Agent Loop 和工作区，因此**不能续跑**；
+   * 但历史、补丁、验证记录都是真的，可以查看和导出。
+   */
+  readonly restored: boolean;
+  /**
+   * 证据完整性。
+   *
+   * `DAMAGED` 表示状态快照读不出来 —— 这个 Run 仍然留在列表里并标明损坏，
+   * 而不是当作从未存在过。
+   */
+  readonly evidence: 'INTACT' | 'DAMAGED' | 'EVENTS_AHEAD';
+  readonly evidenceDetail: string | null;
 }
 
 // ---------------------------------------------------------------------------

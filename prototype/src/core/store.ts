@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { RunEvent, RunEventKind } from '@shared/domain';
 import { nowIso } from '@shared/ids';
 import { runDir } from './paths';
@@ -71,14 +71,27 @@ export class EventStore {
     return this.cache.filter((e) => e.seq > afterSeq);
   }
 
+  /** 事件流最高水位。状态快照用它判断自己是否落后于事件。 */
+  lastSeq(): number {
+    this.load();
+    return this.cache.length === 0 ? 0 : this.cache[this.cache.length - 1]!.seq;
+  }
+
   all(): RunEvent[] {
     this.load();
     return [...this.cache];
   }
 }
 
-/** 小型 JSON 状态文件：write-temp → rename，避免半写状态 */
+/**
+ * 小型 JSON 状态文件：write-temp → rename，避免半写状态。
+ *
+ * 自己保证父目录存在 —— 不依赖"调用前某个别的东西已经建过目录"这种隐式耦合。
+ * （这条是被测试抓出来的：writeRunState 原本靠 EventStore 构造函数顺手建目录，
+ * 生产路径上碰巧成立，单独调用就 ENOENT。）
+ */
 export function writeJsonAtomic(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
   writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
   renameSync(tmp, path);

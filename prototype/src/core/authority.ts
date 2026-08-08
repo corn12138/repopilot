@@ -39,7 +39,13 @@ import {
 } from './repo';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { EventStore, readJson, writeJsonAtomic } from './store';
-import { PATHS, ensureDataRoot, snapshotDir } from './paths';
+import {
+  RUN_STATE_SCHEMA_VERSION,
+  listPersistedRunIds,
+  readRunState,
+  writeRunState,
+} from './persistence';
+import { PATHS, ensureDataRoot, snapshotDir, workspaceDir } from './paths';
 import { compareVerification } from './verify';
 import {
   MaterializedWorkspace,
@@ -70,7 +76,11 @@ interface RunRecord {
   readonly task: TaskSpec;
   readonly snapshot: RepositorySnapshot;
   readonly profile: RepositoryHarnessProfile;
-  readonly workspace: MaterializedWorkspace;
+  /**
+   * 从磁盘恢复的 Run 没有活工作区（目录可能还在，也可能已被清理），
+   * 所以这里可空。所有摸它的地方都必须显式处理 null，不能让它抛未分类异常。
+   */
+  readonly workspace: MaterializedWorkspace | null;
   readonly events: EventStore;
   readonly abort: AbortController;
   readonly toolCalls: Map<string, ToolCallView>;
@@ -92,6 +102,170 @@ export class RunAuthority {
     for (const rec of readJson<ProjectRecord[]>(PATHS.projects, [])) {
       this.projects.set(rec.ref.projectId, rec);
     }
+    this.rehydrateRuns();
+  }
+
+  // -------------------------------------------------------------------------
+  // 持久化与恢复
+  // -------------------------------------------------------------------------
+
+  /**
+   * 把 Run 的当前状态快照写盘。
+   *
+   * 调用约定：**先 append 事件，再调这个**。事件流是流水账，状态快照是结算结果；
+   * 顺序反了会在崩溃窗口里产生"状态说成功、时间线停在半路"的说谎方式。
+   */
+  private persist(record: RunRecord): void {
+    try {
+      writeRunState({
+        schemaVersion: RUN_STATE_SCHEMA_VERSION,
+        view: record.view,
+        task: record.task,
+        snapshot: record.snapshot,
+        profile: record.profile,
+        toolCalls: [...record.toolCalls.values()],
+        verifications: record.verifications,
+        plan: record.plan,
+        patch: record.patch,
+        eventHighWatermark: record.events.lastSeq(),
+        persistedAt: nowIso(),
+      });
+    } catch (err) {
+      // 写盘失败不能让运行中的 Run 崩掉，但必须留痕 —— 否则就成了静默的证据丢失
+      console.error('[core] 持久化 Run 状态失败', record.view.runId, err);
+    }
+  }
+
+  /**
+   * 启动时把磁盘上的 Run 读回来。
+   *
+   * 恢复出来的都是**只读**的：没有 Agent Loop、没有工作区，不能续跑。
+   * 唯一的例外是 `AWAITING_PATCH_REVIEW` —— 补丁已封存、验证已完成，
+   * 接受与否是纯粹的状态转换，不需要活的执行器。所以这个状态**可以跨重启存活**，
+   * 用户第二天回来照样能接受并导出补丁。
+   *
+   * 其余非终态一律落成 `INTERRUPTED`：它们等的是一个已经不存在的执行器，
+   * 假装还能继续才是真正的谎言。
+   */
+  private rehydrateRuns(): void {
+    for (const runId of listPersistedRunIds()) {
+      const loaded = readRunState(runId);
+      const events = new EventStore(runId);
+
+      if (!loaded.ok) {
+        // 读不出来也要留在列表里，标明损坏 —— 不能让一个 Run 凭空消失
+        const damaged = this.damagedRecord(runId, events, loaded.reason);
+        if (damaged) this.runs.set(runId, damaged);
+        continue;
+      }
+
+      const s = loaded.state;
+      // 事件比状态新 = 崩溃发生在两次写之间。如实标注，不假装一致
+      const eventsAhead = events.lastSeq() > s.eventHighWatermark;
+
+      const record: RunRecord = {
+        view: {
+          ...s.view,
+          restored: true,
+          evidence: eventsAhead ? 'EVENTS_AHEAD' : 'INTACT',
+          evidenceDetail: eventsAhead
+            ? `事件流已到 seq ${events.lastSeq()}，状态快照停在 seq ${s.eventHighWatermark} —— 末尾若干事件未反映在状态里`
+            : null,
+        },
+        task: s.task,
+        snapshot: s.snapshot,
+        profile: s.profile,
+        workspace: null, // 恢复态没有活工作区
+        events,
+        abort: abortedController(),
+        toolCalls: new Map(s.toolCalls.map((t) => [t.toolCallId, t])),
+        verifications: [...s.verifications],
+        approvals: new Map(),
+        plan: s.plan,
+        patch: s.patch,
+      };
+
+      this.runs.set(runId, record);
+      this.snapshots.set(s.snapshot.snapshotId, s.snapshot);
+      this.profiles.set(s.profile.profileId, s.profile);
+
+      this.closeInterruptedRun(record);
+    }
+  }
+
+  /** 非终态且不是待补丁审查的，落成 INTERRUPTED 并补一条清理说明 */
+  private closeInterruptedRun(record: RunRecord): void {
+    const status = record.view.status;
+    if (isTerminal(status) || status === 'AWAITING_PATCH_REVIEW') return;
+
+    const previous = status;
+    record.view = {
+      ...record.view,
+      status: 'INTERRUPTED',
+      statusReason: `进程退出时该 Run 处于 ${previous}，重启后无法续跑`,
+      updatedAt: nowIso(),
+    };
+    record.events.append(record.view.attemptId, 'STATUS_CHANGED', `${previous} → INTERRUPTED（进程退出）`, {
+      from: previous,
+      to: 'INTERRUPTED',
+      reason: 'PROCESS_EXIT',
+    });
+
+    const wsDir = workspaceDir(record.view.runId);
+    record.events.append(
+      record.view.attemptId,
+      'CLEANUP_SUMMARY',
+      `子进程与模型流已随进程退出释放；工作区 ${existsSync(wsDir) ? `仍在磁盘上（gen-${record.view.workspaceGeneration}）` : '已不存在'}`,
+      { workspaceRetained: existsSync(wsDir), reason: 'PROCESS_EXIT' },
+    );
+    this.persist(record);
+  }
+
+  /** 状态快照坏了，但目录还在 —— 用事件流能捞多少算多少，剩下的标明未知 */
+  private damagedRecord(runId: string, events: EventStore, reason: string): RunRecord | null {
+    const all = events.all();
+    if (all.length === 0) return null; // 连事件都没有，不构成一个可展示的 Run
+    const first = all[0]!;
+    const last = all[all.length - 1]!;
+
+    return {
+      view: {
+        runId,
+        taskId: String(first.payload.taskId ?? 'unknown'),
+        projectId: '',
+        title: first.summary.replace(/^任务已创建：/, '') || runId,
+        attemptId: first.attemptId,
+        attemptNo: 1,
+        status: 'INTERRUPTED',
+        statusReason: '状态快照损坏，仅能展示事件流',
+        ledger: EMPTY_LEDGER,
+        limits: {
+          maxModelTurns: 0,
+          maxToolCalls: 0,
+          maxSelfFixRounds: 0,
+          maxWallClockMs: 0,
+          maxTotalTokens: 0,
+        },
+        workspaceGeneration: 0,
+        createdAt: first.at,
+        updatedAt: last.at,
+        terminalFacts: null,
+        restored: true,
+        evidence: 'DAMAGED',
+        evidenceDetail: reason,
+      },
+      task: null as unknown as TaskSpec,
+      snapshot: null as unknown as RepositorySnapshot,
+      profile: null as unknown as RepositoryHarnessProfile,
+      workspace: null,
+      events,
+      abort: abortedController(),
+      toolCalls: new Map(),
+      verifications: [],
+      approvals: new Map(),
+      plan: null,
+      patch: null,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -462,6 +636,9 @@ export class RunAuthority {
       createdAt: nowIso(),
       updatedAt: nowIso(),
       terminalFacts: null,
+      restored: false,
+      evidence: 'INTACT',
+      evidenceDetail: null,
     };
 
     const record: RunRecord = {
@@ -520,6 +697,14 @@ export class RunAuthority {
 
   private async execute(record: RunRecord, resolution: ReturnType<ModelGateway['freezeRoute']>): Promise<void> {
     const startedAt = Date.now();
+    // 恢复态的 Run 没有活工作区，永远不该走到执行路径。真走到了就明确停住，
+    // 而不是让一个 null 在深处炸成未分类异常。
+    const workspace = record.workspace;
+    if (!workspace) {
+      this.setStatus(record, 'INTERRUPTED', '内部不变式违规：尝试执行一个没有工作区的 Run');
+      return;
+    }
+
     const deadline = setTimeout(() => {
       if (!isTerminal(record.view.status)) {
         record.abort.abort();
@@ -533,7 +718,7 @@ export class RunAuthority {
         task: record.task,
         snapshot: record.snapshot,
         profile: record.profile,
-        workspace: record.workspace,
+        workspace,
         gateway: this.gateway,
         resolution,
         mutationPolicy: {
@@ -560,7 +745,7 @@ export class RunAuthority {
               ? compareVerification(result.baseline, result.finalVerification)
               : null;
           const patch = sealPatch(
-            record.workspace,
+            workspace,
             record.view.runId,
             record.view.attemptId,
             record.snapshot.baseSha,
@@ -699,6 +884,7 @@ export class RunAuthority {
           resolution,
           reason,
         });
+        this.persist(record);
         this.push({ type: 'toolcall.updated', toolCall: updated });
       },
 
@@ -740,7 +926,7 @@ export class RunAuthority {
         inputTokens: l.inputTokens + (delta.inputTokens ?? 0),
         outputTokens: l.outputTokens + (delta.outputTokens ?? 0),
       },
-      workspaceGeneration: record.workspace.activeGeneration,
+      workspaceGeneration: record.workspace?.activeGeneration ?? record.view.workspaceGeneration,
       updatedAt: nowIso(),
     };
     this.push({ type: 'run.updated', run: record.view });
@@ -759,6 +945,9 @@ export class RunAuthority {
     for (const record of this.runs.values()) {
       const pending = record.approvals.get(input.approvalId);
       if (!pending) continue;
+      if (record.view.restored) {
+        return { accepted: false, reason: '该 Run 已从磁盘恢复，没有在等待这个审批的执行器' };
+      }
 
       // digest 不匹配 = 审批对象已变化，旧审批失效（PRD-APPR-002）
       if (pending.request.subjectDigest !== input.subjectDigest) {
@@ -871,12 +1060,19 @@ export class RunAuthority {
   ): { root: string; baselineRoot: string | null; source: 'SNAPSHOT' | 'WORKSPACE'; generation: number | null } {
     if (runId) {
       const record = this.runs.get(runId);
-      if (record) {
+      if (record && !record.workspace) {
+        throw platformError(
+          'CONFLICT',
+          '该 Run 已从磁盘恢复，工作区不再可用',
+          '只能查看导入时的快照原貌；补丁内容仍可在「补丁审查」里查看和导出',
+        );
+      }
+      if (record && record.workspace) {
         return {
-          root: record.workspace.activePath,
-          baselineRoot: record.workspace.baselinePath(),
+          root: record.workspace!.activePath,
+          baselineRoot: record.workspace!.baselinePath(),
           source: 'WORKSPACE',
-          generation: record.workspace.activeGeneration,
+          generation: record.workspace!.activeGeneration,
         };
       }
     }
@@ -949,6 +1145,13 @@ export class RunAuthority {
     if (!record.patch || record.patch.patchId !== patchId) {
       return { ok: false, reason: 'PATCH_CHANGED', detail: '补丁不存在或已变化，请刷新' };
     }
+    if (record.view.evidence === 'DAMAGED' || !record.snapshot || !record.task) {
+      return {
+        ok: false,
+        reason: 'EVIDENCE_DAMAGED',
+        detail: '该 Run 的状态快照已损坏，无法确定补丁的坐标系，拒绝应用',
+      };
+    }
     const project = this.projects.get(record.task.projectId);
     if (!project) return { ok: false, reason: 'PROJECT_MISSING', detail: '项目不存在' };
     if (record.snapshot.baseKind === 'NO_VCS') {
@@ -1012,6 +1215,11 @@ export class RunAuthority {
   private cancel(runId: string, reason: string): RunView {
     const record = this.require(runId);
     if (isTerminal(record.view.status)) return record.view;
+    if (record.view.restored) {
+      // 恢复态唯一可能的非终态是 AWAITING_PATCH_REVIEW，那里没有进程可停
+      this.setStatus(record, 'BLOCKED', `${reason}（该 Run 已从磁盘恢复，无运行中的进程）`);
+      return record.view;
+    }
     record.abort.abort();
     this.cleanupPendingApprovals(record);
     this.setStatus(record, 'CANCELLED', reason);
@@ -1032,7 +1240,7 @@ export class RunAuthority {
       ...record.view,
       status,
       statusReason: reason,
-      workspaceGeneration: record.workspace.activeGeneration,
+      workspaceGeneration: record.workspace?.activeGeneration ?? record.view.workspaceGeneration,
       updatedAt: nowIso(),
     };
     this.emit(record, 'STATUS_CHANGED', `${previous} → ${status}${reason ? `（${reason}）` : ''}`, {
@@ -1040,6 +1248,7 @@ export class RunAuthority {
       to: status,
       reason,
     });
+    this.persist(record); // 事件已 append，此刻状态快照才允许追上
     this.push({ type: 'run.updated', run: record.view });
   }
 
@@ -1074,6 +1283,13 @@ export function platformError(
   detail: string | null = null,
 ): CoreError {
   return new CoreError({ code, message, detail });
+}
+
+/** 恢复态 Run 用的 AbortController：一出生就是已取消，任何误用都会立刻停 */
+function abortedController(): AbortController {
+  const ac = new AbortController();
+  ac.abort();
+  return ac;
 }
 
 function ensureTrailingNewline(text: string): string {

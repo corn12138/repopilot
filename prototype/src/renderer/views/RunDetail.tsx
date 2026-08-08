@@ -11,7 +11,15 @@ import type {
 } from '@shared/domain';
 import { TERMINAL_RUN_STATUSES } from '@shared/domain';
 import { call } from '../bridge';
-import { Badge, Banner, Card, DiffView, RunStatusBadge, timeOf } from '../components/common';
+import {
+  Badge,
+  Banner,
+  Card,
+  DiffView,
+  RestoredBadge,
+  RunStatusBadge,
+  timeOf,
+} from '../components/common';
 import { Transcript } from './Transcript';
 
 export function RunDetail({
@@ -64,6 +72,7 @@ export function RunDetail({
       >
         <div className="row wrap" style={{ marginBottom: 12 }}>
           <RunStatusBadge status={run.status} />
+          <RestoredBadge run={run} />
           <Badge>gen-{run.workspaceGeneration}</Badge>
           <Badge>模型轮次 {run.ledger.modelTurns}/{run.limits.maxModelTurns}</Badge>
           <Badge>工具调用 {run.ledger.toolCalls}/{run.limits.maxToolCalls}</Badge>
@@ -73,6 +82,35 @@ export function RunDetail({
           </Badge>
           <Badge>{Math.round(run.ledger.elapsedMs / 1000)}s</Badge>
         </div>
+
+        {run.evidence === 'DAMAGED' && (
+          <Banner tone="err">
+            <strong>状态快照损坏，只能展示事件流。</strong>
+            {run.evidenceDetail && <div style={{ marginTop: 4 }}>{run.evidenceDetail}</div>}
+            <div style={{ marginTop: 6 }}>
+              补丁内容与验证记录无法恢复，因此不能导出或应用。这个 Run 保留在列表里是为了
+              让「曾经跑过一次」这件事本身不丢失。
+            </div>
+          </Banner>
+        )}
+        {run.evidence === 'EVENTS_AHEAD' && (
+          <Banner tone="warn">
+            <strong>状态快照落后于事件流。</strong>
+            {run.evidenceDetail && <div style={{ marginTop: 4 }}>{run.evidenceDetail}</div>}
+            <div style={{ marginTop: 6 }}>
+              时间线是完整的，但上面的状态、预算和补丁可能不是最后一刻的样子。
+            </div>
+          </Banner>
+        )}
+        {run.restored && run.evidence === 'INTACT' && (
+          <Banner tone="info">
+            该 Run 是从磁盘恢复的。历史、验证记录和补丁都是真的，
+            {run.status === 'AWAITING_PATCH_REVIEW'
+              ? '补丁仍可接受与导出（这不需要运行中的执行器）。'
+              : '但没有运行中的执行器，不能续跑。'}
+            工作区文件树不可用 —— 那份隔离副本随进程一起结束了。
+          </Banner>
+        )}
 
         {run.statusReason && (
           <Banner

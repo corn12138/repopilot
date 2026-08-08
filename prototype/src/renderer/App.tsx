@@ -15,7 +15,7 @@ import type {
   VerificationRun,
 } from '@shared/domain';
 import { RequestError, call, subscribe } from './bridge';
-import { Badge, Banner, Card, DoctorBadge, RunStatusBadge } from './components/common';
+import { Badge, Banner, Card, DoctorBadge, RestoredBadge, RunStatusBadge } from './components/common';
 import { TaskForm } from './views/TaskForm';
 import { RunDetail } from './views/RunDetail';
 import { FileTreePanel } from './views/FileTree';
@@ -78,6 +78,8 @@ export function App() {
 
   const selectedRunRef = useRef<string | null>(null);
   selectedRunRef.current = selectedRunId;
+  /** 放进 ref 而不是 effect 依赖：否则每次它重建都会重订阅事件流 */
+  const loadRunDetailRef = useRef<((runId: string) => Promise<void>) | null>(null);
 
   const selectedRun = useMemo(
     () => runs.find((r) => r.runId === selectedRunId) ?? null,
@@ -113,7 +115,13 @@ export function App() {
       switch (event.type) {
         case 'core.status':
           setCoreStatus(event.status);
-          if (event.status === 'READY') void bootstrap();
+          if (event.status === 'READY') {
+            void bootstrap();
+            // 断线窗口里的事件不会补发。selectedRunId 没变，详情 effect 也不会重跑，
+            // 所以这里必须主动补一次，否则时间线会缺一段且用户不知道。
+            const runId = selectedRunRef.current;
+            if (runId) void loadRunDetailRef.current?.(runId);
+          }
           break;
         case 'run.updated':
           setRuns((prev) => {
@@ -179,6 +187,8 @@ export function App() {
     },
     [report],
   );
+
+  loadRunDetailRef.current = loadRunDetail;
 
   useEffect(() => {
     if (!selectedRunId) return;
@@ -328,6 +338,7 @@ export function App() {
                   >
                     <div className="row" style={{ gap: 6, marginBottom: 2 }}>
                       <RunStatusBadge status={r.status} />
+                      <RestoredBadge run={r} />
                     </div>
                     <div className="title">{r.title || r.runId}</div>
                   </button>

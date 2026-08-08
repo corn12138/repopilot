@@ -109,6 +109,18 @@ function startCore(): void {
   core = child;
 }
 
+/**
+ * 主动杀掉 Core。
+ *
+ * 必须**同步**把 coreReady 置 false —— `exit` 事件是异步到达的，在那之前
+ * callCore 会认为 Core 还活着，把消息 post 给一个已死进程，然后那个 Promise
+ * 永远不会 resolve。（这条是被重启自检抓出来的。）
+ */
+function killCore(): void {
+  coreReady = false;
+  core?.kill();
+}
+
 function callCore(method: string, payload: unknown): Promise<IpcResult<unknown>> {
   if (!core || !coreReady) {
     return Promise.resolve({
@@ -582,6 +594,139 @@ async function selfTest(): Promise<void> {
     else credentials.removeKey('anthropic');
     await syncCredentialsToCore();
     await show('PASS 还原后');
+  }
+
+  // 重启恢复：造一个真实 Run → 杀 Core → 确认新实例能把它读回来
+  {
+    /*
+     * 造一个真实的、跑到一半的 Run，然后在它非终态时杀掉 Core。
+     *
+     * 为了不产生任何外部网络请求，临时把 anthropic 的 base URL 指向
+     * 一个必然连不上的本地端口。Run 依然会真实地走完 createTask → 基线验证
+     * （真跑 npm run build）→ 模型调用失败，我们在基线验证那一两秒的窗口里下手。
+     */
+    const fixture = join(__dirname, '../../fixtures/vite-react-broken');
+    const savedKey = credentials.getAll().anthropic;
+    let seededRunId: string | null = null;
+
+    credentials.setKey('anthropic', 'sk-ant-selftest-restart');
+    await syncCredentialsToCore();
+    await callCore('model.updateProfile', {
+      profileId: 'profile_anthropic',
+      baseUrlOverride: 'https://127.0.0.1:9/v1', // discard 端口，必然 ECONNREFUSED
+    });
+
+    const reg = await callCore('__project.register', { hostPath: fixture });
+    if (reg.ok) {
+      const projectId = (reg.data as { project: { projectId: string } }).project.projectId;
+      const imported = await callCore('project.import', { projectId });
+      const d = imported.ok
+        ? (imported.data as {
+            outcome: string;
+            snapshot?: { snapshotId: string };
+            profile?: { profileId: string; commands: Record<string, unknown> };
+          })
+        : null;
+      if (d?.outcome === 'IMPORTED' && d.snapshot && d.profile) {
+        const snap = d.snapshot;
+        const prof = d.profile;
+        const created = await callCore('task.create', {
+          projectId,
+          snapshotId: snap.snapshotId,
+          profileId: prof.profileId,
+          modelProfileId: 'profile_anthropic',
+          goal: '[selftest] 重启恢复用例',
+          taskClass: 'BUILD_FAILURE_FIX',
+          allowedPaths: ['src/**'],
+          acceptance: [],
+          // 选上 build：基线验证要真跑一两秒，给我们一个"非终态"窗口
+          verificationCommandIds: Object.keys(prof.commands).includes('build') ? ['build'] : [],
+        });
+        if (created.ok) {
+          seededRunId = (created.data as { run: { runId: string } }).run.runId;
+          console.log(`[selftest] 已造出 Run ${seededRunId}，等它进入执行中`);
+          await new Promise((r) => setTimeout(r, 700)); // 落在基线验证窗口里
+          const mid = await callCore('run.get', { runId: seededRunId });
+          if (mid.ok) {
+            const st = (mid.data as { run: { status: string } | null }).run?.status;
+            console.log(`[selftest] 杀 Core 前该 Run 的状态：${st}`);
+          }
+        } else {
+          console.error(`[selftest] FAIL 造 Run 失败 → ${JSON.stringify(created.error)}`);
+          failures += 1;
+        }
+      }
+    }
+
+    const before = await callCore('run.list', {});
+    const beforeCount = before.ok ? (before.data as { runs: unknown[] }).runs.length : -1;
+
+    // 直接重启 Core（等价于崩溃后自动拉起），看历史还在不在
+    killCore(); // exit handler 会在 1s 后重新 startCore
+    const t0 = Date.now();
+    while (!coreReady && Date.now() - t0 < 20_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const restarted = coreReady;
+    console.log(`[selftest] Core 重启用时 ${Date.now() - t0}ms`);
+
+    if (!restarted) {
+      console.error('[selftest] FAIL Core 重启后未就绪');
+      failures += 1;
+    } else {
+      const after = await callCore('run.list', {});
+      if (!after.ok) {
+        console.error(`[selftest] FAIL 重启后 run.list → ${JSON.stringify(after.error)}`);
+        failures += 1;
+      } else {
+        const runs = (after.data as { runs: Array<Record<string, unknown>> }).runs;
+        const restoredCount = runs.filter((r) => r.restored === true).length;
+        const nonTerminalLeft = runs.filter(
+          (r) => !['SUCCEEDED', 'ACCEPTED_UNVERIFIED', 'FAILED', 'BLOCKED', 'CANCELLED', 'TIMED_OUT', 'INTERRUPTED'].includes(
+            String(r.status),
+          ) && r.status !== 'AWAITING_PATCH_REVIEW',
+        ).length;
+
+        const ok = runs.length >= beforeCount && nonTerminalLeft === 0;
+        console.log(
+          `[selftest] ${ok ? 'PASS' : 'FAIL'} 重启恢复 → 重启前 ${beforeCount} 个 Run，` +
+            `重启后 ${runs.length} 个（其中 ${restoredCount} 个标记为 restored）；` +
+            `残留非终态 ${nonTerminalLeft} 个`,
+        );
+        if (!ok) failures += 1;
+
+        // 恢复的 Run 必须真的能读出事件，不能只是个空壳
+        const sample = runs.find((r) => r.runId === seededRunId) ?? runs.find((r) => r.restored === true);
+        if (sample) {
+          const ev = await callCore('run.events', { runId: sample.runId, afterSeq: 0 });
+          const count = ev.ok ? (ev.data as { events: unknown[] }).events.length : -1;
+          const hasEvidence =
+            count > 0 && sample.restored === true && sample.evidence !== 'DAMAGED';
+          console.log(
+            `[selftest] ${hasEvidence ? 'PASS' : 'FAIL'} 恢复的 Run 可读 → ${sample.runId}` +
+              ` · ${count} 条事件 · status=${sample.status} · restored=${sample.restored}` +
+              ` · evidence=${sample.evidence}`,
+          );
+          if (!hasEvidence) failures += 1;
+
+          // 被打断的 Run 必须落成 INTERRUPTED，而不是继续假装在跑
+          if (sample.runId === seededRunId) {
+            const ok = sample.status === 'INTERRUPTED' || sample.status === 'FAILED';
+            console.log(
+              `[selftest] ${ok ? 'PASS' : 'FAIL'} 被打断的 Run 有明确终态 → ${sample.status}` +
+                `（${String(sample.statusReason ?? '')}）`,
+            );
+            if (!ok) failures += 1;
+          }
+        }
+      }
+    }
+
+    // 还原：删掉测试凭据、恢复官方 origin
+    await callCore('model.updateProfile', { profileId: 'profile_anthropic', baseUrlOverride: '' });
+    if (savedKey) credentials.setKey('anthropic', savedKey);
+    else credentials.removeKey('anthropic');
+    await syncCredentialsToCore();
   }
 
   // 负向：白名单外的方法必须被 Core 拒绝

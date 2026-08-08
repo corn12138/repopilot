@@ -20,7 +20,7 @@ export function RunStatusBadge({ status }: { status: RunStatus }) {
         ? 'warn'
         : status === 'FAILED' || status === 'TIMED_OUT'
           ? 'err'
-          : status === 'BLOCKED' || status === 'CANCELLED'
+          : status === 'BLOCKED' || status === 'CANCELLED' || status === 'INTERRUPTED'
             ? 'warn'
             : status === 'AWAITING_PLAN_APPROVAL' || status === 'AWAITING_PATCH_REVIEW'
               ? 'purple'
@@ -42,6 +42,14 @@ export function ResolutionBadge({ resolution }: { resolution: ToolCallResolution
         ? 'err'
         : 'warn';
   return <Badge tone={tone}>{resolution}</Badge>;
+}
+
+/** 恢复态与证据完整性徽标。两者都必须一眼可见，否则用户会把只读当成能续跑。 */
+export function RestoredBadge({ run }: { run: { restored: boolean; evidence: string } }) {
+  if (run.evidence === 'DAMAGED') return <Badge tone="err">证据损坏</Badge>;
+  if (run.evidence === 'EVENTS_AHEAD') return <Badge tone="warn">状态落后于事件</Badge>;
+  if (run.restored) return <Badge tone="info">已从磁盘恢复</Badge>;
+  return null;
 }
 
 export function DoctorBadge({ status }: { status: DoctorStatus }) {
