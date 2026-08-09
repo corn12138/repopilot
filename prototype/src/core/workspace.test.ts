@@ -219,6 +219,34 @@ describe('resolveManaged — 受管根边界', () => {
     writeTree(root, { 'src/app.ts': 'x' });
     expect(resolveManaged(root, 'src/app.ts')).toBe(join(root, 'src/app.ts'));
   });
+
+  it('大小写不一致的路径被拒绝，不落到真实文件（PATH_CASE_MISMATCH）', () => {
+    writeTree(root, { 'package.json': '{}' });
+    // 在大小写敏感的文件系统上（多数 Linux CI），'Package.json' 本就是另一个不存在的路径，
+    // existsSync 为 false，走的是"新文件"分支 —— 这条攻击在那里根本不成立，跳过。
+    if (!existsSync(join(root, 'Package.json'))) return;
+
+    const v = violationOf(() => resolveManaged(root, 'Package.json'));
+    expect(v.reason).toBe('PATH_CASE_MISMATCH');
+  });
+
+  it('中间目录大小写不一致也拒绝（.GitHub/workflows 落到 .github/workflows）', () => {
+    writeTree(root, { '.github/workflows/ci.yml': 'name: ci' });
+    if (!existsSync(join(root, '.GitHub/workflows/ci.yml'))) return;
+
+    const v = violationOf(() => resolveManaged(root, '.GitHub/workflows/ci.yml'));
+    expect(v.reason).toBe('PATH_CASE_MISMATCH');
+  });
+
+  it('大小写完全一致时正常放行 —— 防绕过不能误伤合法路径', () => {
+    writeTree(root, { 'package.json': '{}' });
+    expect(resolveManaged(root, 'package.json')).toBe(join(root, 'package.json'));
+  });
+
+  it('创建全新文件的末段不受影响（无同名大小写变体时）', () => {
+    writeTree(root, { 'src/app.ts': 'x' });
+    expect(resolveManaged(root, 'src/new.ts')).toBe(join(root, 'src/new.ts'));
+  });
 });
 
 describe('工作区读取不会顺着 symlink 逃出受管根', () => {

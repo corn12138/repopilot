@@ -430,7 +430,10 @@ export type MutationBlockReason =
   | 'TARGET_EXISTS'
   | 'TARGET_ABSENT'
   | 'BUDGET_EXCEEDED'
-  | 'SYMLINK_REJECTED';
+  | 'SYMLINK_REJECTED'
+  /** 请求路径的拼写与磁盘上真实条目不一致（大小写/Unicode 归一绕过）：
+   * 例如在 APFS 上用 'Package.json' 落到 'package.json'，绕过大小写敏感的受保护路径匹配 */
+  | 'PATH_CASE_MISMATCH';
 
 export interface MutationOperationResult {
   readonly path: string;

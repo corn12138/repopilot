@@ -311,6 +311,46 @@ describe('路径策略', () => {
     if (!result.ok) expect(result.reason).toBe('PROTECTED_PATH');
   });
 
+  it('大小写变体绕过受保护路径 → 整笔拒绝，package.json 逐字节不变', () => {
+    // 攻击链：fs_read('Package.json') 拿 receipt（APFS 大小写不敏感读成功）
+    // → REPLACE_WHOLE_FILE path='Package.json' 覆盖 package.json，
+    // 而 protectedPaths=['package.json'] 的大小写敏感匹配对不上 'Package.json'。
+    // resolveManaged 的 PATH_CASE_MISMATCH 必须在写入前把整笔拦下。
+    const before = workspace.readText('package.json');
+
+    // 在大小写敏感的 fs 上（多数 Linux CI），'Package.json' 是另一个不存在的路径，
+    // issueReceipt 会直接失败，这条攻击根本不成立 —— 跳过。
+    let receiptId: string;
+    try {
+      receiptId = workspace.issueReceipt('Package.json').receipt.receiptId;
+    } catch {
+      return;
+    }
+
+    const result = applyMutationPlan(
+      workspace,
+      {
+        planId: 'p1',
+        runId,
+        inputGeneration: workspace.activeGeneration,
+        operations: [
+          {
+            kind: 'REPLACE_WHOLE_FILE',
+            path: 'Package.json',
+            receiptId,
+            newText: '{"scripts":{"build":"true"}}',
+          },
+        ],
+      },
+      { ...DEFAULT_MUTATION_POLICY, protectedPaths: ['package.json'] },
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('PATH_CASE_MISMATCH');
+    // 最硬的断言：真实文件一个字节都没被改
+    expect(workspace.readText('package.json')).toBe(before);
+  });
+
   it('不在 allowedPaths 内 → PATH_NOT_ALLOWED', () => {
     const result = applyMutationPlan(
       workspace,

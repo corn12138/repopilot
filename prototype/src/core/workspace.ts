@@ -224,12 +224,24 @@ export function resolveManaged(root: string, relPath: string): string {
   if (abs !== rootResolved && !abs.startsWith(rootResolved + sep)) {
     throw new PathViolation(`路径逃逸受管根: ${relPath}`, 'PATH_ESCAPE');
   }
-  // 逐级检查 symlink：任何一级是链接都拒绝
+  // 逐级检查：symlink 一律拒绝；请求拼写必须与磁盘真实条目逐字节一致
   let cursor = rootResolved;
   for (const part of relative(rootResolved, abs).split(sep).filter(Boolean)) {
+    const parent = cursor;
     cursor = join(cursor, part);
-    if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) {
+    if (!existsSync(cursor)) continue; // 尚不存在（如 CREATE 的新末段）：留给上层判定
+    if (lstatSync(cursor).isSymbolicLink()) {
       throw new PathViolation(`拒绝 symlink: ${relPath}`, 'SYMLINK_REJECTED');
+    }
+    // 大小写 / Unicode 归一防绕过：macOS APFS 默认对大小写与 NFC/NFD 都不敏感，
+    // 于是 existsSync('Package.json') 对 package.json 返回 true、写入会覆盖它，
+    // 而受保护路径匹配（globMatch 编成大小写敏感正则）却对不上 —— 一条完整的越权。
+    // 要求请求拼写与父目录里的真实条目逐字节相等，把这条通路堵死。
+    if (!readdirSync(parent).includes(part)) {
+      throw new PathViolation(
+        `路径拼写与磁盘上的真实条目不一致（大小写/Unicode 归一绕过）: ${relPath}`,
+        'PATH_CASE_MISMATCH',
+      );
     }
   }
   return abs;
@@ -243,7 +255,7 @@ export function isGeneratedPath(relPath: string): boolean {
 export class PathViolation extends Error {
   constructor(
     message: string,
-    readonly reason: 'PATH_ESCAPE' | 'SYMLINK_REJECTED',
+    readonly reason: 'PATH_ESCAPE' | 'SYMLINK_REJECTED' | 'PATH_CASE_MISMATCH',
   ) {
     super(message);
   }
