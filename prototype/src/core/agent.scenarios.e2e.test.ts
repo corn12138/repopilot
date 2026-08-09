@@ -17,7 +17,7 @@ import type {
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { type AgentHost, type ModelInvoker, runAgent } from './agent';
 import type { ModelResponse } from './model/types';
-import { findOrphanToolUse } from './model/types';
+import { findWireViolation } from './model/types';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { sealPatch } from './patch';
 import { ensureDataRoot, snapshotDir } from './paths';
@@ -505,7 +505,7 @@ class ScriptedModel implements ModelInvoker {
   async invoke(input: Parameters<ModelInvoker['invoke']>[0]) {
     // 真实 provider 会对孤儿 tool_use 返回 400，测试替身不会 —— 所以这里
     // 主动用与网关同一个校验器把关，否则这类回归在测试里是静默的。
-    const orphan = findOrphanToolUse(input.request.messages);
+    const orphan = findWireViolation(input.request.messages);
     if (orphan) throw new Error(`${input.purpose} 调用收到非法消息序列：${orphan}`);
     const messages = input.request.messages;
     const lastUserText = JSON.stringify(messages[messages.length - 1]?.content ?? '');

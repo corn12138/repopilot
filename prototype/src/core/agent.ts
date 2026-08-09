@@ -211,13 +211,12 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
 
   // ---- 3. 执行 + 有界自修复 ----
   host.setStatus('EXECUTING', null);
-  conversation.push({
-    role: 'user',
-    content: [
-      {
-        type: 'text',
-        text:
-          `用户已批准以下计划，现在开始执行。\n\n${renderPlan(plan)}\n\n` +
+  // 规划期末尾刚回填过 tool_result（也是 user），必须合并而不是新起一条 —— 见 pushUser
+  pushUser(conversation, [
+    {
+      type: 'text',
+      text:
+        `用户已批准以下计划，现在开始执行。\n\n${renderPlan(plan)}\n\n` +
           `执行规则：\n` +
           `- 修改现有文件前必须先用 fs_read 取得 receiptId。\n` +
           `- 用 workspace_mutate 提交改动；oldText 必须在文件中唯一命中。\n` +
@@ -227,9 +226,8 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
             : `- 本次任务没有配置验证命令，你无法证明改动是对的。因此要格外保守：\n` +
               `  只做计划里明确说过的改动，不要顺手重构。\n` +
               `- 改完后用一句话说明你做了什么、以及哪些地方你没有把握，然后结束。`),
-      },
-    ],
-  });
+    },
+  ]);
 
   let finalVerification: VerificationRun | null = null;
   /** 最后一轮执行是怎么结束的 —— 供收尾时判断"是不是被预算掐断的" */
@@ -316,18 +314,16 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
     round += 1;
     host.chargeSelfFixRound();
     host.emit('SELF_FIX_ROUND', `进入第 ${round}/${maxRounds} 轮自修复`, { round });
-    conversation.push({
-      role: 'user',
-      content: [
-        {
-          type: 'text',
-          text:
-            `验证仍未通过。这是第 ${round}/${maxRounds} 轮自修复，也是你最后的机会之一。\n\n` +
-            `${summarizeFailures(finalVerification)}\n\n` +
-            `请先判断这是不是与之前相同的失败。如果是同一个错误，说明上一次的改法不对，换一种思路。`,
-        },
-      ],
-    });
+    // 上一轮若以 BUDGET_EXHAUSTED 提前返回，末尾可能仍是 user —— 用 pushUser 合并
+    pushUser(conversation, [
+      {
+        type: 'text',
+        text:
+          `验证仍未通过。这是第 ${round}/${maxRounds} 轮自修复，也是你最后的机会之一。\n\n` +
+          `${summarizeFailures(finalVerification)}\n\n` +
+          `请先判断这是不是与之前相同的失败。如果是同一个错误，说明上一次的改法不对，换一种思路。`,
+      },
+    ]);
   }
 
   const comparison = compareVerification(baseline!, finalVerification);
@@ -373,15 +369,12 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
     if (uses.length === 0) {
       // 没有调用 submit_plan 就想结束 —— 明确要求它提交结构化计划
       conversation.push({ role: 'assistant', content: response.content });
-      conversation.push({
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: '请调用 submit_plan 工具提交结构化计划。纯文字回复不能进入审批流程。',
-          },
-        ],
-      });
+      pushUser(conversation, [
+        {
+          type: 'text',
+          text: '请调用 submit_plan 工具提交结构化计划。纯文字回复不能进入审批流程。',
+        },
+      ]);
       continue;
     }
 
@@ -469,7 +462,7 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
     }
 
     // 先写回历史，再决定是否返回 —— 顺序反了就是这个 bug 本身
-    conversation.push({ role: 'user', content: results });
+    pushUser(conversation, results);
     if (submitted) return submitted;
   }
 
@@ -477,6 +470,27 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
 }
 
 export class PlanningFailed extends Error {}
+
+/**
+ * 追加一条 user 消息；**末尾已经是 user 消息时合并进去**，不新起一条。
+ *
+ * 因为 Anthropic 要求 role 严格交替（连续两条 user 返回
+ * `roles must alternate between "user" and "assistant"`，同样是 400），
+ * 而 OpenAI 兼容端对此宽容 —— 只在一家上炸的错误最容易漏。
+ *
+ * 这个坑是修孤儿 tool_use 时自己造出来的：规划期提交计划后先回填 tool_result（user），
+ * 紧接着 runAgent 又 push 审批通知（user）。合并对两家都合法：
+ * Anthropic 允许一条 user 消息里同时有 tool_result 和 text 块；
+ * OpenAI 适配器的 toWireMessages 会把它们拆成 role:'tool' + role:'user' 两条。
+ */
+function pushUser(conversation: ModelMessage[], blocks: readonly ContentBlock[]): void {
+  const last = conversation[conversation.length - 1];
+  if (last?.role === 'user') {
+    conversation[conversation.length - 1] = { role: 'user', content: [...last.content, ...blocks] };
+    return;
+  }
+  conversation.push({ role: 'user', content: [...blocks] });
+}
 
 // ---------------------------------------------------------------------------
 // 交叉审核（只读的第二个模型；PRD-XAGENT-003）
@@ -606,7 +620,7 @@ export async function runReviewPass(
       });
     }
 
-    conversation.push({ role: 'user', content: results });
+    pushUser(conversation, results);
 
     if (submitted) {
       const findings: ReviewFinding[] = submitted.findings.map((f) => {
@@ -774,7 +788,7 @@ async function executionTurns(
           isError: true,
         });
       }
-      conversation.push({ role: 'user', content: results });
+      pushUser(conversation, results);
     }
   }
 }

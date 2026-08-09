@@ -99,6 +99,32 @@ export function toolUsesOf(
 }
 
 /**
+ * 检查 role 是否严格交替。
+ *
+ * Anthropic 明确要求 user / assistant 交替，连续两条同角色会返回
+ * `roles must alternate between "user" and "assistant"`（同样是 400）。
+ * OpenAI 兼容端对此宽容 —— 所以这条只在 Anthropic 上炸，更容易漏。
+ *
+ * 这个坑是补 tool_result 时自己造出来的：规划期提交计划后先回填 tool_result（user），
+ * 紧接着又 push 审批通知（user）。修 A（孤儿 tool_use）顺手制造了 B。
+ *
+ * 返回 null 表示合法。
+ */
+export function findRoleAlternationViolation(messages: readonly ModelMessage[]): string | null {
+  for (let i = 1; i < messages.length; i += 1) {
+    if (messages[i]!.role === messages[i - 1]!.role) {
+      return `messages[${i - 1}] 与 messages[${i}] 都是 ${messages[i]!.role} —— role 必须交替`;
+    }
+  }
+  return null;
+}
+
+/** 出站前的消息序列体检：孤儿 tool_use + role 交替。返回 null 表示合法。 */
+export function findWireViolation(messages: readonly ModelMessage[]): string | null {
+  return findOrphanToolUse(messages) ?? findRoleAlternationViolation(messages);
+}
+
+/**
  * 检查消息序列是否满足两家 wire 共同的硬性要求：
  * **每条含 tool_use 的 assistant 消息，下一条消息必须回填全部 toolUseId。**
  *

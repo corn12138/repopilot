@@ -25,7 +25,7 @@ import {
   saveCustomProvider,
 } from './registry';
 import {
-  findOrphanToolUse,
+  findWireViolation,
   ModelCallError,
   type ModelAdapter,
   type ModelMessage,
@@ -452,8 +452,8 @@ export class ModelGateway {
     if (!resolution.origin.startsWith('https://')) return 'INSECURE_ORIGIN';
     // 我们自己拼错的历史，不要花一次真实请求去换供应商的一句 400。
     // 详见 findOrphanToolUse 的注释：孤儿会污染此后每一次请求，不只是这一次。
-    const orphan = findOrphanToolUse(messages);
-    if (orphan) return `MALFORMED_CONVERSATION: ${orphan}`;
+    const violation = findWireViolation(messages);
+    if (violation) return `MALFORMED_CONVERSATION: ${violation}`;
     return null;
   }
 }

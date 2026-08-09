@@ -17,7 +17,7 @@ import type {
 import { digestOf, newId, nowIso, sha256 } from '@shared/ids';
 import { AgentCancelled, PlanningFailed, type AgentHost, type ModelInvoker, runAgent } from './agent';
 import type { ContentBlock, ModelMessage, ModelResponse } from './model/types';
-import { findOrphanToolUse, toolUsesOf } from './model/types';
+import { findOrphanToolUse, findWireViolation, toolUsesOf } from './model/types';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { type MaterializedWorkspace, listTree, resolveManaged } from './workspace';
 
@@ -230,7 +230,7 @@ class ScriptedModel implements ModelInvoker {
     // 先快照再校验：抛在快照前的话，出问题的那一次调用反而查不到。
     // 真实 provider 会对孤儿 tool_use 返回 400，测试替身不会 —— 所以这里
     // 主动用与网关同一个校验器把关，否则这类回归在测试里是静默的。
-    const orphan = findOrphanToolUse(input.request.messages);
+    const orphan = findWireViolation(input.request.messages);
     if (orphan) {
       throw new Error(`第 ${this.calls.length} 次调用（${input.purpose}）收到非法消息序列：${orphan}`);
     }
