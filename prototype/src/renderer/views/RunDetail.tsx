@@ -136,7 +136,7 @@ export function RunDetail({
         )}
       </Card>
 
-      {approvals.length > 0 && plan && (
+      {approvals.length > 0 && plan && run.status === 'AWAITING_PLAN_APPROVAL' && (
         <PlanApproval approval={approvals[0]!} plan={plan} onError={onError} />
       )}
 

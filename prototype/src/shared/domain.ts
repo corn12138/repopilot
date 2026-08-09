@@ -548,7 +548,10 @@ export type ModelInvocationPurpose =
   | 'EXECUTION'
   | 'SELF_FIX'
   | 'COMPACTION'
-  | 'TITLE_SUMMARY';
+  | 'TITLE_SUMMARY'
+  /** 设置页「测试连接」的连通性探针 —— 不属于任何 Run，但同样带真实凭据出站，
+   * 因此同样要产出 ModelEgressManifest（没有"辅助调用免记账"的旁路）。 */
+  | 'CONNECTIVITY_TEST';
 
 /** 凭据从哪来。应用内录入优先于环境变量。 */
 export type CredentialSource = 'APP' | 'ENV' | 'NONE';

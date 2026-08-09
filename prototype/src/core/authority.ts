@@ -78,7 +78,64 @@ interface ProjectRecord {
 
 interface PendingApproval {
   readonly request: ApprovalRequest;
+  /** 兑现审批：内部会清理超时定时器、abort 监听，并恢复墙钟 deadline */
   readonly resolve: (decision: ApprovalDecisionKind) => void;
+}
+
+/**
+ * 可暂停的墙钟 deadline。
+ *
+ * 存在的理由：等待**人工审批**的时间不该算进 Run 的计算预算 —— 用户花 25 分钟
+ * 审一个计划，不该导致 Run 被判 TIMED_OUT。所以进入审批等待时 pause()，
+ * 用户决定后 resume()。审批期间模型并没有在跑，计算时间仍然是有界的。
+ *
+ * 之前是一个从 execute 开始就一直在走的 setTimeout，它覆盖了审批等待时间，
+ * 且到点只 abort + setStatus，不兑现 awaitPlanApproval 的 Promise —— 于是
+ * runAgent 永远挂在 await 上，execute 的 finally（清理 + CLEANUP_SUMMARY）永不执行。
+ */
+export class PausableDeadline {
+  private handle: ReturnType<typeof setTimeout> | null = null;
+  private remaining: number;
+  private startedAt = 0;
+  private done = false;
+
+  constructor(
+    totalMs: number,
+    private readonly onFire: () => void,
+  ) {
+    this.remaining = totalMs;
+    this.arm();
+  }
+
+  private arm(): void {
+    if (this.done || this.handle) return;
+    this.startedAt = Date.now();
+    this.handle = setTimeout(() => {
+      this.handle = null;
+      this.done = true;
+      this.onFire();
+    }, Math.max(0, this.remaining));
+    this.handle.unref?.();
+  }
+
+  pause(): void {
+    if (this.done || !this.handle) return;
+    clearTimeout(this.handle);
+    this.handle = null;
+    this.remaining -= Date.now() - this.startedAt;
+  }
+
+  resume(): void {
+    this.arm();
+  }
+
+  clear(): void {
+    this.done = true;
+    if (this.handle) {
+      clearTimeout(this.handle);
+      this.handle = null;
+    }
+  }
 }
 
 interface RunRecord {
@@ -93,6 +150,8 @@ interface RunRecord {
   readonly workspace: MaterializedWorkspace | null;
   readonly events: EventStore;
   readonly abort: AbortController;
+  /** 运行期墙钟 deadline；审批等待时暂停。恢复态与非执行期为 null */
+  deadline: PausableDeadline | null;
   readonly toolCalls: Map<string, ToolCallView>;
   readonly verifications: VerificationRun[];
   readonly approvals: Map<string, PendingApproval>;
@@ -227,6 +286,7 @@ export class RunAuthority {
         workspace: null, // 恢复态没有活工作区
         events,
         abort: abortedController(),
+        deadline: null,
         toolCalls: new Map(s.toolCalls.map((t) => [t.toolCallId, t])),
         verifications: [...s.verifications],
         approvals: new Map(),
@@ -309,6 +369,7 @@ export class RunAuthority {
       workspace: null,
       events,
       abort: abortedController(),
+      deadline: null,
       toolCalls: new Map(),
       verifications: [],
       approvals: new Map(),
@@ -727,6 +788,7 @@ export class RunAuthority {
       workspace,
       events: new EventStore(runId),
       abort: new AbortController(),
+      deadline: null,
       toolCalls: new Map(),
       verifications: [],
       approvals: new Map(),
@@ -783,13 +845,16 @@ export class RunAuthority {
       return;
     }
 
-    const deadline = setTimeout(() => {
+    const deadline = new PausableDeadline(record.task.budget.maxWallClockMs, () => {
       if (!isTerminal(record.view.status)) {
         record.abort.abort();
+        // 防御性：正常情况下审批期间 deadline 是暂停的，不会在这里撞上待审批；
+        // 但万一撞上，也要兑现 Promise 让 runAgent 解开、finally 得以执行。
+        this.cleanupPendingApprovals(record);
         this.setStatus(record, 'TIMED_OUT', '超过任务时间预算');
       }
-    }, record.task.budget.maxWallClockMs);
-    deadline.unref?.();
+    });
+    record.deadline = deadline;
 
     try {
       const result = await runAgent({
@@ -807,7 +872,7 @@ export class RunAuthority {
         runId: record.view.runId,
         attemptId: record.view.attemptId,
         signal: record.abort.signal,
-        host: this.hostFor(record, startedAt),
+        host: this.hostFor(record, startedAt, deadline),
       });
 
       for (const v of [result.baseline, result.finalVerification]) {
@@ -867,7 +932,8 @@ export class RunAuthority {
         this.setStatus(record, 'FAILED', `运行时异常：${(err as Error).message}`);
       }
     } finally {
-      clearTimeout(deadline);
+      deadline.clear();
+      record.deadline = null;
       this.cleanupPendingApprovals(record);
       if (isTerminal(record.view.status) && record.view.status !== 'AWAITING_PATCH_REVIEW') {
         this.emit(record, 'CLEANUP_SUMMARY', '已释放模型流、子进程与审批等待', {
@@ -877,7 +943,7 @@ export class RunAuthority {
     }
   }
 
-  private hostFor(record: RunRecord, startedAt: number) {
+  private hostFor(record: RunRecord, startedAt: number, deadline: PausableDeadline) {
     return {
       emit: (kind: RunEventKind, summary: string, payload: Record<string, unknown> = {}) =>
         this.emit(record, kind, summary, payload),
@@ -898,8 +964,52 @@ export class RunAuthority {
           requestedAt: nowIso(),
           expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
         };
-        return new Promise<ApprovalDecisionKind>((resolve) => {
-          record.approvals.set(request.approvalId, { request, resolve });
+
+        // 人工审批不消耗计算预算：暂停墙钟，用户决定后再恢复。
+        deadline.pause();
+
+        return new Promise<ApprovalDecisionKind>((resolve, reject) => {
+          // 已被取消就别挂起了，否则 runAgent 永远等不到（addEventListener 对已 abort
+          // 的 signal 不会再触发）。正常路径上 runAgent 在调用本函数前刚 throwIfCancelled 过。
+          if (record.abort.signal.aborted) {
+            deadline.resume();
+            reject(new AgentCancelled('审批开始前已取消'));
+            return;
+          }
+
+          const cleanup = (): void => {
+            clearTimeout(expiry);
+            record.abort.signal.removeEventListener('abort', onAbort);
+            record.approvals.delete(request.approvalId);
+            this.pushApprovals(record);
+          };
+
+          // 取消 / 超时（deadline 兜底）→ abort：兑现 Promise，让 runAgent 解开、finally 执行。
+          const onAbort = (): void => {
+            cleanup();
+            reject(new AgentCancelled('审批等待期间被中止'));
+          };
+
+          // 审批自身的过期（30 分钟未决定）→ BLOCKED，与「计算超时 TIMED_OUT」区分。
+          // 之前这条只能被"用户回来点按钮"惰性触发，且那条分支只 delete 不 resolve，
+          // 于是 Promise 永久泄漏、CLEANUP_SUMMARY 永远发不出来。
+          const expiry = setTimeout(() => {
+            if (!record.approvals.has(request.approvalId)) return;
+            this.emit(record, 'NOTE', '计划审批已过期（超过 30 分钟未决定），已停止');
+            this.setStatus(record, 'BLOCKED', '计划审批已过期（超过 30 分钟未决定）');
+            record.abort.abort(); // 触发 onAbort → cleanup + reject
+          }, APPROVAL_TTL_MS);
+          expiry.unref?.();
+
+          record.approvals.set(request.approvalId, {
+            request,
+            resolve: (decision: ApprovalDecisionKind) => {
+              cleanup();
+              deadline.resume(); // 决定完成，计算预算继续计时
+              resolve(decision);
+            },
+          });
+          record.abort.signal.addEventListener('abort', onAbort, { once: true });
           this.pushApprovals(record);
         });
       },
@@ -1027,18 +1137,26 @@ export class RunAuthority {
         return { accepted: false, reason: '该 Run 已从磁盘恢复，没有在等待这个审批的执行器' };
       }
 
+      // 已进入终态的 Run 不再接受审批决定 —— 否则会往一个 TIMED_OUT/CANCELLED 的
+      // Run 上追加一条"用户批准了计划"的假审计记录，然后什么都不执行。
+      if (isTerminal(record.view.status)) {
+        return { accepted: false, reason: `当前状态 ${record.view.status} 不再接受审批决定` };
+      }
+
       // digest 不匹配 = 审批对象已变化，旧审批失效（PRD-APPR-002）
       if (pending.request.subjectDigest !== input.subjectDigest) {
         return { accepted: false, reason: '审批对象已变化，请重新查看后再决定' };
       }
       if (Date.parse(pending.request.expiresAt) < Date.now()) {
-        record.approvals.delete(input.approvalId);
-        this.pushApprovals(record);
+        // 与代理超时定时器同样处理：置 BLOCKED 并 abort（→ onAbort 兑现 Promise 并清理）。
+        // 绝不能只 delete 不 resolve —— 那正是之前 Promise 永久泄漏、CLEANUP_SUMMARY
+        // 永远发不出来的根因。
+        this.setStatus(record, 'BLOCKED', '计划审批已过期');
+        record.abort.abort();
         return { accepted: false, reason: '审批已过期' };
       }
 
-      record.approvals.delete(input.approvalId);
-      this.pushApprovals(record);
+      // pending.resolve 内部会清理定时器/监听、恢复墙钟、并从 map 删除
       pending.resolve(input.decision);
       return { accepted: true, reason: null };
     }
@@ -1054,10 +1172,13 @@ export class RunAuthority {
   }
 
   private cleanupPendingApprovals(record: RunRecord): void {
-    for (const [id, pending] of record.approvals) {
-      record.approvals.delete(id);
-      pending.resolve('REJECT');
+    // 先快照：pending.resolve 内部会从 record.approvals 删除自己，
+    // 边遍历边删原 map 容易漏项。
+    const pendings = [...record.approvals.values()];
+    for (const pending of pendings) {
+      pending.resolve('REJECT'); // 内部 cleanup：清定时器/监听、从 map 删除、恢复墙钟（已 clear 时为 no-op）
     }
+    record.approvals.clear();
     this.pushApprovals(record);
   }
 

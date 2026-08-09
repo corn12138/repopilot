@@ -21,6 +21,8 @@ export const PATHS = {
   snapshots: join(DATA_ROOT, 'snapshots'),
   workspaces: join(DATA_ROOT, 'workspaces'),
   artifacts: join(DATA_ROOT, 'artifacts'),
+  /** 不属于任何 Run 的出站记录（如设置页连通性测试）追加到这里 */
+  egressLog: join(DATA_ROOT, 'egress.jsonl'),
 } as const;
 
 export function ensureDataRoot(): void {

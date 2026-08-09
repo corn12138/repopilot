@@ -5,7 +5,8 @@ import type {
   ModelRouteResolution,
   ProviderId,
 } from '@shared/domain';
-import { join } from 'node:path';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { PATHS } from '../paths';
 import { readJson, writeJsonAtomic } from '../store';
@@ -37,6 +38,22 @@ const ADAPTERS: Record<'anthropic' | 'openai', ModelAdapter> = {
   anthropic: anthropicAdapter,
   openai: openAiWireAdapter,
 };
+
+/**
+ * 把不属于任何 Run 的出站清单追加到全局 egress 日志。
+ *
+ * Run 内的调用清单进各自的事件流；设置页的连通性测试没有 Run 归属，
+ * 但同样带真实凭据出站，必须留痕。写盘失败只记录不抛 —— 记账失败不该
+ * 让「测试连接」这个动作本身崩掉，但也绝不能静默当作没发生。
+ */
+export function appendEgress(manifest: ModelEgressManifest): void {
+  try {
+    mkdirSync(dirname(PATHS.egressLog), { recursive: true });
+    appendFileSync(PATHS.egressLog, `${JSON.stringify(manifest)}\n`, 'utf8');
+  } catch (err) {
+    console.error('[core] 写 egress 日志失败', err);
+  }
+}
 
 const SETTINGS_PATH = join(PATHS.root, 'model-profiles.json');
 
@@ -176,10 +193,27 @@ export class ModelGateway {
       throw new ModelCallError(`未知 profile: ${profileId}`, 'BAD_REQUEST');
     }
     const current = this.settingsOf(providerId);
+    const nextOverride =
+      patch.baseUrlOverride === undefined ? current.baseUrlOverride : patch.baseUrlOverride.trim();
+
+    // 非空覆盖地址必须是带主机名的 https —— 与 saveCustomProvider 同一道校验。
+    // 之前这里只 trim，normalizeBaseUrl 又放行 http:，于是 http://attacker 能被存进配置，
+    // 之后「测试连接」把 API key 明文发出去。空串表示清除覆盖，回落到环境变量/默认地址。
+    if (nextOverride) {
+      let parsed: URL;
+      try {
+        parsed = new URL(nextOverride);
+      } catch {
+        throw new ModelCallError('API 地址不是合法 URL', 'BAD_REQUEST');
+      }
+      if (parsed.protocol !== 'https:' || !parsed.host) {
+        throw new ModelCallError('API 地址必须是带主机名的 https:// 地址', 'BAD_REQUEST');
+      }
+    }
+
     this.settings[providerId] = {
       modelId: patch.modelId?.trim() || current.modelId,
-      baseUrlOverride:
-        patch.baseUrlOverride === undefined ? current.baseUrlOverride : patch.baseUrlOverride.trim(),
+      baseUrlOverride: nextOverride,
     };
     writeJsonAtomic(SETTINGS_PATH, this.settings);
     return this.buildProfile(providerId);
@@ -229,17 +263,65 @@ export class ModelGateway {
   ): Promise<{ ok: boolean; detail: string; latencyMs: number | null }> {
     const profile = this.getProfile(profileId);
     if (!profile) return { ok: false, detail: '未知 profile', latencyMs: null };
+
+    // 连通性探针不属于任何 Run，但同样带真实凭据出站 —— 每一种结局（含被阻断）
+    // 都产出一条 ModelEgressManifest 追加到全局 egress 日志。gateway 类注释写明：
+    // 没有"辅助调用免记账"的旁路。
+    const requestedAt = nowIso();
+    const baseManifest = {
+      invocationId: newId('inv'),
+      runId: 'connectivity-test',
+      attemptId: 'connectivity-test',
+      purpose: 'CONNECTIVITY_TEST' as const,
+      resolutionId: 'connectivity-test',
+      providerId: profile.providerId,
+      origin: profile.origin,
+      modelId: profile.modelId,
+      contextFileRefs: [] as readonly string[],
+      requestedAt,
+    };
+    const record = (m: ModelEgressManifest): void => appendEgress(m);
+
     const apiKey = this.keyFor(profile.providerId);
     if (!apiKey) {
+      record({
+        ...baseManifest,
+        sent: false,
+        blockReason: 'CREDENTIAL_MISSING',
+        inputTokens: null,
+        outputTokens: null,
+        settledAt: nowIso(),
+        errorKind: null,
+      });
       return {
         ok: false,
         detail: `未配置凭据（应用内未填，环境变量 ${profile.credentialEnvVar} 也没有）`,
         latencyMs: null,
       };
     }
+
+    // 明文出站前拦住：即使 origin 来自环境变量（绕过 updateProfile 的校验），
+    // 也不能把 key 通过 http 发出去。testProfile 之前完全不过这道门。
+    if (!profile.origin.startsWith('https://')) {
+      record({
+        ...baseManifest,
+        sent: false,
+        blockReason: 'INSECURE_ORIGIN',
+        inputTokens: null,
+        outputTokens: null,
+        settledAt: nowIso(),
+        errorKind: null,
+      });
+      return {
+        ok: false,
+        detail: `拒绝测试：地址不是 https（${profile.origin}）。明文 HTTP 会暴露 API Key。`,
+        latencyMs: null,
+      };
+    }
+
     const started = Date.now();
     try {
-      await this.adapterFor(profile.wire).call(
+      const response = await this.adapterFor(profile.wire).call(
         {
           system: 'You are a connectivity probe. Reply with exactly: ok',
           messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
@@ -249,6 +331,15 @@ export class ModelGateway {
         },
         { apiKey, modelId: profile.modelId, signal, baseUrl: profile.origin },
       );
+      record({
+        ...baseManifest,
+        sent: true,
+        blockReason: null,
+        inputTokens: response.inputTokens,
+        outputTokens: response.outputTokens,
+        settledAt: nowIso(),
+        errorKind: null,
+      });
       return {
         ok: true,
         detail: `${profile.modelId} @ ${profile.origin} 连接正常（凭据来自${profile.credentialSource === 'APP' ? '应用内' : '环境变量'}）`,
@@ -256,6 +347,15 @@ export class ModelGateway {
       };
     } catch (err) {
       const e = err as ModelCallError;
+      record({
+        ...baseManifest,
+        sent: true, // 请求确实发出去了，只是没成功
+        blockReason: null,
+        inputTokens: null,
+        outputTokens: null,
+        settledAt: nowIso(),
+        errorKind: e.kind ?? 'UNKNOWN',
+      });
       return { ok: false, detail: `${e.kind}: ${e.message}`, latencyMs: Date.now() - started };
     }
   }
