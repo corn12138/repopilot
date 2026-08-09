@@ -184,6 +184,15 @@ export type RunStatus =
   | 'AWAITING_PLAN_APPROVAL'
   | 'EXECUTING'
   | 'VERIFYING'
+  /**
+   * 补丁已封存、验证已完成，正在由**第二个模型**只读交叉审核（PRD-XAGENT-003）。
+   *
+   * 非终态，介于 VERIFYING 与 AWAITING_PATCH_REVIEW 之间。审核方的"通过"绝不等于
+   * SUCCEEDED —— 那需要机器验证。审核只产出 findings，最终仍由人在
+   * AWAITING_PATCH_REVIEW 决定（即 PRD 的 HUMAN_REVIEW_REQUIRED）。
+   * 不进可跨重启存活白名单：它需要活的执行器。
+   */
+  | 'CROSS_REVIEWING'
   | 'AWAITING_PATCH_REVIEW'
   | 'SUCCEEDED'
   /** 用户接受了补丁，但没有任何机器验证支撑 —— 与 SUCCEEDED 严格区分 */
@@ -532,6 +541,103 @@ export interface PatchArtifact {
 }
 
 export type PatchDecisionKind = 'ACCEPT' | 'REJECT' | 'REQUEST_CHANGES';
+
+// ---------------------------------------------------------------------------
+// 交叉审核（PRD-XAGENT-003/004 的诚实子集：第二个模型 API 只读交叉审核）
+// ---------------------------------------------------------------------------
+//
+// 明确边界：这里用的是两个 `ModelConnectionProfile`，**不是** PRD 定义的
+// `ExternalCodingAgentConnectorProfile`（那要求接官方 Codex CLI / Claude Code 的
+// 非交互接口，含 binary identity、capability probe、ExternalCandidateWorkspace）。
+// PRD 第 439 行要求这两个概念不得互相冒充：所以对外只能说"第二个模型 API 交叉审核"，
+// 不能说"已接入 Codex / Claude Code"。
+
+export type ReviewSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
+
+/**
+ * 只读审核方产出的单条发现。形状对齐 TD §12.17 的 ReviewFindingArtifact：
+ * severity / confidence / file / range / evidence / reproduction /
+ * suggestedRemediation / blocking / fingerprint。
+ *
+ * 审核方**只能**产出这个 —— 不能改工作区、不能批准补丁、不能改 Run 终态。
+ */
+export interface ReviewFinding {
+  readonly severity: ReviewSeverity;
+  /** 0..1，审核方对这条判断的把握 */
+  readonly confidence: number;
+  readonly file: string | null;
+  /** [startLine, endLine]，1-based；无法定位时为 null */
+  readonly range: readonly [number, number] | null;
+  readonly evidence: string;
+  readonly reproduction: string | null;
+  readonly suggestedRemediation: string | null;
+  /** true = 阻断性缺陷，会驱动一次整改；false = 提示性 */
+  readonly blocking: boolean;
+  /**
+   * 去重指纹。同一指纹在多轮里重复出现是"没有进展"的信号之一，
+   * 会触发提前转人工（PRD-XAGENT-004）。
+   */
+  readonly fingerprint: string;
+}
+
+/** 单次审核调用的判定 —— "通过"仅指"没发现阻断项"，绝不是 Verification/SUCCEEDED */
+export type CrossReviewVerdict = 'PASS' | 'CHANGES_REQUESTED' | 'INCONCLUSIVE';
+
+/** 一次 reviewer invocation 的不可变记录 */
+export interface CrossReviewRound {
+  readonly round: number;
+  /** 审核所针对的补丁 digest —— 用来判定"整改后 digest 是否真的变了" */
+  readonly reviewedPatchDigest: Digest;
+  readonly reviewerResolutionId: string;
+  readonly verdict: CrossReviewVerdict;
+  readonly findings: readonly ReviewFinding[];
+  readonly startedAt: Iso8601;
+  readonly finishedAt: Iso8601;
+}
+
+/**
+ * 为什么交叉审核结束、把控制权交回人手上。
+ *
+ * 除 REVIEWER_PASSED / COUNTER_EXHAUSTED 外，都是提前转人工的早停信号
+ * （PRD-XAGENT-004）。无论哪种，终点都是 AWAITING_PATCH_REVIEW（= HUMAN_REVIEW_REQUIRED），
+ * 绝不自动接受。
+ */
+export type CrossReviewStopReason =
+  | 'REVIEWER_PASSED' // 审核方无阻断发现
+  | 'COUNTER_EXHAUSTED' // 用满 2 次审核 + 1 次整改
+  | 'NO_DELTA' // 整改后补丁 digest 没变
+  | 'NO_PROGRESS' // 阻断项没减少或出现重复指纹
+  | 'REVIEWER_UNAVAILABLE' // 只配了一家 key / 审核方 route 不可用
+  | 'BUDGET_EXHAUSTED'
+  | 'CANCELLED'
+  | 'ERROR';
+
+/**
+ * 整个交叉审核过程的聚合记录，挂在 Run 上、进 state.json。
+ *
+ * counter 是"任务级聚合"：换窗口、换模型、恢复 session 都不能重置它
+ * （PRD-XAGENT-004）。
+ */
+export interface CrossReviewRecord {
+  readonly enabled: boolean;
+  readonly reviewerProfileId: string;
+  /** 两条 route 是否异构（不同 provider）—— 同源审核价值有限，如实标注 */
+  readonly heterogeneous: boolean;
+  readonly rounds: readonly CrossReviewRound[];
+  /** 已消耗的 reviewer invocation 次数（上限 2） */
+  readonly reviewerInvocations: number;
+  /** 已消耗的 remediation 次数（上限 1） */
+  readonly remediations: number;
+  readonly stopReason: CrossReviewStopReason | null;
+  readonly startedAt: Iso8601;
+  readonly finishedAt: Iso8601 | null;
+}
+
+/** 交叉审核的收敛硬上限 —— 不可放宽（PRD-XAGENT-004） */
+export const CROSS_REVIEW_LIMITS = {
+  maxReviewerInvocations: 2,
+  maxRemediations: 1,
+} as const;
 
 // ---------------------------------------------------------------------------
 // 模型
