@@ -234,7 +234,7 @@ describe('超时', () => {
     expect(r.exitCode).toBe(3);
   });
 
-  it('忽略 SIGTERM 的进程必须被 SIGKILL 兜底杀掉（当前 settled 守卫让升级逻辑成了死代码）', async () => {
+  it('忽略 SIGTERM 的进程必须被 SIGKILL 兜底杀掉（升级判据用 childClosed，不能复用 settled）', async () => {
     // killTree() 里那个 3 秒后的 SIGKILL 检查 `if (settled) return`，
     // 但 finish() 在 killTree() 之后立刻把 settled 置 true，所以升级永远不会发生。
     // 后果：任何屏蔽 SIGTERM 的构建工具（不少 watch/daemon 会这么干）在超时后继续活着。
