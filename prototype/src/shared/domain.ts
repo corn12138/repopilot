@@ -290,6 +290,12 @@ export type RunEventKind =
   | 'SELF_FIX_ROUND'
   | 'BUDGET_EXHAUSTED'
   | 'CLEANUP_SUMMARY'
+  /** 交叉审核开始（含 reviewer route 与是否异构） */
+  | 'CROSS_REVIEW_STARTED'
+  /** 一次 reviewer invocation 结束（verdict + 发现数） */
+  | 'CROSS_REVIEW_ROUND'
+  /** 交叉审核整体结束（stopReason） */
+  | 'CROSS_REVIEW_FINISHED'
   | 'NOTE';
 
 export interface RunEvent {
@@ -656,6 +662,8 @@ export type ModelInvocationPurpose =
   | 'PLANNING'
   | 'EXECUTION'
   | 'SELF_FIX'
+  /** 第二个模型对已封存补丁的只读交叉审核（PRD-XAGENT-003） */
+  | 'CROSS_REVIEW'
   | 'COMPACTION'
   | 'TITLE_SUMMARY'
   /** 设置页「测试连接」的连通性探针 —— 不属于任何 Run，但同样带真实凭据出站，

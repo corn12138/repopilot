@@ -1,10 +1,13 @@
 import { z } from 'zod';
 import type {
+  CrossReviewRound,
   ModelRouteResolution,
+  PatchArtifact,
   PlanRevision,
   PlanStep,
   RepositoryHarnessProfile,
   RepositorySnapshot,
+  ReviewFinding,
   RunEventKind,
   RunStatus,
   TaskSpec,
@@ -476,6 +479,240 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
 export class PlanningFailed extends Error {}
 
 // ---------------------------------------------------------------------------
+// 交叉审核（只读的第二个模型；PRD-XAGENT-003）
+// ---------------------------------------------------------------------------
+
+const reviewFindingSchema = z.object({
+  severity: z.enum(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']),
+  confidence: z.number().min(0).max(1),
+  file: z.string().nullable().optional(),
+  startLine: z.number().int().positive().nullable().optional(),
+  endLine: z.number().int().positive().nullable().optional(),
+  evidence: z.string().min(1),
+  reproduction: z.string().nullable().optional(),
+  suggestedRemediation: z.string().nullable().optional(),
+  blocking: z.boolean(),
+});
+
+const reviewSchema = z.object({
+  verdict: z.enum(['PASS', 'CHANGES_REQUESTED', 'INCONCLUSIVE']),
+  findings: z.array(reviewFindingSchema),
+});
+
+export interface ReviewPassInput {
+  readonly reviewerResolution: ModelRouteResolution;
+  readonly patch: PatchArtifact;
+  readonly finalVerification: VerificationRun | null;
+  /** 第几次 reviewer invocation（1-based），用于日志与记录 */
+  readonly round: number;
+}
+
+/**
+ * 跑一次只读交叉审核。
+ *
+ * 审核方拿到的是**已封存补丁的全文** + 任务目标/验收 + 验证结果，工具被平台强制为
+ * 只读（REVIEW phase，只有 R0）。它只能通过 submit_review 产出结构化 findings ——
+ * 不能改工作区、不能跑命令、不能批准补丁。这与"审核方通过 ≠ SUCCEEDED"是同一件事的
+ * 两个面：能力上做不到，语义上也不承认。
+ *
+ * 返回一次 CrossReviewRound。findings 的 fingerprint 由平台按 (severity,file,range,evidence)
+ * 计算，不信任模型自报 —— 指纹是判定"多轮之间有没有进展"的依据，不能让被审方操纵。
+ */
+export async function runReviewPass(
+  deps: AgentDeps,
+  input: ReviewPassInput,
+): Promise<CrossReviewRound> {
+  const startedAt = nowIso();
+  const { host } = deps;
+  const reviewTools = TOOLS.filter((t) => t.risk === 'R0'); // 只读子集
+  const system = reviewSystemPrompt(deps);
+
+  const conversation: ModelMessage[] = [
+    {
+      role: 'user',
+      content: [{ type: 'text', text: renderReviewBrief(deps.task, input.patch, input.finalVerification) }],
+    },
+  ];
+
+  const maxReviewTurns = 8;
+  for (let turn = 0; turn < maxReviewTurns; turn += 1) {
+    throwIfCancelled(deps.signal);
+    const response = await callModel(
+      deps,
+      conversation,
+      reviewTools,
+      'CROSS_REVIEW',
+      input.reviewerResolution,
+      system,
+    );
+    const uses = toolUsesOf(response.content);
+
+    if (uses.length === 0) {
+      // 只回了文本没提交结论 —— 要求它用 submit_review
+      conversation.push({ role: 'assistant', content: response.content });
+      conversation.push({
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: '请调用 submit_review 工具提交结构化审核结论（verdict + findings）。纯文字不计入审核记录。',
+          },
+        ],
+      });
+      continue;
+    }
+
+    conversation.push({ role: 'assistant', content: response.content });
+    const results: ContentBlock[] = [];
+    let submitted: z.infer<typeof reviewSchema> | null = null;
+
+    for (const use of uses) {
+      if (submitted) {
+        results.push({
+          type: 'tool_result',
+          toolUseId: use.id,
+          content: '本轮已提交审核结论，其余调用未执行。',
+          isError: true,
+        });
+        continue;
+      }
+      if (use.name === 'submit_review') {
+        const parsed = reviewSchema.safeParse(use.input);
+        if (!parsed.success) {
+          results.push({
+            type: 'tool_result',
+            toolUseId: use.id,
+            content: `审核结论 schema 校验失败：${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`,
+            isError: true,
+          });
+          continue;
+        }
+        submitted = parsed.data;
+        results.push({
+          type: 'tool_result',
+          toolUseId: use.id,
+          content: '审核结论已收到。',
+          isError: false,
+        });
+        continue;
+      }
+      // 只读工具（fs_read/fs_grep/...）；REVIEW phase 会挡掉任何非 R0
+      const outcome = await dispatchTool(deps, use.name, use.input, 'REVIEW');
+      results.push({
+        type: 'tool_result',
+        toolUseId: use.id,
+        content: outcome.text,
+        isError: !outcome.ok,
+      });
+    }
+
+    conversation.push({ role: 'user', content: results });
+
+    if (submitted) {
+      const findings: ReviewFinding[] = submitted.findings.map((f) => {
+        const range: readonly [number, number] | null =
+          f.startLine != null && f.endLine != null ? [f.startLine, f.endLine] : null;
+        return {
+          severity: f.severity,
+          confidence: f.confidence,
+          file: f.file ?? null,
+          range,
+          evidence: f.evidence,
+          reproduction: f.reproduction ?? null,
+          suggestedRemediation: f.suggestedRemediation ?? null,
+          blocking: f.blocking,
+          // 指纹由平台算，不用模型自报的 —— 它是"有没有进展"的判据
+          fingerprint: digestOf({
+            severity: f.severity,
+            file: f.file ?? null,
+            range,
+            evidence: f.evidence.trim().slice(0, 400),
+          }),
+        };
+      });
+      host.emit(
+        'CROSS_REVIEW_ROUND',
+        `第 ${input.round} 轮交叉审核：${submitted.verdict}，${findings.length} 条发现（阻断 ${findings.filter((x) => x.blocking).length}）`,
+        { round: input.round, verdict: submitted.verdict, findingCount: findings.length },
+      );
+      return {
+        round: input.round,
+        reviewedPatchDigest: input.patch.digest,
+        reviewerResolutionId: input.reviewerResolution.resolutionId,
+        verdict: submitted.verdict,
+        findings,
+        startedAt,
+        finishedAt: nowIso(),
+      };
+    }
+  }
+
+  // 用满轮次还没提交：记为 INCONCLUSIVE，不编造发现
+  host.emit('CROSS_REVIEW_ROUND', `第 ${input.round} 轮交叉审核用满 ${maxReviewTurns} 轮未提交结论`, {
+    round: input.round,
+    verdict: 'INCONCLUSIVE',
+  });
+  return {
+    round: input.round,
+    reviewedPatchDigest: input.patch.digest,
+    reviewerResolutionId: input.reviewerResolution.resolutionId,
+    verdict: 'INCONCLUSIVE',
+    findings: [],
+    startedAt,
+    finishedAt: nowIso(),
+  };
+}
+
+function renderReviewBrief(
+  task: TaskSpec,
+  patch: PatchArtifact,
+  verification: VerificationRun | null,
+): string {
+  const verifyLine = verification
+    ? `验证结果：${verification.passed ? '通过' : '未通过'}（${verification.commands.map((c) => `${c.commandId}=${c.outcome}`).join(' ')}）`
+    : '本次没有机器验证 —— 你的审核是唯一的第二意见，请格外仔细。';
+  const acc = task.acceptance.length ? task.acceptance.map((a) => `  - ${a}`).join('\n') : '  （无）';
+  const nonGoals = task.nonGoals.length ? task.nonGoals.map((g) => `  - ${g}`).join('\n') : '  （无）';
+  return `请审核下面这个**已封存**的补丁。你是独立的第二个模型，只读。
+
+任务目标：${task.goal}
+验收标准：
+${acc}
+明确的非目标（改了这些属于范围蔓延，应报为发现）：
+${nonGoals}
+允许改动的路径：${task.allowedPaths.join(', ') || '（未限定）'}
+${verifyLine}
+
+补丁 digest：${patch.digest}
+改动文件：${patch.files.map((f) => `${f.path}(${f.changeKind})`).join(', ')}
+${patch.unverifiedItems.length ? `实现方声明未覆盖：${patch.unverifiedItems.join('；')}` : ''}
+
+统一 diff：
+\`\`\`diff
+${patch.unifiedDiff.slice(0, 24_000)}
+\`\`\`
+${patch.unifiedDiff.length > 24_000 ? '（diff 过长已截断，可用 fs_read 读取完整文件核对）' : ''}
+
+请核对：正确性、是否真的满足验收、有没有范围蔓延、安全与边界、以及验证覆盖不到的地方。
+需要时用只读工具读取补丁后的文件。核对完调用 submit_review 提交：
+- verdict：PASS（无阻断发现）/ CHANGES_REQUESTED（有阻断发现）/ INCONCLUSIVE（信息不足下结论）
+- findings：每条给 severity/confidence/file/range/evidence/blocking，尽量给 reproduction 与 suggestedRemediation。
+不要臆造发现；没有阻断问题就如实 PASS。`;
+}
+
+function reviewSystemPrompt(deps: AgentDeps): string {
+  return `你是 RepoPilot 的**交叉审核方**：一个独立的第二个模型，审核另一个模型写出并已封存的补丁。
+
+硬性约束（由平台强制，不是自律）：
+- 你是**只读**的。不能改文件、不能运行命令、不能批准补丁。任何写操作都会被拒绝。
+- 你的"通过"**不等于**验证通过，也不等于任务成功 —— 那需要机器验证和人工接受。你只提供第二意见。
+- 只通过 submit_review 输出结构化发现，不要在自由文本里下最终结论。
+
+仓库：${deps.profile.adapterId}（${deps.profile.packageManager}），工作区是补丁应用后的只读副本。
+判断要基于证据：能指到具体文件与行、能说清怎么触发的发现才有价值。不确定就降低 confidence 或标 INCONCLUSIVE，不要凑数。`;
+}
+
+// ---------------------------------------------------------------------------
 // 执行
 // ---------------------------------------------------------------------------
 
@@ -546,7 +783,7 @@ async function executionTurns(
 // 工具分发 —— 每次调用都有且只有一个 resolution
 // ---------------------------------------------------------------------------
 
-type Phase = 'PLANNING' | 'EXECUTION';
+type Phase = 'PLANNING' | 'EXECUTION' | 'REVIEW';
 
 async function dispatchTool(
   deps: AgentDeps,
@@ -600,21 +837,25 @@ async function dispatchTool(
    * TOOLS_BY_NAME —— 模型只要凭记忆点名 workspace_mutate，之前就会真的执行。
    * PRD-PLAN-001 要求的是 capability envelope 强制，不是 prompt 自律。
    */
-  if (phase === 'PLANNING' && def.risk !== 'R0') {
+  if ((phase === 'PLANNING' || phase === 'REVIEW') && def.risk !== 'R0') {
+    const label = phase === 'PLANNING' ? '规划阶段' : '交叉审核阶段';
     host.endToolCall(
       toolCallId,
       'DENIED',
       'PHASE_READONLY',
-      `规划阶段被平台强制为只读，${def.risk} 工具不可用`,
+      `${label}被平台强制为只读，${def.risk} 工具不可用`,
       false,
       null,
     );
     return {
       ok: false,
       text:
-        `工具 ${toolName} 在规划阶段不可用 —— 这一阶段由平台强制为只读，` +
-        `不是提示词约束。请先用只读工具把问题看清楚，再调用 submit_plan 提交计划；` +
-        `用户批准后才会进入可以修改文件的执行阶段。`,
+        phase === 'PLANNING'
+          ? `工具 ${toolName} 在规划阶段不可用 —— 这一阶段由平台强制为只读，` +
+            `不是提示词约束。请先用只读工具把问题看清楚，再调用 submit_plan 提交计划；` +
+            `用户批准后才会进入可以修改文件的执行阶段。`
+          : `工具 ${toolName} 在交叉审核阶段不可用 —— 审核方由平台强制为只读，` +
+            `不能改动工作区、不能运行命令。请只用只读工具核对补丁，然后调用 submit_review 提交发现。`,
     };
   }
 
@@ -672,7 +913,10 @@ async function callModel(
   deps: AgentDeps,
   conversation: readonly ModelMessage[],
   tools: readonly ToolDefinition[],
-  purpose: 'PLANNING' | 'EXECUTION',
+  purpose: 'PLANNING' | 'EXECUTION' | 'CROSS_REVIEW',
+  /** 交叉审核走审核方的 route，其余走 implementer 的 route */
+  resolutionOverride?: ModelRouteResolution,
+  systemOverride?: string,
 ) {
   const schemas: ToolSchema[] = tools.map((t) => ({
     name: t.name,
@@ -685,9 +929,9 @@ async function callModel(
       runId: deps.runId,
       attemptId: deps.attemptId,
       purpose,
-      resolution: deps.resolution,
+      resolution: resolutionOverride ?? deps.resolution,
       request: {
-        system: systemPrompt(deps, purpose),
+        system: systemOverride ?? systemPrompt(deps, purpose as 'PLANNING' | 'EXECUTION'),
         messages: conversation,
         tools: schemas,
         maxOutputTokens: 8000,
