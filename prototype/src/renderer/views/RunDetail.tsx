@@ -1,9 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type {
   ApprovalRequest,
+  CrossReviewRecord,
   PatchArtifact,
   PatchDecisionKind,
   PlanRevision,
+  ReviewFinding,
   RunEvent,
   RunView,
   ToolCallView,
@@ -45,6 +47,22 @@ export function RunDetail({
 }) {
   const [showRaw, setShowRaw] = useState(false);
   const active = !TERMINAL_RUN_STATUSES.includes(run.status);
+
+  // 交叉审核记录随 Run 状态变化拉取（进行中会从 CROSS_REVIEWING 变到终态）
+  const [crossReview, setCrossReview] = useState<CrossReviewRecord | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void call('crossreview.get', { runId: run.runId })
+      .then((r) => {
+        if (alive) setCrossReview(r.crossReview);
+      })
+      .catch(() => {
+        /* 交叉审核记录拉取失败不该拖垮整个详情页 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [run.runId, run.status]);
 
   const cancel = async () => {
     try {
@@ -139,6 +157,12 @@ export function RunDetail({
       {approvals.length > 0 && plan && run.status === 'AWAITING_PLAN_APPROVAL' && (
         <PlanApproval approval={approvals[0]!} plan={plan} onError={onError} />
       )}
+
+      {run.status === 'CROSS_REVIEWING' && (
+        <Banner tone="info">第二个模型正在只读交叉审核这个补丁…</Banner>
+      )}
+
+      {crossReview && <CrossReviewPanel record={crossReview} />}
 
       {patch && (
         <PatchReview
@@ -469,6 +493,90 @@ function PatchReview({
       )}
 
       {!canDecide && !accepted && <Banner tone="info">该补丁已被决定，不能再次决定。</Banner>}
+    </Card>
+  );
+}
+
+const SEVERITY_TONE: Record<ReviewFinding['severity'], 'err' | 'warn' | 'info' | 'default'> = {
+  CRITICAL: 'err',
+  HIGH: 'err',
+  MEDIUM: 'warn',
+  LOW: 'info',
+  INFO: 'default',
+};
+
+const STOP_REASON_LABEL: Record<string, string> = {
+  REVIEWER_PASSED: '审核方未发现阻断问题',
+  COUNTER_EXHAUSTED: '已用满可自动进行的审核/整改轮次',
+  NO_DELTA: '整改后补丁无变化',
+  NO_PROGRESS: '阻断问题没有减少',
+  REVIEWER_UNAVAILABLE: '审核方不可用',
+  BUDGET_EXHAUSTED: '预算耗尽',
+  CANCELLED: '已取消',
+  ERROR: '审核过程出错',
+};
+
+function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
+  const findings = record.rounds.flatMap((r) => r.findings);
+  const blocking = findings.filter((f) => f.blocking).length;
+  const verdicts = record.rounds.map((r) => r.verdict).join(' → ') || '（无）';
+
+  return (
+    <Card
+      title="交叉审核（第二个模型只读）"
+      hint={`${record.reviewerInvocations} 轮 · ${findings.length} 条发现 · 阻断 ${blocking}`}
+      right={
+        <Badge tone={record.heterogeneous ? 'info' : 'warn'}>
+          {record.heterogeneous ? '异构审核方' : '同源审核方'}
+        </Badge>
+      }
+    >
+      {/* 这条免责必须显眼：审核只是第二意见，绝不代表可以接受 */}
+      <Banner tone="info">
+        这是第二个模型对已封存补丁的只读第二意见，<b>既不是机器验证，也不代表补丁可以接受</b>。
+        是否接受仍由你在下方决定。
+      </Banner>
+
+      <dl className="kv" style={{ marginTop: 10 }}>
+        <dt>结论序列</dt>
+        <dd>{verdicts}</dd>
+        <dt>结束原因</dt>
+        <dd>{record.stopReason ? (STOP_REASON_LABEL[record.stopReason] ?? record.stopReason) : '进行中'}</dd>
+      </dl>
+
+      {findings.length === 0 ? (
+        <p style={{ color: 'var(--text-dim)', marginTop: 10 }}>审核方没有提出发现。</p>
+      ) : (
+        <div style={{ marginTop: 10 }}>
+          {findings.map((f, i) => (
+            <details key={i} className="toolcall" open={f.blocking}>
+              <summary>
+                <Badge tone={SEVERITY_TONE[f.severity]}>{f.severity}</Badge>
+                {f.blocking && <Badge tone="err">阻断</Badge>}
+                <code style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>
+                  {f.file ?? '（无具体文件）'}
+                  {f.range ? `:${f.range[0]}-${f.range[1]}` : ''}
+                </code>
+                <span className="spacer" style={{ flex: 1 }} />
+                <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
+                  信心 {(f.confidence * 100).toFixed(0)}%
+                </span>
+              </summary>
+              <div className="body">
+                <p style={{ margin: '6px 0' }}>{f.evidence}</p>
+                {f.reproduction && (
+                  <p style={{ margin: '6px 0', color: 'var(--text-dim)' }}>复现：{f.reproduction}</p>
+                )}
+                {f.suggestedRemediation && (
+                  <p style={{ margin: '6px 0', color: 'var(--text-dim)' }}>
+                    建议：{f.suggestedRemediation}
+                  </p>
+                )}
+              </div>
+            </details>
+          ))}
+        </div>
+      )}
     </Card>
   );
 }

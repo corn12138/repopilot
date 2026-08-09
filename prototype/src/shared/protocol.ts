@@ -13,6 +13,7 @@
 import type {
   ApprovalDecisionKind,
   ApprovalRequest,
+  CrossReviewRecord,
   DoctorCheck,
   FileTreeEntry,
   ModelConnectionProfile,
@@ -136,6 +137,12 @@ export interface RequestMap {
       verificationCommandIds: string[];
       /** 用户手填的验证命令；检测不出命令的项目靠这个也能跑完整闭环 */
       customCommands?: Array<{ label: string; argv: string[] }>;
+      /**
+       * 可选：第二个模型 profile，用于对封存的补丁做只读交叉审核（PRD-XAGENT-003）。
+       * 每任务显式勾选。未填 = 不做交叉审核；填了但没配凭据 = 降级为不审核，
+       * **绝不**回落到 implementer 的 route（那就成了自审）。
+       */
+      reviewerModelProfileId?: string;
     };
     res: { task: TaskSpec; run: RunView };
   };
@@ -161,6 +168,8 @@ export interface RequestMap {
   };
 
   'patch.get': { req: { runId: string }; res: { patch: PatchArtifact | null } };
+  /** 交叉审核记录（第二个模型的只读发现）；没启用或没跑过为 null */
+  'crossreview.get': { req: { runId: string }; res: { crossReview: CrossReviewRecord | null } };
   'patch.decide': {
     req: {
       runId: string;

@@ -42,6 +42,8 @@ export function TaskForm({
     commandIds.includes('build') ? ['build'] : commandIds.slice(0, 1),
   );
   const [modelProfileId, setModelProfileId] = useState(enabledModels[0]?.profileId ?? '');
+  /** 空串 = 不做交叉审核 */
+  const [reviewerProfileId, setReviewerProfileId] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [customCommand, setCustomCommand] = useState('');
   const [useCustom, setUseCustom] = useState(false);
@@ -76,6 +78,8 @@ export function TaskForm({
         ...(hasCustom
           ? { customCommands: [{ label: customCommand.trim(), argv: customArgv }] }
           : {}),
+        // 空串表示不做交叉审核；选了才传，且必然与 implementer 不同（选项已过滤）
+        ...(reviewerProfileId ? { reviewerModelProfileId: reviewerProfileId } : {}),
       });
       onCreated(run);
     } catch (err) {
@@ -195,6 +199,28 @@ export function TaskForm({
           ))}
         </select>
         <div className="help">运行中不会自动切换供应商或模型；路由漂移会导致阻断而不是静默换路。</div>
+      </div>
+
+      <div className="field">
+        <label>交叉审核（可选）：第二个模型只读审补丁</label>
+        <select
+          value={reviewerProfileId}
+          disabled={disabled}
+          onChange={(e) => setReviewerProfileId(e.target.value)}
+        >
+          <option value="">不做交叉审核</option>
+          {enabledModels
+            .filter((m) => m.profileId !== modelProfileId)
+            .map((m) => (
+              <option key={m.profileId} value={m.profileId}>
+                {m.label} · {m.modelId}
+              </option>
+            ))}
+        </select>
+        <div className="help">
+          补丁封存后，由另一个模型只读审一遍并给出发现。它的"通过"<b>不等于</b>验证通过，也不代表可以接受
+          —— 是否接受仍由你决定。异构（不同供应商）的第二意见价值更高。
+        </div>
       </div>
 
       <div className="row">

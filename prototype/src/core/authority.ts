@@ -4,8 +4,12 @@ import type {
   ApprovalDecisionKind,
   ApprovalRequest,
   BudgetLedger,
+  CrossReviewRecord,
+  CrossReviewRound,
+  CrossReviewStopReason,
   DoctorCheck,
   FileTreeEntry,
+  ModelRouteResolution,
   PatchArtifact,
   PatchDecisionKind,
   PlanRevision,
@@ -26,7 +30,7 @@ import { EMPTY_LEDGER, isTerminal } from '@shared/domain';
 import { sha256 } from '@shared/ids';
 import type { ImportOutcome, PatchExportResult, PlatformError, PushEvent } from '@shared/protocol';
 import { digestOf, newId, nowIso } from '@shared/ids';
-import { AgentCancelled, PlanningFailed, runAgent } from './agent';
+import { AgentCancelled, PlanningFailed, runAgent, runReviewPass, type AgentDeps } from './agent';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { applyPatchWithGit, sealPatch } from './patch';
@@ -157,6 +161,13 @@ interface RunRecord {
   readonly approvals: Map<string, PendingApproval>;
   plan: PlanRevision | null;
   patch: PatchArtifact | null;
+  /**
+   * 交叉审核方的冻结 route。null = 本任务不做交叉审核（未请求或凭据降级）。
+   * 与 implementer 的 resolution 严格分离 —— 绝不共用。
+   */
+  reviewer: { resolution: ModelRouteResolution; heterogeneous: boolean } | null;
+  /** 交叉审核聚合记录；跑过才有 */
+  crossReview: CrossReviewRecord | null;
 }
 
 /**
@@ -235,6 +246,7 @@ export class RunAuthority {
         verifications: record.verifications,
         plan: record.plan,
         patch: record.patch,
+        crossReview: record.crossReview,
         eventHighWatermark: record.events.lastSeq(),
         persistedAt: nowIso(),
       });
@@ -292,6 +304,9 @@ export class RunAuthority {
         approvals: new Map(),
         plan: s.plan,
         patch: s.patch,
+        // 恢复态不再续跑，reviewer route 不重建；但已完成的审核记录要留着展示
+        reviewer: null,
+        crossReview: s.crossReview ?? null,
       };
 
       this.runs.set(runId, record);
@@ -375,6 +390,8 @@ export class RunAuthority {
       approvals: new Map(),
       plan: null,
       patch: null,
+      reviewer: null,
+      crossReview: null,
     };
   }
 
@@ -485,6 +502,9 @@ export class RunAuthority {
 
       case 'patch.get':
         return { patch: this.runs.get(String(payload.runId))?.patch ?? null };
+
+      case 'crossreview.get':
+        return { crossReview: this.runs.get(String(payload.runId))?.crossReview ?? null };
 
       case 'patch.decide':
         return this.decidePatch(payload as never);
@@ -706,6 +726,7 @@ export class RunAuthority {
     acceptance: string[];
     verificationCommandIds: string[];
     customCommands?: Array<{ label: string; argv: string[] }>;
+    reviewerModelProfileId?: string;
   }): { task: TaskSpec; run: RunView } {
     const project = this.projects.get(input.projectId);
     const snapshot = this.snapshots.get(input.snapshotId);
@@ -730,6 +751,28 @@ export class RunAuthority {
     this.profiles.set(effectiveProfile.profileId, effectiveProfile);
 
     const resolution = this.gateway.freezeRoute(input.modelProfileId);
+
+    // 交叉审核方 route：每任务显式勾选，凭据缺失时降级为不审核，
+    // 绝不回落到 implementer 的 route（那就成了自审）。
+    let reviewer: { resolution: ModelRouteResolution; heterogeneous: boolean } | null = null;
+    let reviewerDegradeNote: string | null = null;
+    if (input.reviewerModelProfileId) {
+      if (input.reviewerModelProfileId === input.modelProfileId) {
+        // 同一个 profile 一写一审没有独立第二意见的价值，如实降级
+        reviewerDegradeNote = '交叉审核方与实现方是同一个 profile —— 无法提供独立第二意见，已跳过交叉审核';
+      } else {
+        try {
+          const reviewerResolution = this.gateway.freezeRoute(input.reviewerModelProfileId);
+          reviewer = {
+            resolution: reviewerResolution,
+            heterogeneous: reviewerResolution.providerId !== resolution.providerId,
+          };
+        } catch (err) {
+          // 审核方没配凭据：降级，不阻断任务创建，也不偷偷改用 implementer 的 key
+          reviewerDegradeNote = `已请求交叉审核，但审核方 route 不可用（${(err as Error).message}）—— 本次降级为不审核`;
+        }
+      }
+    }
 
     const task: TaskSpec = {
       taskId: newId('task'),
@@ -794,6 +837,8 @@ export class RunAuthority {
       approvals: new Map(),
       plan: null,
       patch: null,
+      reviewer,
+      crossReview: null,
     };
     this.runs.set(runId, record);
 
@@ -826,6 +871,17 @@ export class RunAuthority {
         record,
         'NOTE',
         '本次任务没有选择任何验证命令：改动不会被机器验证，接受后终态为 ACCEPTED_UNVERIFIED 而不是 SUCCEEDED',
+      );
+    }
+    if (reviewerDegradeNote) {
+      this.emit(record, 'NOTE', reviewerDegradeNote);
+    } else if (reviewer) {
+      // 审核方 route 的事实进事件，供审计
+      this.emit(
+        record,
+        'NOTE',
+        `已启用交叉审核：审核方 ${reviewer.resolution.providerId}/${reviewer.resolution.modelId}${reviewer.heterogeneous ? '（与实现方异构）' : '（与实现方同源，第二意见价值有限）'}`,
+        { reviewerRoute: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId }, heterogeneous: reviewer.heterogeneous },
       );
     }
 
@@ -903,6 +959,13 @@ export class RunAuthority {
             `补丁已封存：${patch.files.length} 个文件，+${patch.files.reduce((n, f) => n + f.addedLines, 0)}/-${patch.files.reduce((n, f) => n + f.removedLines, 0)}`,
             { patchId: patch.patchId, digest: patch.digest, files: patch.files.map((f) => f.path) },
           );
+
+          // 补丁封存后、交回人手之前：如果启用了交叉审核，先让第二个模型只读审一遍。
+          // 审核结论只是给人的第二意见，绝不改变"接受与否"仍由人决定这件事。
+          if (record.reviewer) {
+            await this.runCrossReview(record, workspace, startedAt, deadline, patch, result.finalVerification);
+          }
+
           this.setStatus(record, 'AWAITING_PATCH_REVIEW', result.detail);
           break;
         }
@@ -941,6 +1004,102 @@ export class RunAuthority {
         });
       }
     }
+  }
+
+  /**
+   * 补丁封存后的只读交叉审核（PRD-XAGENT-003 的诚实子集）。
+   *
+   * 本切片只跑 1 轮审核，产出发现后**始终**交回人工（AWAITING_PATCH_REVIEW，
+   * 即 PRD 的 HUMAN_REVIEW_REQUIRED）。自动整改（remediation → 第 2 轮审核）
+   * 尚未接线：有阻断发现时如实记为交人工，counter 不虚报"用满整改次数"。
+   *
+   * 无论审核结果如何：
+   *   - 绝不自动接受补丁（审核"通过" ≠ SUCCEEDED，那需要机器验证 + 人工接受）
+   *   - 出错 / 取消 / 审核方不可用都吞进 stopReason，不让交叉审核的失败拖垮主 Run
+   */
+  private async runCrossReview(
+    record: RunRecord,
+    workspace: MaterializedWorkspace,
+    startedAt: number,
+    deadline: PausableDeadline,
+    patch: PatchArtifact,
+    finalVerification: VerificationRun | null,
+  ): Promise<void> {
+    const reviewer = record.reviewer;
+    if (!reviewer) return;
+
+    this.setStatus(record, 'CROSS_REVIEWING', '第二个模型正在只读交叉审核');
+    const crStart = nowIso();
+    this.emit(record, 'CROSS_REVIEW_STARTED', `交叉审核开始：${reviewer.resolution.modelId}`, {
+      reviewer: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId },
+      heterogeneous: reviewer.heterogeneous,
+    });
+
+    const deps: AgentDeps = {
+      task: record.task,
+      snapshot: record.snapshot,
+      profile: record.profile,
+      workspace,
+      gateway: this.gateway,
+      resolution: reviewer.resolution, // implementer 字段这里不会被审核路径用到，填审核方即可
+      mutationPolicy: {
+        ...DEFAULT_MUTATION_POLICY,
+        allowedPaths: record.task.allowedPaths,
+        protectedPaths: record.task.protectedPaths,
+      },
+      runId: record.view.runId,
+      attemptId: record.view.attemptId,
+      signal: record.abort.signal,
+      host: this.hostFor(record, startedAt, deadline),
+    };
+
+    const rounds: CrossReviewRound[] = [];
+    let stopReason: CrossReviewStopReason;
+    try {
+      const round = await runReviewPass(deps, {
+        reviewerResolution: reviewer.resolution,
+        patch,
+        finalVerification,
+        round: 1,
+      });
+      rounds.push(round);
+      const blocking = round.findings.filter((f) => f.blocking).length;
+      // 本切片没有自动整改：PASS/无阻断 → REVIEWER_PASSED；有阻断 → 用满可自动进行的轮次
+      stopReason = round.verdict === 'PASS' || blocking === 0 ? 'REVIEWER_PASSED' : 'COUNTER_EXHAUSTED';
+    } catch (err) {
+      if (err instanceof AgentCancelled || record.abort.signal.aborted) {
+        stopReason = 'CANCELLED';
+      } else if (err instanceof EgressBlocked) {
+        stopReason = 'REVIEWER_UNAVAILABLE';
+        this.emit(record, 'NOTE', `交叉审核出站被阻断：${err.reason}`);
+      } else {
+        stopReason = 'ERROR';
+        this.emit(record, 'NOTE', `交叉审核出错（不影响补丁本身）：${(err as Error).message}`);
+      }
+    }
+
+    const cr: CrossReviewRecord = {
+      enabled: true,
+      reviewerProfileId: reviewer.resolution.profileId,
+      heterogeneous: reviewer.heterogeneous,
+      rounds,
+      reviewerInvocations: rounds.length,
+      remediations: 0,
+      stopReason,
+      startedAt: crStart,
+      finishedAt: nowIso(),
+    };
+    record.crossReview = cr;
+
+    const blockingTotal = rounds.flatMap((r) => r.findings).filter((f) => f.blocking).length;
+    const findingTotal = rounds.flatMap((r) => r.findings).length;
+    this.emit(
+      record,
+      'CROSS_REVIEW_FINISHED',
+      `交叉审核结束（${stopReason}）：${findingTotal} 条发现，其中阻断 ${blockingTotal}`,
+      { stopReason, reviewerInvocations: cr.reviewerInvocations, blockingTotal, findingTotal },
+    );
+    // 补丁审查阶段会读到 record.crossReview，把发现摆在用户面前再让其决定
   }
 
   private hostFor(record: RunRecord, startedAt: number, deadline: PausableDeadline) {

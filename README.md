@@ -81,13 +81,13 @@ pnpm dev
 可以直接拿它当第一个任务目标。
 
 ```bash
-pnpm test        # 44 个测试，含一条跑真实 tsc + vite build 的端到端链路
+pnpm test        # 463 个测试，含一条跑真实 tsc + vite build 的端到端链路
 pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
 ```
 
 ## 有机器证据支撑的部分
 
-`pnpm test` 的 44 个断言里，值得单独说的：
+`pnpm test` 的断言里，值得单独说的：
 
 - exact-span 命中 0 次 / 多次 → 拒绝，且**工作区逐字节不变**
 - 批次中任一 operation 失败 → 整批零写入
@@ -96,14 +96,37 @@ pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
 - 修复后必须是真的 `EXIT_ZERO`
 - 补丁 diff 里不含宿主绝对路径
 - 补丁应用：目标文件已漂移 → `git apply --check` 拒绝，宿主逐字节不变
+- 补丁写回宿主仓库要求**已被接受** + digest 匹配，门禁在 Core 不在界面
+- 规划阶段与交叉审核阶段的只读由**平台强制**：模型点名写工具会被 `PHASE_READONLY` 拒绝
+- 子进程 env 走白名单：仓库脚本拿不到 `ANTHROPIC_API_KEY` 之类的凭据
+- macOS 上 `Package.json` 这类大小写变体不能绕过受保护路径
 - **修复全程宿主仓库 `git status` 干净**
+
+## 交叉审核（第二个模型）
+
+补丁封存后，可以让**另一个模型 API** 只读审一遍，产出结构化发现（severity /
+confidence / file / range / evidence / blocking）。审核方由平台强制只读，
+拿不到写工具。
+
+必须说清楚的两件事：
+
+- 审核方说"通过"**不等于**验证通过，也**不等于**可以接受。是否接受仍然只由你决定。
+- 这里用的是两个 `ModelConnectionProfile`，**不是** PRD 里定义的
+  `ExternalCodingAgentConnectorProfile`。所以本项目**没有**接入 Codex CLI /
+  Claude Code 这类自带 Agent Loop 的外部编码代理，只是"第二个模型 API 交叉审核"。
 
 ## 还没做的
 
 - **隔离强度**：`utilityProcess` + 子进程**不是**容器沙箱。`node_modules` 目前是宿主的
   symlink，构建脚本以你的用户权限运行。这是明确接受的残余风险。
-- **持久化**：Run 事件是 JSONL，没有加密、没有保留期、没有级联清理。
-- **崩溃恢复**：事件日志能重放，但 Core 重启后不会自动恢复进行中的 Run。
+- **持久化加密**：Run 事件是 JSONL，没有加密。（分级保留与清理已经做了：
+  工作区终态后 60 分钟回收、证据 30 天、快照与 artifact 按引用计数。）
+- **崩溃恢复**：重启后历史可读、被打断的 Run 落 `INTERRUPTED`；但**不含**带 hash 校验、
+  fail-closed 的可续跑 Checkpoint。
+- **保留策略的界面出口**：后端 IPC 就绪，设置页还没接出来 —— 用户目前看不到也改不了 30 天这回事。
+- **交叉审核的自动整改**：目前只跑 1 轮审核就交回人工；PRD 允许的"1 次整改 + 第 2 轮审核"
+  还没接线。
+- **账本诚实性**：provider 不返回 usage 时记成 0（应记"未知"），失败的调用不入账。
 - **多轮对话**：对话流目前是只读投影，不能在运行中追加指令。
 - **「要求修改」**：点了只会 BLOCKED，不会带着反馈创建新 Attempt。
 

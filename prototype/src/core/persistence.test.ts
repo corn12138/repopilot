@@ -169,6 +169,84 @@ describe('损坏的状态快照不能让 Run 凭空消失', () => {
   });
 });
 
+describe('schema v2：交叉审核记录', () => {
+  it('当前版本是 2', () => {
+    expect(RUN_STATE_SCHEMA_VERSION).toBe(2);
+  });
+
+  it('crossReview 原样往返', () => {
+    const view = makeView('AWAITING_PATCH_REVIEW');
+    track(view.runId);
+    const crossReview = {
+      enabled: true,
+      reviewerProfileId: 'profile_openai',
+      heterogeneous: true,
+      rounds: [
+        {
+          round: 1,
+          reviewedPatchDigest: 'sha256:abc',
+          reviewerResolutionId: 'route_r',
+          verdict: 'CHANGES_REQUESTED' as const,
+          findings: [
+            {
+              severity: 'HIGH' as const,
+              confidence: 0.8,
+              file: 'src/a.ts',
+              range: [3, 5] as readonly [number, number],
+              evidence: '边界没处理',
+              reproduction: null,
+              suggestedRemediation: '加一个空数组分支',
+              blocking: true,
+              fingerprint: 'fp_1',
+            },
+          ],
+          startedAt: nowIso(),
+          finishedAt: nowIso(),
+        },
+      ],
+      reviewerInvocations: 1,
+      remediations: 0,
+      stopReason: 'COUNTER_EXHAUSTED' as const,
+      startedAt: nowIso(),
+      finishedAt: nowIso(),
+    };
+    writeRunState(makeState(view, { crossReview }));
+
+    const loaded = readRunState(view.runId);
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) {
+      expect(loaded.state.crossReview).toEqual(crossReview);
+      // 发现必须原样保住 —— 它是给人做决定的依据，丢了就等于没审
+      expect(loaded.state.crossReview!.rounds[0]!.findings[0]!.blocking).toBe(true);
+    }
+  });
+
+  it('v1 旧快照（没有 crossReview 字段）仍能读，按"没做过审核"处理', () => {
+    const view = makeView('SUCCEEDED');
+    track(view.runId);
+    mkdirSync(runDir(view.runId), { recursive: true });
+    // 手写一份 v1 结构：没有 crossReview 键
+    const v1 = { ...makeState(view), schemaVersion: 1 } as Record<string, unknown>;
+    delete v1.crossReview;
+    writeFileSync(join(runDir(view.runId), 'state.json'), JSON.stringify(v1), 'utf8');
+
+    const loaded = readRunState(view.runId);
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) {
+      expect(loaded.state.schemaVersion).toBe(1);
+      expect(loaded.state.crossReview ?? null).toBeNull();
+    }
+  });
+
+  it('v3（未来版本）仍然拒绝 —— 未知结构 fail-closed', () => {
+    const view = makeView('SUCCEEDED');
+    track(view.runId);
+    writeRunState({ ...makeState(view), schemaVersion: 3 });
+    const loaded = readRunState(view.runId);
+    expect(loaded.ok).toBe(false);
+  });
+});
+
 describe('事件流与状态快照的一致性', () => {
   it('lastSeq 反映真实水位', () => {
     const runId = track(newId('run'));

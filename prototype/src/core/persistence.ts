@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
+  CrossReviewRecord,
   PatchArtifact,
   PlanRevision,
   RepositoryHarnessProfile,
@@ -24,8 +25,12 @@ import { writeJsonAtomic } from './store';
  * 与事件日志的一致性约定：**永远先 append 事件，再写状态快照**。
  * 这样崩溃窗口只会产生"事件比状态新"，不会产生"状态说成功、时间线停在半路"
  * 这种更危险的方向。rehydrate 时会检查这一点并如实标注。
+ *
+ * v2：新增可选 crossReview。旧的 v1 快照缺这个字段，读回来是 undefined，
+ * 按"没做过交叉审核"处理即可 —— 所以 v2 能读 v1，不需要迁移代码，
+ * 但仍拒绝**高于**当前版本的快照（未知结构 fail-closed）。
  */
-export const RUN_STATE_SCHEMA_VERSION = 1;
+export const RUN_STATE_SCHEMA_VERSION = 2;
 
 export interface PersistedRunState {
   readonly schemaVersion: number;
@@ -37,6 +42,8 @@ export interface PersistedRunState {
   readonly verifications: readonly VerificationRun[];
   readonly plan: PlanRevision | null;
   readonly patch: PatchArtifact | null;
+  /** 交叉审核聚合记录（v2 新增）；没做过为 null，旧 v1 快照读回来是 undefined */
+  readonly crossReview?: CrossReviewRecord | null;
   /** 写这份快照时事件流的最高 seq，用于 rehydrate 时判断两者是否同步 */
   readonly eventHighWatermark: number;
   readonly persistedAt: string;
