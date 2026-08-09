@@ -7,6 +7,7 @@ import type { RunEventKind, TaskSpec, ToolCallResolution, ToolRisk } from '@shar
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { type AgentHost, type ModelInvoker, runAgent } from './agent';
 import type { ContentBlock, ModelResponse } from './model/types';
+import { findOrphanToolUse } from './model/types';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { importSnapshot, resolveProfile } from './repo';
 import { MaterializedWorkspace } from './workspace';
@@ -53,6 +54,10 @@ class RogueModel implements ModelInvoker {
   readonly attempted: string[] = [];
 
   async invoke(input: Parameters<ModelInvoker['invoke']>[0]) {
+    // 真实 provider 会对孤儿 tool_use 返回 400，测试替身不会 —— 所以这里
+    // 主动用与网关同一个校验器把关，否则这类回归在测试里是静默的。
+    const orphan = findOrphanToolUse(input.request.messages);
+    if (orphan) throw new Error(`${input.purpose} 调用收到非法消息序列：${orphan}`);
     this.turn += 1;
     const last = JSON.stringify(input.request.messages.at(-1)?.content ?? '');
     let content: ContentBlock[];

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { newId } from '@shared/ids';
+import { checkPatchApplyGate } from './authority';
 import { applyMutationPlan } from './mutation';
 import { applyPatchWithGit, sealPatch } from './patch';
 import { importSnapshot } from './repo';
@@ -144,5 +145,86 @@ describe('子包补丁应用', () => {
     const patch = makePatch('apps/web');
     const result = applyPatchWithGit(host, '', patch.unifiedDiff, patchFile, ['src/greet.ts']);
     expect(result.ok).toBe(false);
+  });
+});
+
+describe('写回宿主仓库的接受态门禁（checkPatchApplyGate）', () => {
+  const DIGEST = 'sha256:deadbeef';
+
+  it('已接受 + digest 一致 → 放行', () => {
+    const g = checkPatchApplyGate({
+      status: 'SUCCEEDED',
+      patchAcceptanceId: 'acc_1',
+      actualDigest: DIGEST,
+      requestedDigest: DIGEST,
+    });
+    expect(g.ok).toBe(true);
+  });
+
+  it('未验证但已接受（ACCEPTED_UNVERIFIED）同样放行', () => {
+    const g = checkPatchApplyGate({
+      status: 'ACCEPTED_UNVERIFIED',
+      patchAcceptanceId: 'acc_2',
+      actualDigest: DIGEST,
+      requestedDigest: DIGEST,
+    });
+    expect(g.ok).toBe(true);
+  });
+
+  it('被拒绝的补丁（BLOCKED，无 patchAcceptanceId）绝不能写回', () => {
+    // 这是本条修复要堵的核心场景：用户点了「拒绝」，补丁仍留在 record 里，
+    // 一次 patch.export{APPLY_TO_REPO} 不能把它写进用户仓库。
+    const g = checkPatchApplyGate({
+      status: 'BLOCKED',
+      patchAcceptanceId: null,
+      actualDigest: DIGEST,
+      requestedDigest: DIGEST,
+    });
+    expect(g.ok).toBe(false);
+    if (!g.ok) expect(g.reason).toBe('NOT_ACCEPTED');
+  });
+
+  it('停在 AWAITING_PATCH_REVIEW、还没决定，也不能写回', () => {
+    const g = checkPatchApplyGate({
+      status: 'AWAITING_PATCH_REVIEW',
+      patchAcceptanceId: null,
+      actualDigest: DIGEST,
+      requestedDigest: DIGEST,
+    });
+    expect(g.ok).toBe(false);
+    if (!g.ok) expect(g.reason).toBe('NOT_ACCEPTED');
+  });
+
+  it('已接受但没带 digest → 拒绝（写宿主仓库不接受就地信任）', () => {
+    const g = checkPatchApplyGate({
+      status: 'SUCCEEDED',
+      patchAcceptanceId: 'acc_3',
+      actualDigest: DIGEST,
+      requestedDigest: undefined,
+    });
+    expect(g.ok).toBe(false);
+    if (!g.ok) expect(g.reason).toBe('DIGEST_REQUIRED');
+  });
+
+  it('已接受但 digest 对不上 → 拒绝（应用的必须等于接受的）', () => {
+    const g = checkPatchApplyGate({
+      status: 'SUCCEEDED',
+      patchAcceptanceId: 'acc_4',
+      actualDigest: DIGEST,
+      requestedDigest: 'sha256:0ther',
+    });
+    expect(g.ok).toBe(false);
+    if (!g.ok) expect(g.reason).toBe('PATCH_CHANGED');
+  });
+
+  it('门禁顺序：未接受优先于 digest —— 被拒补丁即使 digest 对也进不来', () => {
+    const g = checkPatchApplyGate({
+      status: 'BLOCKED',
+      patchAcceptanceId: null,
+      actualDigest: DIGEST,
+      requestedDigest: DIGEST,
+    });
+    expect(g.ok).toBe(false);
+    if (!g.ok) expect(g.reason).toBe('NOT_ACCEPTED');
   });
 });

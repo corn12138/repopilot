@@ -23,7 +23,14 @@ import {
   resolveOrigin,
   saveCustomProvider,
 } from './registry';
-import { ModelCallError, type ModelAdapter, type ModelRequest, type ModelResponse } from './types';
+import {
+  findOrphanToolUse,
+  ModelCallError,
+  type ModelAdapter,
+  type ModelMessage,
+  type ModelRequest,
+  type ModelResponse,
+} from './types';
 
 /** 按线上协议方言选适配器，不按 provider —— 对应 CLI 的 `apiFormat` 分派 */
 const ADAPTERS: Record<'anthropic' | 'openai', ModelAdapter> = {
@@ -276,7 +283,7 @@ export class ModelGateway {
     };
 
     // ---- 出站前置检查：不满足就是 NOT_SENT，不会先发再说 ----
-    const blockReason = this.preflight(profile, resolution);
+    const blockReason = this.preflight(profile, resolution, input.request.messages);
     if (blockReason) {
       const manifest: ModelEgressManifest = {
         ...base,
@@ -329,6 +336,7 @@ export class ModelGateway {
   private preflight(
     profile: ModelConnectionProfile | undefined,
     resolution: ModelRouteResolution,
+    messages: readonly ModelMessage[],
   ): string | null {
     if (!profile) return 'PROFILE_NOT_FOUND';
     if (!profile.enabled) return 'PROFILE_DISABLED';
@@ -342,6 +350,10 @@ export class ModelGateway {
     });
     if (current !== resolution.digest) return 'ROUTE_DRIFT';
     if (!resolution.origin.startsWith('https://')) return 'INSECURE_ORIGIN';
+    // 我们自己拼错的历史，不要花一次真实请求去换供应商的一句 400。
+    // 详见 findOrphanToolUse 的注释：孤儿会污染此后每一次请求，不只是这一次。
+    const orphan = findOrphanToolUse(messages);
+    if (orphan) return `MALFORMED_CONVERSATION: ${orphan}`;
     return null;
   }
 }

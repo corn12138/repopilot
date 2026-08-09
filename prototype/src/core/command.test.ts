@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CommandDefinition, CommandOutcome } from '@shared/domain';
-import { runCommand } from './command';
+import { buildChildEnv, runCommand } from './command';
 import { PREVIEW_MAX_BYTES } from './tools';
 
 /**
@@ -427,6 +427,54 @@ describe('输出捕获与 tailPreview', () => {
   });
 });
 
+describe('buildChildEnv 白名单', () => {
+  it('放行 PATH/HOME 等基础变量，注入 CI 三件套', () => {
+    const { env } = buildChildEnv({ PATH: '/usr/bin', HOME: '/home/x', NODE_ENV: 'test' });
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.HOME).toBe('/home/x');
+    expect(env.CI).toBe('1');
+    expect(env.NO_COLOR).toBe('1');
+    expect(env.FORCE_COLOR).toBe('0');
+    expect(env.NODE_ENV).toBe('test');
+  });
+
+  it('丢弃凭据类变量，并如实回报被丢弃的名字（只报名字不报值）', () => {
+    const { env, droppedKeys } = buildChildEnv({
+      PATH: '/usr/bin',
+      ANTHROPIC_API_KEY: 'sk-secret',
+      GITHUB_TOKEN: 'gho_secret',
+      AWS_SECRET_ACCESS_KEY: 'aws-secret',
+      NPM_TOKEN: 'npm-secret',
+    });
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(env.NPM_TOKEN).toBeUndefined();
+    expect(droppedKeys).toEqual(
+      ['ANTHROPIC_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'GITHUB_TOKEN', 'NPM_TOKEN'].sort(),
+    );
+    // 回报的是名字，值绝不能出现在里面
+    expect(JSON.stringify(droppedKeys)).not.toContain('secret');
+  });
+
+  it('LC_* 前缀族整体放行（否则子进程 locale 报错）', () => {
+    const { env } = buildChildEnv({ PATH: '/usr/bin', LC_ALL: 'en_US.UTF-8', LC_CTYPE: 'C' });
+    expect(env.LC_ALL).toBe('en_US.UTF-8');
+    expect(env.LC_CTYPE).toBe('C');
+  });
+
+  it('强制项覆盖同名透传值：父进程的 CI=0 不能翻掉我们的 CI=1', () => {
+    const { env } = buildChildEnv({ PATH: '/usr/bin', CI: '0', NO_COLOR: '0' });
+    expect(env.CI).toBe('1');
+    expect(env.NO_COLOR).toBe('1');
+  });
+
+  it('返回的 env 是 null 原型对象：constructor/toString 这类 key 不会命中原型', () => {
+    const { env } = buildChildEnv({ PATH: '/usr/bin' });
+    expect(Object.getPrototypeOf(env)).toBeNull();
+  });
+});
+
 describe('执行环境与审计字段', () => {
   it('cwd 生效：命令看到的是传入的工作目录', async () => {
     writeFileSync(join(cwd, 'marker.txt'), 'in-workspace', 'utf8');
@@ -435,15 +483,25 @@ describe('执行环境与审计字段', () => {
     expect(r.stdoutPreview).toBe('in-workspace');
   });
 
-  it('强制注入 CI/NO_COLOR/FORCE_COLOR，同时透传父进程环境', async () => {
-    // 不做这件事，同一条命令在不同机器上会产出带 ANSI 转义、带交互提示的不同输出，
-    // baseline 与 post-mutation 的对比就失去意义
-    process.env.REPOPILOT_ENV_PROBE = 'inherited-value';
+  it('强制注入 CI/NO_COLOR/FORCE_COLOR，且 PATH 透传（构建能找到工具链）', async () => {
+    // 不注入这三个，同一条命令在不同机器上会产出带 ANSI 转义、带交互提示的不同输出，
+    // baseline 与 post-mutation 的对比就失去意义；PATH 必须透传，否则 node/npm 都找不到。
+    const r = await run(sh('echo "$CI|$NO_COLOR|$FORCE_COLOR|${PATH:+has-path}"'));
+    expect(r.stdoutPreview).toBe('1|1|0|has-path');
+  });
+
+  it('子进程看不到未列入白名单的父进程变量 —— BYOK 凭据不外泄给仓库脚本', async () => {
+    // 这是一条安全断言：仓库自己的 build 脚本以完整宿主 env 运行时，
+    // 一行 `curl -d "$ANTHROPIC_API_KEY"` 就能把 key 送走。
+    process.env.ANTHROPIC_API_KEY = 'sk-should-not-leak';
+    process.env.REPOPILOT_SECRET_PROBE = 'should-not-leak';
     try {
-      const r = await run(sh('echo "$CI|$NO_COLOR|$FORCE_COLOR|$REPOPILOT_ENV_PROBE"'));
-      expect(r.stdoutPreview).toBe('1|1|0|inherited-value');
+      const r = await run(sh('echo "[$ANTHROPIC_API_KEY][$REPOPILOT_SECRET_PROBE]"'));
+      // 两个都不该出现在子进程环境里
+      expect(r.stdoutPreview).toBe('[][]');
     } finally {
-      delete process.env.REPOPILOT_ENV_PROBE;
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.REPOPILOT_SECRET_PROBE;
     }
   });
 

@@ -65,6 +65,87 @@ export function truncateTailToBytes(
 }
 
 /**
+ * 子进程环境变量白名单。
+ *
+ * 子进程跑的是**仓库自己的**脚本（`npm run build` 之类），它不该看到宿主的全部环境。
+ * 这条链路是闭合的：`registry.ts` 的 resolveKey 支持从 `process.env` 读 BYOK 凭据，
+ * doctor 给出的修复建议就是「设置以下环境变量后重启应用」—— 所以全集透传等于把
+ * `ANTHROPIC_API_KEY` / `GITHUB_TOKEN` / `AWS_*` / `NPM_TOKEN` 交给任意仓库的
+ * postinstall 脚本，一行 curl 就能送走。
+ *
+ * 用白名单而不是黑名单：黑名单永远追不上新出现的凭据变量名，
+ * 而"漏掉一个构建变量"只是构建失败（可见、可修），"漏掉一个凭据变量"是静默泄露。
+ *
+ * 注意这与「不做容器沙箱」那条残余风险无关 —— 子进程仍以你的用户权限运行、
+ * 仍能读写工作区。这里只堵住凭据这一条。
+ */
+const ENV_ALLOWLIST: readonly string[] = [
+  'PATH',
+  'HOME',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'LANG',
+  'LANGUAGE',
+  'TZ',
+  'TERM',
+  // nvm / asdf / volta 之类的版本管理器：PATH 能找到 bin，但脚本常直接引用这些
+  'NVM_DIR',
+  'NVM_BIN',
+  'ASDF_DIR',
+  'ASDF_DATA_DIR',
+  'VOLTA_HOME',
+  // macOS
+  '__CF_USER_TEXT_ENCODING',
+  // Windows（本原型只跑 macOS，但别让白名单本身成为跨平台的坑）
+  'SystemRoot',
+  'SystemDrive',
+  'windir',
+  'PATHEXT',
+  'COMSPEC',
+  'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE',
+];
+
+/** 前缀白名单：这些族整体放行 */
+const ENV_ALLOW_PREFIXES: readonly string[] = ['LC_'];
+
+/**
+ * 按白名单裁剪环境，并回报**被丢弃的变量名**（只回名字，绝不回值）。
+ *
+ * 之所以要回报：构建脚本缺变量时的报错通常很难懂（"undefined is not a URL"），
+ * 而"我们悄悄拿掉了 27 个变量"是这时候最有用的一条线索。静默省略正是本项目反对的。
+ */
+export function buildChildEnv(source: NodeJS.ProcessEnv = process.env): {
+  env: NodeJS.ProcessEnv;
+  droppedKeys: readonly string[];
+} {
+  const env: NodeJS.ProcessEnv = Object.create(null) as NodeJS.ProcessEnv;
+  const dropped: string[] = [];
+
+  for (const key of Object.keys(source)) {
+    const allowed =
+      ENV_ALLOWLIST.includes(key) || ENV_ALLOW_PREFIXES.some((p) => key.startsWith(p));
+    if (allowed) {
+      if (source[key] !== undefined) env[key] = source[key];
+    } else {
+      dropped.push(key);
+    }
+  }
+
+  // 强制项放在最后，覆盖同名的透传值
+  env.CI = '1';
+  env.FORCE_COLOR = '0';
+  env.NO_COLOR = '1';
+  env.NODE_ENV = source.NODE_ENV ?? 'development';
+
+  return { env, droppedKeys: dropped.sort() };
+}
+
+/**
  * 执行 profile 中已登记的结构化命令。
  *
  * 与参考 CLI 样本的差别（overlay §7.2 Reject 行）：
@@ -93,6 +174,8 @@ export async function runCommand(
     return outcome(def, 'SPAWN_ERROR', null, null, started, '', 'argv 为空', false);
   }
 
+  const childEnv = buildChildEnv();
+
   return new Promise<CommandOutcome>((resolve) => {
     const out = new TailBuffer();
     const err = new TailBuffer();
@@ -103,13 +186,8 @@ export async function runCommand(
     const child = spawn(bin, args, {
       cwd,
       detached: true, // 建立独立进程组，便于整树终止
-      env: {
-        ...process.env,
-        CI: '1',
-        FORCE_COLOR: '0',
-        NO_COLOR: '1',
-        NODE_ENV: process.env.NODE_ENV ?? 'development',
-      },
+      // 白名单裁剪：仓库脚本不该看到宿主的 BYOK 凭据。见 buildChildEnv
+      env: childEnv.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

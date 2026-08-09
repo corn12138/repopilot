@@ -100,6 +100,44 @@ interface RunRecord {
   patch: PatchArtifact | null;
 }
 
+/**
+ * 「补丁能否写回宿主仓库」的门禁判定 —— 抽成纯函数，因为它是整个原型里
+ * 唯一会写用户文件的动作的最后一道闸，必须能被单测直接打穿，而不依赖
+ * 起一整个 RunAuthority + git 仓库。
+ *
+ * 两条规则：
+ *   1. 必须先被接受（terminalFacts.patchAcceptanceId 存在）。REJECT / REQUEST_CHANGES
+ *      走 BLOCKED、terminalFacts 为 null，被这条挡住。
+ *   2. 请求里的 digest 必须与实际补丁一致；未提供一律拒绝 —— 写宿主仓库不接受"就地信任"。
+ */
+export type PatchApplyGate = { ok: true } | { ok: false; reason: string; detail: string };
+
+export function checkPatchApplyGate(input: {
+  status: RunStatus;
+  patchAcceptanceId: string | null;
+  actualDigest: string;
+  requestedDigest: string | undefined;
+}): PatchApplyGate {
+  if (!input.patchAcceptanceId) {
+    return {
+      ok: false,
+      reason: 'NOT_ACCEPTED',
+      detail: `补丁尚未被接受（当前状态 ${input.status}）。请先在补丁审查里接受，再写回仓库。`,
+    };
+  }
+  if (input.requestedDigest === undefined) {
+    return {
+      ok: false,
+      reason: 'DIGEST_REQUIRED',
+      detail: '写回宿主仓库必须携带补丁 digest 以校验一致性',
+    };
+  }
+  if (input.actualDigest !== input.requestedDigest) {
+    return { ok: false, reason: 'PATCH_CHANGED', detail: '补丁已变化，请刷新后重新确认' };
+  }
+  return { ok: true };
+}
+
 export class RunAuthority {
   private readonly projects = new Map<string, ProjectRecord>();
   private readonly snapshots = new Map<string, RepositorySnapshot>();
@@ -443,7 +481,11 @@ export class RunAuthority {
       }
 
       case '__patch.applyToRepo':
-        return this.applyPatchToRepo(String(payload.runId), String(payload.patchId));
+        return this.applyPatchToRepo(
+          String(payload.runId),
+          String(payload.patchId),
+          payload.patchDigest === undefined ? undefined : String(payload.patchDigest),
+        );
 
       default:
         throw platformError('BAD_REQUEST', `未知方法: ${method}`);
@@ -1248,16 +1290,33 @@ export class RunAuthority {
    * 把补丁真正应用回宿主仓库。
    *
    * 这是整个原型里**唯一**会写用户仓库的路径，因此：
+   *   - 只有被**接受过**的补丁才能写：门禁必须在 Core，而不是只靠 Renderer 藏起按钮。
+   *     （之前唯一的门禁是 RunDetail.tsx 里一个决定按钮显不显示的布尔量，任何一次
+   *     重放 / 渲染 bug / 直接走 IPC 都能把**被拒绝的**补丁写进用户仓库。）
+   *   - digest 必须与调用方看到的一致：「被应用的东西」= 「被接受的东西」。
    *   - 交给 `git apply` 做，不自己实现 patch 应用逻辑。
    *   - 先 `--check` 干跑一遍；有任何一处冲突就整笔拒绝，不做部分应用。
    *   - 子包导入时用 `--directory` 把坐标系还原回仓库根。
    *   - 结果如实回报，失败时原样带出 git 的错误。
    */
-  private applyPatchToRepo(runId: string, patchId: string): PatchExportResult {
+  private applyPatchToRepo(
+    runId: string,
+    patchId: string,
+    patchDigest: string | undefined,
+  ): PatchExportResult {
     const record = this.require(runId);
     if (!record.patch || record.patch.patchId !== patchId) {
       return { ok: false, reason: 'PATCH_CHANGED', detail: '补丁不存在或已变化，请刷新' };
     }
+
+    // 接受态 + digest 双重门禁，抽成纯函数以便单测（见 checkPatchApplyGate）
+    const gate = checkPatchApplyGate({
+      status: record.view.status,
+      patchAcceptanceId: record.view.terminalFacts?.patchAcceptanceId ?? null,
+      actualDigest: record.patch.digest,
+      requestedDigest: patchDigest,
+    });
+    if (!gate.ok) return gate;
     if (record.view.evidence === 'DAMAGED' || !record.snapshot || !record.task) {
       return {
         ok: false,

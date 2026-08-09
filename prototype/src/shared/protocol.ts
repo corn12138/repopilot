@@ -224,9 +224,18 @@ export interface RequestMap {
    *
    * `SAVE_FILE` / `COPY` 不碰你的仓库；`APPLY_TO_REPO` 会真的写入宿主仓库，
    * 所以它先跑 `git apply --check`，任何冲突都整笔拒绝，不做部分应用。
+   *
+   * `patchDigest` 是调用方看到的补丁摘要。写宿主仓库这条路径**必须**带上它，
+   * 由 Core 侧比对（与 `patch.decide` 同一道校验）—— 「被应用的东西」必须等于
+   * 「被审查/接受的东西」。SAVE_FILE / COPY 不写仓库，可以不带。
    */
   'patch.export': {
-    req: { runId: string; patchId: string; mode: 'SAVE_FILE' | 'COPY' | 'APPLY_TO_REPO' };
+    req: {
+      runId: string;
+      patchId: string;
+      mode: 'SAVE_FILE' | 'COPY' | 'APPLY_TO_REPO';
+      patchDigest?: string;
+    };
     res: PatchExportResult;
   };
 }

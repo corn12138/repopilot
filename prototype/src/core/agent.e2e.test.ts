@@ -8,6 +8,7 @@ import type { RunEventKind, TaskSpec, ToolCallResolution, ToolRisk } from '@shar
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { type AgentHost, type ModelInvoker, runAgent } from './agent';
 import type { ContentBlock, ModelResponse } from './model/types';
+import { findOrphanToolUse } from './model/types';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { sealPatch } from './patch';
 import { importSnapshot, resolveProfile } from './repo';
@@ -145,7 +146,13 @@ describe('端到端：Vite + React + TS 构建失败修复', () => {
       });
 
       // ---- 结果断言 ----
-      expect(result.kind).toBe('PATCH_READY');
+      // 带上 detail 与模型轮次：这条断言曾经红过一次且复现不出来，
+      // 只说 "expected BLOCKED to be PATCH_READY" 是查不下去的。
+      expect(
+        result.kind,
+        `result.detail=${result.detail} · modelTurns=${recorder.ledger.modelTurns} · ` +
+          `finalVerification=${result.finalVerification?.commands.map((c) => `${c.commandId}=${c.outcome}`).join(' ') ?? 'null'}`,
+      ).toBe('PATCH_READY');
 
       // 基线必须是"真的构建失败"，不能是 spawn 失败伪装成的失败
       const baselineBuild = result.baseline!.commands.find((c) => c.commandId === 'build')!;
@@ -218,6 +225,10 @@ class ScriptedModel implements ModelInvoker {
   private turn = 0;
 
   async invoke(input: Parameters<ModelInvoker['invoke']>[0]) {
+    // 真实 provider 会对孤儿 tool_use 返回 400，测试替身不会 —— 所以这里
+    // 主动用与网关同一个校验器把关，否则这类回归在测试里是静默的。
+    const orphan = findOrphanToolUse(input.request.messages);
+    if (orphan) throw new Error(`${input.purpose} 调用收到非法消息序列：${orphan}`);
     this.turn += 1;
     const response = this.script(input.purpose, input);
     return {

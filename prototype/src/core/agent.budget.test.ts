@@ -17,6 +17,7 @@ import type {
 import { digestOf, newId, nowIso, sha256 } from '@shared/ids';
 import { AgentCancelled, PlanningFailed, type AgentHost, type ModelInvoker, runAgent } from './agent';
 import type { ContentBlock, ModelMessage, ModelResponse } from './model/types';
+import { findOrphanToolUse, toolUsesOf } from './model/types';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { type MaterializedWorkspace, listTree, resolveManaged } from './workspace';
 
@@ -226,6 +227,13 @@ class ScriptedModel implements ModelInvoker {
       system: input.request.system,
       messages: [...input.request.messages],
     });
+    // 先快照再校验：抛在快照前的话，出问题的那一次调用反而查不到。
+    // 真实 provider 会对孤儿 tool_use 返回 400，测试替身不会 —— 所以这里
+    // 主动用与网关同一个校验器把关，否则这类回归在测试里是静默的。
+    const orphan = findOrphanToolUse(input.request.messages);
+    if (orphan) {
+      throw new Error(`第 ${this.calls.length} 次调用（${input.purpose}）收到非法消息序列：${orphan}`);
+    }
     const response = this.script(this.calls.length, input);
     return {
       invocationId: `inv_stub_${this.calls.length}`,
@@ -255,6 +263,21 @@ class ScriptedModel implements ModelInvoker {
 function toolUse(name: string, input: unknown): ModelResponse {
   return {
     content: [{ type: 'tool_use', id: `tu_${name}_${Math.random().toString(36).slice(2, 8)}`, name, input }],
+    stopReason: 'TOOL_USE',
+    inputTokens: 10,
+    outputTokens: 5,
+  };
+}
+
+/** 一轮里点名多个工具 —— 真实模型经常这么干 */
+function multiToolUse(...calls: Array<{ name: string; input: unknown }>): ModelResponse {
+  return {
+    content: calls.map((c) => ({
+      type: 'tool_use' as const,
+      id: `tu_${c.name}_${Math.random().toString(36).slice(2, 8)}`,
+      name: c.name,
+      input: c.input,
+    })),
     stopReason: 'TOOL_USE',
     inputTokens: 10,
     outputTokens: 5,
@@ -626,6 +649,117 @@ describe('基线决定这一趟要不要跑', () => {
 // ---------------------------------------------------------------------------
 // 规划阶段的轮次上界
 // ---------------------------------------------------------------------------
+
+describe('发给模型的消息序列必须合法', () => {
+  // 这一组守的是两家 wire 共同的硬性要求：assistant 消息里的每个 tool_use，
+  // 下一条消息必须回填对应的 tool_result。违反时 Anthropic 与 OpenAI 兼容端都返回 400，
+  // 而且是**此后每一次请求**都失败 —— 坏消息永久留在 conversation 里。
+  // 脚本化替身不校验序列，所以这类缺陷曾经在 389 个测试全绿的情况下存活。
+
+  it('findOrphanToolUse 真的能抓到孤儿 —— 否则本组其余断言都是空的', () => {
+    const orphan = [
+      { role: 'user' as const, content: [{ type: 'text' as const, text: '干活' }] },
+      {
+        role: 'assistant' as const,
+        content: [{ type: 'tool_use' as const, id: 'tu_1', name: 'submit_plan', input: {} }],
+      },
+      { role: 'user' as const, content: [{ type: 'text' as const, text: '用户已批准' }] },
+    ];
+    expect(findOrphanToolUse(orphan)).toContain('submit_plan(tu_1)');
+
+    // 回填之后就合法
+    const answered = [
+      orphan[0]!,
+      orphan[1]!,
+      {
+        role: 'user' as const,
+        content: [
+          { type: 'tool_result' as const, toolUseId: 'tu_1', content: '已提交', isError: false },
+        ],
+      },
+    ];
+    expect(findOrphanToolUse(answered)).toBeNull();
+
+    // 只回填了一半也算孤儿
+    const half = [
+      orphan[0]!,
+      {
+        role: 'assistant' as const,
+        content: [
+          { type: 'tool_use' as const, id: 'tu_1', name: 'fs_read', input: {} },
+          { type: 'tool_use' as const, id: 'tu_2', name: 'submit_plan', input: {} },
+        ],
+      },
+      {
+        role: 'user' as const,
+        content: [
+          { type: 'tool_result' as const, toolUseId: 'tu_1', content: 'ok', isError: false },
+        ],
+      },
+    ];
+    expect(findOrphanToolUse(half)).toContain('submit_plan(tu_2)');
+  });
+
+  it('计划获批后的第一次执行调用，历史里不能有孤儿 tool_use', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) =>
+      n === 1 ? toolUse('submit_plan', VALID_PLAN) : endTurn('改完了'),
+    );
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    // 前提：确实发生了「规划提交 → 执行」的跨阶段历史复用，
+    // 否则下面那句断言什么都没验证。
+    const exec = gateway.calls.filter((c) => c.purpose === 'EXECUTION');
+    expect(exec.length).toBeGreaterThan(0);
+    const first = exec[0]!;
+    expect(
+      first.messages.some((m) => toolUsesOf(m.content).some((u) => u.name === 'submit_plan')),
+    ).toBe(true);
+
+    expect(findOrphanToolUse(first.messages)).toBeNull();
+  });
+
+  it('submit_plan 与别的工具同轮出现时，两个 id 都要被回填', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) =>
+      n === 1
+        ? multiToolUse(
+            { name: 'fs_read', input: { path: 'src/a.ts' } },
+            { name: 'submit_plan', input: VALID_PLAN },
+          )
+        : endTurn('改完了'),
+    );
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    const exec = gateway.calls.filter((c) => c.purpose === 'EXECUTION');
+    expect(exec.length).toBeGreaterThan(0);
+
+    // 前提：那一轮确实有两个 tool_use
+    const planTurn = exec[0]!.messages.find((m) => toolUsesOf(m.content).length === 2);
+    expect(planTurn).toBeDefined();
+
+    expect(findOrphanToolUse(exec[0]!.messages)).toBeNull();
+  });
+
+  it('每一次模型调用的历史都合法，不只是第一次', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) => {
+      if (n === 1) return toolUse('submit_plan', VALID_PLAN);
+      if (n === 2) return toolUse('fs_read', { path: 'src/a.ts' });
+      if (n === 3) return toolUse('fs_list', { path: '.' });
+      return endTurn('改完了');
+    });
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    expect(gateway.calls.length).toBeGreaterThan(3);
+    for (const [i, call] of gateway.calls.entries()) {
+      expect(findOrphanToolUse(call.messages), `第 ${i + 1} 次调用（${call.purpose}）`).toBeNull();
+    }
+  });
+});
 
 describe('规划阶段不会无限重试', () => {
   it('模型只回文本不调 submit_plan：每轮都被要求重提，用满轮次后抛 PlanningFailed', async () => {

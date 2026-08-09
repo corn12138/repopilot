@@ -97,3 +97,41 @@ export function toolUsesOf(
     (b): b is Extract<ContentBlock, { type: 'tool_use' }> => b.type === 'tool_use',
   );
 }
+
+/**
+ * 检查消息序列是否满足两家 wire 共同的硬性要求：
+ * **每条含 tool_use 的 assistant 消息，下一条消息必须回填全部 toolUseId。**
+ *
+ * Anthropic 返回 `tool_use ids were found without tool_result blocks immediately after`，
+ * OpenAI 兼容端返回 `An assistant message with 'tool_calls' must be followed by tool messages`。
+ * 两者都是 400，且**在整个 conversation 上检查** —— 一条历史遗留的孤儿会让此后
+ * 每一次请求都失败，而不只是产生它的那一次。
+ *
+ * 所以这不是"发出去再看"的事情，得在出站前拦住：provider 的 400 只会被归类成
+ * BAD_REQUEST 加一句供应商原文，定位不到是我们自己拼错了历史。
+ *
+ * 返回 null 表示合法，否则返回可直接展示的原因。
+ */
+export function findOrphanToolUse(messages: readonly ModelMessage[]): string | null {
+  for (let i = 0; i < messages.length; i += 1) {
+    const msg = messages[i]!;
+    if (msg.role !== 'assistant') continue;
+    const uses = toolUsesOf(msg.content);
+    if (uses.length === 0) continue;
+
+    const next = messages[i + 1];
+    const answered = new Set(
+      (next?.content ?? [])
+        .filter((b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result')
+        .map((b) => b.toolUseId),
+    );
+    const orphans = uses.filter((u) => !answered.has(u.id));
+    if (orphans.length === 0) continue;
+
+    const which = orphans.map((u) => `${u.name}(${u.id})`).join(', ');
+    return next
+      ? `messages[${i}] 的 tool_use 未被 messages[${i + 1}] 回填：${which}`
+      : `messages[${i}] 的 tool_use 后没有任何消息：${which}`;
+  }
+  return null;
+}

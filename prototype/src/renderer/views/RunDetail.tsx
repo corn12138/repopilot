@@ -276,7 +276,14 @@ function PatchReview({
     setBusy(true);
     setExportMsg(null);
     try {
-      const r = await call('patch.export', { runId: patch.runId, patchId: patch.patchId, mode });
+      const r = await call('patch.export', {
+        runId: patch.runId,
+        patchId: patch.patchId,
+        mode,
+        // 写回宿主仓库时带上 digest，由 Core 比对「应用的」= 「接受的」。
+        // SAVE_FILE / COPY 不写仓库，Core 侧忽略。
+        patchDigest: patch.digest,
+      });
       setExportMsg(
         r.ok
           ? { ok: true, text: `${r.detail}${r.target ? ` → ${r.target}` : ''}` }

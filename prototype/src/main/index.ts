@@ -268,6 +268,7 @@ interface ExportRequest {
   runId: string;
   patchId: string;
   mode: 'SAVE_FILE' | 'COPY' | 'APPLY_TO_REPO';
+  patchDigest?: string;
 }
 
 /**
@@ -278,7 +279,11 @@ interface ExportRequest {
  */
 async function exportPatch(req: ExportRequest): Promise<IpcResult<unknown>> {
   if (req.mode === 'APPLY_TO_REPO') {
-    return callCore('__patch.applyToRepo', { runId: req.runId, patchId: req.patchId });
+    return callCore('__patch.applyToRepo', {
+      runId: req.runId,
+      patchId: req.patchId,
+      patchDigest: req.patchDigest,
+    });
   }
 
   const contentResult = await callCore('__patch.content', {

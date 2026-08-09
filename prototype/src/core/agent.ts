@@ -384,8 +384,26 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
 
     conversation.push({ role: 'assistant', content: response.content });
     const results: ContentBlock[] = [];
+    /**
+     * 本轮 submit_plan 解析出的计划。
+     *
+     * 拿到之后**不能立刻 return** —— 必须先把本轮全部 tool_use 的 tool_result 写回历史。
+     * 这个 conversation 会被执行阶段继续复用，一条带 tool_use 却没有对应 tool_result 的
+     * assistant 消息会让 Anthropic 与 OpenAI 兼容端都以 400 拒绝整个请求。
+     */
+    let submitted: PlanRevision | null = null;
 
     for (const use of uses) {
+      if (submitted) {
+        // 计划已在本轮提交，剩余工具不再执行 —— 但 id 仍要回填，否则它们就是孤儿
+        results.push({
+          type: 'tool_result',
+          toolUseId: use.id,
+          content: '本轮已提交计划，该工具调用未执行。请在计划获批后的执行阶段再调用。',
+          isError: true,
+        });
+        continue;
+      }
       if (use.name === 'submit_plan') {
         const parsed = planSchema.safeParse(use.input);
         if (!parsed.success) {
@@ -411,7 +429,7 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
           steps,
           risks: parsed.data.risks,
         };
-        return {
+        submitted = {
           planId: newId('plan'),
           runId: deps.runId,
           revision: 1,
@@ -429,6 +447,13 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
           },
           createdAt: nowIso(),
         };
+        results.push({
+          type: 'tool_result',
+          toolUseId: use.id,
+          content: '计划已提交，等待用户审批。',
+          isError: false,
+        });
+        continue;
       }
 
       const outcome = await dispatchTool(deps, use.name, use.input, 'PLANNING');
@@ -440,7 +465,9 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
       });
     }
 
+    // 先写回历史，再决定是否返回 —— 顺序反了就是这个 bug 本身
     conversation.push({ role: 'user', content: results });
+    if (submitted) return submitted;
   }
 
   throw new PlanningFailed(`规划阶段用满 ${maxPlanTurns} 轮仍未提交计划`);
@@ -487,17 +514,31 @@ async function executionTurns(
     }
 
     const results: ContentBlock[] = [];
-    for (const use of uses) {
-      throwIfCancelled(deps.signal);
-      const outcome = await dispatchTool(deps, use.name, use.input, 'EXECUTION');
-      results.push({
-        type: 'tool_result',
-        toolUseId: use.id,
-        content: outcome.text,
-        isError: !outcome.ok,
-      });
+    try {
+      for (const use of uses) {
+        throwIfCancelled(deps.signal);
+        const outcome = await dispatchTool(deps, use.name, use.input, 'EXECUTION');
+        results.push({
+          type: 'tool_result',
+          toolUseId: use.id,
+          content: outcome.text,
+          isError: !outcome.ok,
+        });
+      }
+    } finally {
+      // 正常跑完、被取消、或 dispatchTool 抛错，都必须把本轮**全部** tool_use 回填。
+      // 半截的历史一旦被复用（重启续跑、交叉审核复读），两家 wire 都会返回 400，
+      // 而且是此后每一次请求都失败 —— 见 findOrphanToolUse。
+      for (const use of uses.slice(results.length)) {
+        results.push({
+          type: 'tool_result',
+          toolUseId: use.id,
+          content: '该工具调用未完成（执行被中断）。',
+          isError: true,
+        });
+      }
+      conversation.push({ role: 'user', content: results });
     }
-    conversation.push({ role: 'user', content: results });
   }
 }
 
