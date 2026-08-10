@@ -39,6 +39,9 @@
 | 补丁应用：干净场景真的改对宿主文件，且不 commit 不 stage | `apply.test.ts` |
 | 补丁应用：目标文件已漂移 → `--check` 拒绝，宿主逐字节不变 | `apply.test.ts` |
 | 补丁应用：子包场景用 `--directory` 还原坐标系 | `apply.test.ts` |
+| 账本：provider 未回报用量（null）计入"未知轮次"，绝不折算成 0 | `domain.test.ts` |
+| 账本：不涉及 token 的记账（工具调用）不污染未知计数 | `domain.test.ts` |
+| failureClass / unknownUsageTurns 增量字段跨重启往返，旧快照缺字段读出 undefined 而非补 0 | `persistence.test.ts` |
 
 ## 尚未证明的
 
@@ -154,6 +157,12 @@ base URL 存的是**完整地址含版本路径** —— 智谱是 `/api/paas/v4
 发出去了但结局不明的（连接中断、单次 240s 超时）默认不重发 —— 可能重复执行、重复计费。
 重试**永远不换** provider/模型/origin，每次尝试在 egress 日志里独立落账（`sendAttempt`）。
 语义与测试见 `core/model/retry.ts`。
+
+**账本不说谎**：provider 未回报用量时（`inputTokens: null`），账本不把它折算成 0，
+而是计入 `unknownUsageTurns` —— UI 上显式标注「N 轮用量未知，token 数不含它们」。
+非成功终态另有封闭枚举 `failureClass`（验证未通过 / 预算耗尽 / 模型调用失败 /
+用户取消…），statusReason 归人读，failureClass 归统计和 eval ——
+「有多少 Run 是验证失败」不该靠 grep 中文句子回答。
 
 然后：授权仓库 → 快照导入 → 填 TaskSpec 选验证命令 → 创建 → 审批计划 → 看时间线 → 审查 diff → 接受或拒绝。
 

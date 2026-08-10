@@ -163,6 +163,15 @@ export interface BudgetLedger {
   readonly elapsedMs: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
+  /**
+   * provider 未回报用量的模型轮次数。
+   *
+   * inputTokens/outputTokens 的加和只包含**已知**数字 —— null 绝不折算成 0
+   * （null 表示无法证明，不等于 0）。这个计数器让"上面的 token 数少算了几轮"
+   * 这件事本身可见。可选：旧版状态快照没有此字段，含义是"当时未统计"，
+   * 与 0（统计了、全都回报了）不同。
+   */
+  readonly unknownUsageTurns?: number;
 }
 
 export const EMPTY_LEDGER: BudgetLedger = {
@@ -172,11 +181,68 @@ export const EMPTY_LEDGER: BudgetLedger = {
   elapsedMs: 0,
   inputTokens: 0,
   outputTokens: 0,
+  unknownUsageTurns: 0,
 };
+
+/**
+ * 一次记账。token 字段三态：
+ *   number    —— 已知用量，计入加和；
+ *   null      —— 涉及 token 但 provider 未回报（计入 unknownUsageTurns，不进加和）；
+ *   undefined —— 此次记账不涉及 token（工具调用、自修复轮）。
+ */
+export interface LedgerCharge {
+  readonly modelTurns?: number;
+  readonly toolCalls?: number;
+  readonly selfFixRounds?: number;
+  readonly inputTokens?: number | null;
+  readonly outputTokens?: number | null;
+}
+
+/** 账本只加不减（PRD-RUN-007）。null 与 undefined 的区分见 LedgerCharge。 */
+export function applyLedgerCharge(
+  ledger: BudgetLedger,
+  charge: LedgerCharge,
+  elapsedMs: number,
+): BudgetLedger {
+  const usageUnknown = charge.inputTokens === null || charge.outputTokens === null;
+  return {
+    modelTurns: ledger.modelTurns + (charge.modelTurns ?? 0),
+    toolCalls: ledger.toolCalls + (charge.toolCalls ?? 0),
+    selfFixRounds: ledger.selfFixRounds + (charge.selfFixRounds ?? 0),
+    elapsedMs,
+    inputTokens: ledger.inputTokens + (charge.inputTokens ?? 0),
+    outputTokens: ledger.outputTokens + (charge.outputTokens ?? 0),
+    unknownUsageTurns: (ledger.unknownUsageTurns ?? 0) + (usageUnknown ? 1 : 0),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Run / Attempt 状态机
 // ---------------------------------------------------------------------------
+
+/**
+ * 非成功终态的失败归类（封闭枚举）。
+ *
+ * 与 RunStatus 的分工：status 说"停在了哪种终态"（FAILED/BLOCKED/…），
+ * failureClass 说"**为什么**"。同一个 BLOCKED 可能是预算耗尽、计划被拒、
+ * 审批过期 —— 事后统计与 eval 需要区分它们，而不是 grep statusReason 的中文。
+ */
+export type FailureClass =
+  | 'VERIFICATION_FAILED' // 自修复用尽，验证仍未通过
+  | 'NO_CHANGES' // 模型没有做出任何改动
+  | 'MODEL_INVOCATION_FAILED' // 出站调用失败（含重试用尽）
+  | 'PLANNING_FAILED'
+  | 'RUNTIME_ERROR'
+  | 'BUDGET_EXHAUSTED'
+  | 'EGRESS_BLOCKED'
+  | 'PLAN_REJECTED'
+  | 'APPROVAL_EXPIRED'
+  | 'PATCH_REJECTED'
+  | 'CHANGES_REQUESTED'
+  | 'USER_CANCELLED'
+  | 'TIMEOUT'
+  | 'INTERRUPTED' // 进程退出时仍在执行，没来得及有结论
+  | 'INVARIANT_VIOLATION'; // 内部不变式违规（平台自己的错，不是任务的错）
 
 export type RunStatus =
   | 'CREATED'
@@ -246,6 +312,12 @@ export interface RunView {
   readonly attemptNo: number;
   readonly status: RunStatus;
   readonly statusReason: string | null;
+  /**
+   * 非成功终态的结构化归类。statusReason 是给人读的自由文本，这个是给
+   * 统计、eval 和过滤用的封闭枚举 —— 「有多少 Run 是验证失败、多少是
+   * 模型调用失败」不该靠 grep 中文句子回答。可选：旧状态快照没有此字段。
+   */
+  readonly failureClass?: FailureClass | null;
   readonly ledger: BudgetLedger;
   readonly limits: BudgetLimits;
   readonly workspaceGeneration: number;

@@ -3,7 +3,8 @@ import { basename, join } from 'node:path';
 import type {
   ApprovalDecisionKind,
   ApprovalRequest,
-  BudgetLedger,
+  FailureClass,
+  LedgerCharge,
   CrossReviewRecord,
   CrossReviewRound,
   CrossReviewStopReason,
@@ -26,7 +27,7 @@ import type {
   ToolRisk,
   VerificationRun,
 } from '@shared/domain';
-import { CROSS_REVIEW_LIMITS, EMPTY_LEDGER, isTerminal } from '@shared/domain';
+import { CROSS_REVIEW_LIMITS, EMPTY_LEDGER, applyLedgerCharge, isTerminal } from '@shared/domain';
 import { sha256 } from '@shared/ids';
 import type { ImportOutcome, PatchExportResult, PlatformError, PushEvent } from '@shared/protocol';
 import { digestOf, newId, nowIso } from '@shared/ids';
@@ -335,6 +336,7 @@ export class RunAuthority {
       ...record.view,
       status: 'INTERRUPTED',
       statusReason: `进程退出时该 Run 处于 ${previous}，重启后无法续跑`,
+      failureClass: 'INTERRUPTED',
       updatedAt: nowIso(),
     };
     record.events.append(record.view.attemptId, 'STATUS_CHANGED', `${previous} → INTERRUPTED（进程退出）`, {
@@ -370,6 +372,7 @@ export class RunAuthority {
         attemptNo: 1,
         status: 'INTERRUPTED',
         statusReason: '状态快照损坏，仅能展示事件流',
+        failureClass: 'INTERRUPTED',
         ledger: EMPTY_LEDGER,
         limits: {
           maxModelTurns: 0,
@@ -937,7 +940,7 @@ export class RunAuthority {
     // 而不是让一个 null 在深处炸成未分类异常。
     const workspace = record.workspace;
     if (!workspace) {
-      this.setStatus(record, 'INTERRUPTED', '内部不变式违规：尝试执行一个没有工作区的 Run');
+      this.setStatus(record, 'INTERRUPTED', '内部不变式违规：尝试执行一个没有工作区的 Run', 'INVARIANT_VIOLATION');
       return;
     }
 
@@ -947,7 +950,7 @@ export class RunAuthority {
         // 防御性：正常情况下审批期间 deadline 是暂停的，不会在这里撞上待审批；
         // 但万一撞上，也要兑现 Promise 让 runAgent 解开、finally 得以执行。
         this.cleanupPendingApprovals(record);
-        this.setStatus(record, 'TIMED_OUT', '超过任务时间预算');
+        this.setStatus(record, 'TIMED_OUT', '超过任务时间预算', 'TIMEOUT');
       }
     });
     record.deadline = deadline;
@@ -1020,10 +1023,10 @@ export class RunAuthority {
           break;
         }
         case 'PLAN_REJECTED':
-          this.setStatus(record, 'BLOCKED', result.detail);
+          this.setStatus(record, 'BLOCKED', result.detail, 'PLAN_REJECTED');
           break;
         case 'NO_CHANGES':
-          this.setStatus(record, 'FAILED', result.detail);
+          this.setStatus(record, 'FAILED', result.detail, 'NO_CHANGES');
           break;
         case 'VERIFICATION_FAILED':
           this.sealSalvagePatch(record, workspace, {
@@ -1031,7 +1034,7 @@ export class RunAuthority {
             baseline: result.baseline,
             finalVerification: result.finalVerification,
           });
-          this.setStatus(record, 'FAILED', result.detail);
+          this.setStatus(record, 'FAILED', result.detail, 'VERIFICATION_FAILED');
           break;
         case 'BLOCKED':
           this.sealSalvagePatch(record, workspace, {
@@ -1039,7 +1042,7 @@ export class RunAuthority {
             baseline: result.baseline,
             finalVerification: result.finalVerification,
           });
-          this.setStatus(record, 'BLOCKED', result.detail);
+          this.setStatus(record, 'BLOCKED', result.detail, 'BUDGET_EXHAUSTED');
           break;
       }
     } catch (err) {
@@ -1048,21 +1051,21 @@ export class RunAuthority {
       if (err instanceof AgentCancelled || record.abort.signal.aborted) {
         if (!isTerminal(record.view.status)) {
           this.sealSalvagePatch(record, workspace, { marker: '用户取消时的执行现场' });
-          this.setStatus(record, 'CANCELLED', '已取消');
+          this.setStatus(record, 'CANCELLED', '已取消', 'USER_CANCELLED');
         }
       } else if (err instanceof EgressBlocked) {
         this.sealSalvagePatch(record, workspace, { marker: `模型出站被阻断（${err.reason}）时的执行现场` });
-        this.setStatus(record, 'BLOCKED', `模型出站被阻断：${err.reason}`);
+        this.setStatus(record, 'BLOCKED', `模型出站被阻断：${err.reason}`, 'EGRESS_BLOCKED');
       } else if (err instanceof InvocationFailed) {
         this.sealSalvagePatch(record, workspace, {
           marker: `模型调用失败（${err.cause.kind}）时的执行现场`,
         });
-        this.setStatus(record, 'FAILED', `模型调用失败：${err.cause.kind} — ${err.message}`);
+        this.setStatus(record, 'FAILED', `模型调用失败：${err.cause.kind} — ${err.message}`, 'MODEL_INVOCATION_FAILED');
       } else if (err instanceof PlanningFailed) {
-        this.setStatus(record, 'FAILED', `规划失败：${err.message}`);
+        this.setStatus(record, 'FAILED', `规划失败：${err.message}`, 'PLANNING_FAILED');
       } else {
         this.sealSalvagePatch(record, workspace, { marker: '运行时异常时的执行现场' });
-        this.setStatus(record, 'FAILED', `运行时异常：${(err as Error).message}`);
+        this.setStatus(record, 'FAILED', `运行时异常：${(err as Error).message}`, 'RUNTIME_ERROR');
       }
     } finally {
       deadline.clear();
@@ -1292,7 +1295,7 @@ export class RunAuthority {
           const expiry = setTimeout(() => {
             if (!record.approvals.has(request.approvalId)) return;
             this.emit(record, 'NOTE', '计划审批已过期（超过 30 分钟未决定），已停止');
-            this.setStatus(record, 'BLOCKED', '计划审批已过期（超过 30 分钟未决定）');
+            this.setStatus(record, 'BLOCKED', '计划审批已过期（超过 30 分钟未决定）', 'APPROVAL_EXPIRED');
             record.abort.abort(); // 触发 onAbort → cleanup + reject
           }, APPROVAL_TTL_MS);
           expiry.unref?.();
@@ -1372,7 +1375,7 @@ export class RunAuthority {
         this.push({ type: 'toolcall.updated', toolCall: updated });
       },
 
-      chargeModelTurn: (inputTokens: number, outputTokens: number) =>
+      chargeModelTurn: (inputTokens: number | null, outputTokens: number | null) =>
         this.charge(record, startedAt, {
           modelTurns: 1,
           inputTokens,
@@ -1398,18 +1401,11 @@ export class RunAuthority {
   }
 
   /** 账本只增不减 —— retry / deny / cancel 都不回退已消耗量 */
-  private charge(record: RunRecord, startedAt: number, delta: Partial<BudgetLedger>): void {
-    const l = record.view.ledger;
+  private charge(record: RunRecord, startedAt: number, delta: LedgerCharge): void {
     record.view = {
       ...record.view,
-      ledger: {
-        modelTurns: l.modelTurns + (delta.modelTurns ?? 0),
-        toolCalls: l.toolCalls + (delta.toolCalls ?? 0),
-        selfFixRounds: l.selfFixRounds + (delta.selfFixRounds ?? 0),
-        elapsedMs: Date.now() - startedAt,
-        inputTokens: l.inputTokens + (delta.inputTokens ?? 0),
-        outputTokens: l.outputTokens + (delta.outputTokens ?? 0),
-      },
+      // null/undefined 的三态语义在 applyLedgerCharge：null 计入未知轮次，不折算成 0
+      ledger: applyLedgerCharge(record.view.ledger, delta, Date.now() - startedAt),
       workspaceGeneration: record.workspace?.activeGeneration ?? record.view.workspaceGeneration,
       updatedAt: nowIso(),
     };
@@ -1447,7 +1443,7 @@ export class RunAuthority {
         // 与代理超时定时器同样处理：置 BLOCKED 并 abort（→ onAbort 兑现 Promise 并清理）。
         // 绝不能只 delete 不 resolve —— 那正是之前 Promise 永久泄漏、CLEANUP_SUMMARY
         // 永远发不出来的根因。
-        this.setStatus(record, 'BLOCKED', '计划审批已过期');
+        this.setStatus(record, 'BLOCKED', '计划审批已过期', 'APPROVAL_EXPIRED');
         record.abort.abort();
         return { accepted: false, reason: '审批已过期' };
       }
@@ -1591,9 +1587,9 @@ export class RunAuthority {
           : '用户已接受补丁，但没有通过的机器验证支撑 —— 正确性仅由人工判断',
       );
     } else if (input.decision === 'REJECT') {
-      this.setStatus(record, 'BLOCKED', `用户拒绝了补丁：${input.note || '未填写原因'}`);
+      this.setStatus(record, 'BLOCKED', `用户拒绝了补丁：${input.note || '未填写原因'}`, 'PATCH_REJECTED');
     } else {
-      this.setStatus(record, 'BLOCKED', `用户要求修改：${input.note || '未填写反馈'}（原型暂未实现新 Attempt）`);
+      this.setStatus(record, 'BLOCKED', `用户要求修改：${input.note || '未填写反馈'}（原型暂未实现新 Attempt）`, 'CHANGES_REQUESTED');
     }
 
     return { run: record.view, reason: null };
@@ -1866,16 +1862,21 @@ export class RunAuthority {
     if (isTerminal(record.view.status)) return record.view;
     if (record.view.restored) {
       // 恢复态唯一可能的非终态是 AWAITING_PATCH_REVIEW，那里没有进程可停
-      this.setStatus(record, 'BLOCKED', `${reason}（该 Run 已从磁盘恢复，无运行中的进程）`);
+      this.setStatus(record, 'BLOCKED', `${reason}（该 Run 已从磁盘恢复，无运行中的进程）`, 'USER_CANCELLED');
       return record.view;
     }
     record.abort.abort();
     this.cleanupPendingApprovals(record);
-    this.setStatus(record, 'CANCELLED', reason);
+    this.setStatus(record, 'CANCELLED', reason, 'USER_CANCELLED');
     return record.view;
   }
 
-  private setStatus(record: RunRecord, status: RunStatus, reason: string | null): void {
+  private setStatus(
+    record: RunRecord,
+    status: RunStatus,
+    reason: string | null,
+    failureClass: FailureClass | null = null,
+  ): void {
     if (isTerminal(record.view.status)) return; // 终态不可逆
     const facts = record.view.terminalFacts;
     if (status === 'SUCCEEDED' && !(facts?.verificationRunId && facts.patchAcceptanceId)) {
@@ -1889,6 +1890,8 @@ export class RunAuthority {
       ...record.view,
       status,
       statusReason: reason,
+      // 归类只随非成功终态落定；中间态转换传 null，不残留上一次的值
+      failureClass,
       workspaceGeneration: record.workspace?.activeGeneration ?? record.view.workspaceGeneration,
       updatedAt: nowIso(),
     };
@@ -1896,6 +1899,7 @@ export class RunAuthority {
       from: previous,
       to: status,
       reason,
+      failureClass,
     });
     this.persist(record); // 事件已 append，此刻状态快照才允许追上
     this.push({ type: 'run.updated', run: record.view });

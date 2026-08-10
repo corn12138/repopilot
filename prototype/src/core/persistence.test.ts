@@ -121,6 +121,41 @@ describe('状态快照读写', () => {
     expect(listPersistedRunIds()).toContain(view.runId);
   });
 
+  it('failureClass 与 unknownUsageTurns 是增量字段：新状态带着走，旧状态缺了也能读', () => {
+    // 两个字段都是 optional —— 不 bump 状态 schema 版本就能落盘/读回；
+    // 旧快照缺字段时读出来是 undefined（"当时未统计"），不是 0，也不是拒读。
+    const view = {
+      ...makeView('FAILED'),
+      failureClass: 'VERIFICATION_FAILED' as const,
+      ledger: { ...EMPTY_LEDGER, modelTurns: 5, inputTokens: 900, unknownUsageTurns: 2 },
+    };
+    track(view.runId);
+    writeRunState(makeState(view));
+
+    const loaded = readRunState(view.runId);
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) {
+      expect(loaded.state.view.failureClass).toBe('VERIFICATION_FAILED');
+      expect(loaded.state.view.ledger.unknownUsageTurns).toBe(2);
+      // token 加和只含已知数字这一点由 domain.test 钉住；这里钉"数字不被落盘损坏"
+      expect(loaded.state.view.ledger.inputTokens).toBe(900);
+    }
+
+    // 旧版快照：没有这两个字段，照样能读，读出 undefined 而不是被拒或被补 0。
+    // makeView 会经 EMPTY_LEDGER 带上 unknownUsageTurns:0，这里显式剥掉才是真"旧"
+    const base = makeView('FAILED');
+    const { unknownUsageTurns: _drop, ...legacyLedger } = base.ledger;
+    const legacy = { ...base, ledger: legacyLedger };
+    track(legacy.runId);
+    writeRunState(makeState(legacy));
+    const legacyLoaded = readRunState(legacy.runId);
+    expect(legacyLoaded.ok).toBe(true);
+    if (legacyLoaded.ok) {
+      expect(legacyLoaded.state.view.failureClass).toBeUndefined();
+      expect(legacyLoaded.state.view.ledger.unknownUsageTurns).toBeUndefined();
+    }
+  });
+
   it('FAILED Run 的挽救补丁跨重启存活 —— 失败不是丢掉工作成果的理由', () => {
     // "失败 Run 也要封存补丁"的持久化前提：挽救补丁若只活在内存里，
     // 重启一次就没了，挽救就成了空话。终态是 FAILED 不妨碍补丁完整落盘、完整读回。

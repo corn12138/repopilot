@@ -90,6 +90,7 @@ export function RunDetail({
       >
         <div className="row wrap" style={{ marginBottom: 12 }}>
           <RunStatusBadge status={run.status} />
+          {run.failureClass && <FailureClassBadge failureClass={run.failureClass} />}
           <RestoredBadge run={run} />
           <Badge>gen-{run.workspaceGeneration}</Badge>
           <Badge>模型轮次 {run.ledger.modelTurns}/{run.limits.maxModelTurns}</Badge>
@@ -98,6 +99,11 @@ export function RunDetail({
           <Badge>
             token {run.ledger.inputTokens + run.ledger.outputTokens}/{run.limits.maxTotalTokens}
           </Badge>
+          {(run.ledger.unknownUsageTurns ?? 0) > 0 && (
+            <span title="这些轮次 provider 没有回报用量，上面的 token 数没有把它们算进去 —— 未知不折算成 0">
+              <Badge tone="warn">{run.ledger.unknownUsageTurns} 轮用量未知</Badge>
+            </span>
+          )}
           <Badge>{Math.round(run.ledger.elapsedMs / 1000)}s</Badge>
         </div>
 
@@ -211,6 +217,33 @@ export function RunDetail({
 }
 
 // ---------------------------------------------------------------------------
+
+/** 失败归类的中文标签；raw 枚举收进 title 悬停可见（与状态徽章同一约定） */
+const FAILURE_CLASS_TEXT: Record<string, string> = {
+  VERIFICATION_FAILED: '验证未通过',
+  NO_CHANGES: '未产生改动',
+  MODEL_INVOCATION_FAILED: '模型调用失败',
+  PLANNING_FAILED: '规划失败',
+  RUNTIME_ERROR: '运行时异常',
+  BUDGET_EXHAUSTED: '预算耗尽',
+  EGRESS_BLOCKED: '出站被阻断',
+  PLAN_REJECTED: '计划被拒',
+  APPROVAL_EXPIRED: '审批过期',
+  PATCH_REJECTED: '补丁被拒',
+  CHANGES_REQUESTED: '要求修改',
+  USER_CANCELLED: '用户取消',
+  TIMEOUT: '超时',
+  INTERRUPTED: '进程中断',
+  INVARIANT_VIOLATION: '平台内部错误',
+};
+
+function FailureClassBadge({ failureClass }: { failureClass: string }) {
+  return (
+    <span title={failureClass}>
+      <Badge tone="err">{FAILURE_CLASS_TEXT[failureClass] ?? failureClass}</Badge>
+    </span>
+  );
+}
 
 function PlanApproval({
   approval,

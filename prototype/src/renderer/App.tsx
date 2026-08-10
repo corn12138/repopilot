@@ -564,6 +564,14 @@ function UsagePanel({ run, events }: { run: RunView; events: RunEvent[] }) {
         used={run.ledger.inputTokens + run.ledger.outputTokens}
         max={run.limits.maxTotalTokens}
       />
+      {(run.ledger.unknownUsageTurns ?? 0) > 0 && (
+        <div className="usage-row">
+          <span className="usage-label">用量未知</span>
+          <span className="usage-value" style={{ color: 'var(--warn)' }}>
+            {run.ledger.unknownUsageTurns} 轮未回报，上面的 token 数不含它们
+          </span>
+        </div>
+      )}
       <UsageBar
         label="墙钟"
         used={Math.round(run.ledger.elapsedMs / 1000)}

@@ -44,7 +44,8 @@ export interface AgentHost {
     previewTruncated: boolean,
     artifactRef: string | null,
   ): void;
-  chargeModelTurn(inputTokens: number, outputTokens: number): void;
+  /** token 传 null 表示 provider 未回报 —— 账本记"未知轮次"，绝不折算成 0 */
+  chargeModelTurn(inputTokens: number | null, outputTokens: number | null): void;
   chargeToolCall(): void;
   chargeSelfFixRound(): void;
   budgetExceeded(): { exceeded: boolean; reason: string };
@@ -1224,7 +1225,8 @@ async function callModel(
       signal: deps.signal,
     });
 
-    deps.host.chargeModelTurn(manifest.inputTokens ?? 0, manifest.outputTokens ?? 0);
+    // null 原样传递：?? 0 会把"provider 没回报"伪装成"零消耗"，账本层负责区分
+    deps.host.chargeModelTurn(manifest.inputTokens, manifest.outputTokens);
     deps.host.emit(
       'MODEL_INVOCATION',
       `${purpose} 调用 ${manifest.modelId}（in=${manifest.inputTokens ?? '?'} out=${manifest.outputTokens ?? '?'}）`,
