@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import type {
   ModelConnectionProfile,
   ProjectRef,
@@ -8,7 +8,6 @@ import type {
   TaskClass,
 } from '@shared/domain';
 import { call } from '../bridge';
-import { Banner, Card } from '../components/common';
 
 const TASK_CLASS_LABEL: Record<TaskClass, string> = {
   BUILD_FAILURE_FIX: '构建失败修复',
@@ -16,54 +15,77 @@ const TASK_CLASS_LABEL: Record<TaskClass, string> = {
   TYPE_ERROR_FIX: '类型错误修复',
 };
 
-export function TaskForm({
+/**
+ * 底部常驻的任务输入区（对话式），替代原来的整页表单。
+ *
+ * 表单字段一个没删 —— 验证命令、路径、验收条件、交叉审核都是这个产品的
+ * 骨架而不是配置噪音 —— 只是把它们收进「高级」抽屉，给出能直接开跑的默认值。
+ * 两处刻意保留在明面上：
+ *   - 验证命令 chips：这是「能不能说成功」的开关，是差异化本体，不能藏；
+ *   - 模型路由：路由会被冻结，选择本身是一次授权（PRD：用户手动选路，不自动 fallback）。
+ */
+export function Composer({
   project,
   snapshot,
   profile,
   modelProfiles,
+  activeRun,
   onCreated,
+  onOpenRun,
+  onOpenSettings,
   onError,
 }: {
   project: ProjectRef;
   snapshot: RepositorySnapshot;
   profile: RepositoryHarnessProfile;
   modelProfiles: ModelConnectionProfile[];
+  /** 该项目下仍在进行中的 Run（若有）—— 用来提示，避免"以为没反应"而重复创建 */
+  activeRun: RunView | null;
   onCreated: (run: RunView) => void;
+  onOpenRun: (run: RunView) => void;
+  onOpenSettings: () => void;
   onError: (err: unknown) => void;
 }) {
   const enabledModels = useMemo(() => modelProfiles.filter((m) => m.enabled), [modelProfiles]);
   const commandIds = useMemo(() => Object.keys(profile.commands), [profile]);
 
   const [goal, setGoal] = useState('');
-  const [taskClass, setTaskClass] = useState<TaskClass>(profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX');
+  const [taskClass, setTaskClass] = useState<TaskClass>(
+    profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX',
+  );
   const [allowedPaths, setAllowedPaths] = useState('src/**');
   const [acceptance, setAcceptance] = useState('');
   const [selectedCommands, setSelectedCommands] = useState<string[]>(
     commandIds.includes('build') ? ['build'] : commandIds.slice(0, 1),
   );
   const [modelProfileId, setModelProfileId] = useState(enabledModels[0]?.profileId ?? '');
-  /** 空串 = 不做交叉审核 */
   const [reviewerProfileId, setReviewerProfileId] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [customCommand, setCustomCommand] = useState('');
   const [useCustom, setUseCustom] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const boxRef = useRef<HTMLTextAreaElement>(null);
 
   const customArgv = customCommand.trim().split(/\s+/).filter(Boolean);
   const hasCustom = useCustom && customArgv.length > 0;
-  /** 没有任何验证命令不再阻止创建 —— 只是终态会变成 ACCEPTED_UNVERIFIED */
   const unverifiedMode = selectedCommands.length === 0 && !hasCustom;
 
-  const disabled = false;
-  const canSubmit = goal.trim().length > 0 && modelProfileId.length > 0 && !submitting;
+  // 选中的模型失效时（例如刚删了 key）回落到第一个可用的
+  const effectiveModelId = enabledModels.some((m) => m.profileId === modelProfileId)
+    ? modelProfileId
+    : (enabledModels[0]?.profileId ?? '');
+
+  const canSubmit = goal.trim().length > 0 && effectiveModelId.length > 0 && !submitting;
 
   const submit = async () => {
+    if (!canSubmit) return;
     setSubmitting(true);
     try {
       const { run } = await call('task.create', {
         projectId: project.projectId,
         snapshotId: snapshot.snapshotId,
         profileId: profile.profileId,
-        modelProfileId,
+        modelProfileId: effectiveModelId,
         goal: goal.trim(),
         taskClass,
         allowedPaths: allowedPaths
@@ -78,9 +100,9 @@ export function TaskForm({
         ...(hasCustom
           ? { customCommands: [{ label: customCommand.trim(), argv: customArgv }] }
           : {}),
-        // 空串表示不做交叉审核；选了才传，且必然与 implementer 不同（选项已过滤）
         ...(reviewerProfileId ? { reviewerModelProfileId: reviewerProfileId } : {}),
       });
+      setGoal('');
       onCreated(run);
     } catch (err) {
       onError(err);
@@ -91,144 +113,174 @@ export function TaskForm({
 
   if (enabledModels.length === 0) {
     return (
-      <Card title="新建任务">
-        <Banner tone="warn">
-          没有已启用的模型 Profile。请设置 <code>ANTHROPIC_API_KEY</code> / <code>OPENAI_API_KEY</code> /{' '}
-          <code>DEEPSEEK_API_KEY</code> 中的任意一个后重启应用。
-        </Banner>
-      </Card>
+      <div className="composer">
+        <div className="composer-empty">
+          还没有可用的模型连接 ——{' '}
+          <button className="linklike" onClick={onOpenSettings}>
+            去「设置 · API」填一个 Key
+          </button>
+          ，填完即生效。
+        </div>
+      </div>
     );
   }
 
   return (
-    <Card title="新建任务" hint="TaskSpec">
-      <div className="field">
-        <label>目标</label>
-        <textarea
-          value={goal}
-          disabled={disabled}
-          placeholder="例如：修复 npm run build 失败 —— TypeScript 报 src/App.tsx 里 useCounter 的返回类型不匹配"
-          onChange={(e) => setGoal(e.target.value)}
-        />
-        <div className="help">写清楚"哪个命令失败了、失败长什么样"，比写"修一下 bug"有效得多。</div>
-      </div>
-
-      <div className="field">
-        <label>任务类型</label>
-        <select value={taskClass} disabled={disabled} onChange={(e) => setTaskClass(e.target.value as TaskClass)}>
-          {profile.supportedTaskClasses.map((c) => (
-            <option key={c} value={c}>
-              {TASK_CLASS_LABEL[c]}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      <div className="field">
-        <label>验证命令（决定能不能说"成功"，可以不选）</label>
-        <div>
-          {commandIds.map((id) => (
-            <button
-              key={id}
-              type="button"
-              className={`chip ${selectedCommands.includes(id) ? 'selected' : ''}`}
-              onClick={() =>
-                setSelectedCommands((prev) =>
-                  prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-                )
-              }
-            >
-              {id} → {profile.commands[id]!.label}
-            </button>
-          ))}
-          <button
-            type="button"
-            className={`chip ${useCustom ? 'selected' : ''}`}
-            onClick={() => setUseCustom((v) => !v)}
-          >
-            + 自定义命令
+    <div className="composer">
+      {activeRun && (
+        <div className="composer-note">
+          这个项目有一个进行中的运行（{activeRun.title || activeRun.runId}）。
+          <button className="linklike" onClick={() => onOpenRun(activeRun)}>
+            查看它
           </button>
+          ，或在下面开一个新任务 —— 两者互不影响。
         </div>
-        {useCustom && (
-          <input
-            style={{ marginTop: 8 }}
-            value={customCommand}
-            placeholder="例如：pnpm --filter web build（按空格拆成 argv，不经过 shell）"
-            onChange={(e) => setCustomCommand(e.target.value)}
-          />
-        )}
-        <div className="help">
-          先跑一次基线，再跑修改后的版本。只有基线失败、修改后通过，才算真的修好了。
-          检测不出命令的项目可以自己填一条。
-        </div>
-      </div>
-
-      {unverifiedMode && (
-        <Banner tone="warn">
-          <strong>未验证模式</strong>：没有选任何验证命令，Agent 照常读代码、出计划、改文件、给补丁，
-          但不会跑基线、不会重验、不做自修复。接受补丁后终态是{' '}
-          <code>ACCEPTED_UNVERIFIED</code> 而不是 <code>SUCCEEDED</code> —— 正确性完全由你判断。
-        </Banner>
       )}
 
-      <div className="field">
-        <label>允许修改的路径</label>
-        <input value={allowedPaths} disabled={disabled} onChange={(e) => setAllowedPaths(e.target.value)} />
-        <div className="help">
-          逗号或换行分隔。受保护路径（{profile.protectedPaths.slice(0, 4).join(', ')}…）无论如何都禁止修改。
-        </div>
+      {/* 验证命令：明面控件。这不是配置项，是"成功"二字的定义域 */}
+      <div className="composer-chips">
+        <span className="composer-chips-label">验证</span>
+        {commandIds.map((id) => (
+          <button
+            key={id}
+            type="button"
+            className={`chip ${selectedCommands.includes(id) ? 'selected' : ''}`}
+            title={profile.commands[id]!.label}
+            onClick={() =>
+              setSelectedCommands((prev) =>
+                prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+              )
+            }
+          >
+            {id}
+          </button>
+        ))}
+        <button
+          type="button"
+          className={`chip ${useCustom ? 'selected' : ''}`}
+          onClick={() => {
+            setUseCustom((v) => !v);
+            setAdvancedOpen(true);
+          }}
+        >
+          + 自定义
+        </button>
+        {unverifiedMode && (
+          <span className="composer-unverified" title="没有验证命令时，终态最多是 ACCEPTED_UNVERIFIED，不会是 SUCCEEDED">
+            未验证模式：无法证明"修好了"
+          </span>
+        )}
       </div>
 
-      <div className="field">
-        <label>验收条件（每行一条，可留空）</label>
+      <div className="composer-box">
         <textarea
-          value={acceptance}
-          disabled={disabled}
-          placeholder={'不引入新的类型错误\n不修改测试文件'}
-          onChange={(e) => setAcceptance(e.target.value)}
+          ref={boxRef}
+          value={goal}
+          disabled={submitting}
+          placeholder={`描述要修的问题…（例：修复 ${profile.commands.build?.label ?? 'npm run build'} 失败 —— TypeScript 报 src/App.tsx 类型不匹配）\nEnter 发送，Shift+Enter 换行`}
+          onChange={(e) => setGoal(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              void submit();
+            }
+          }}
         />
       </div>
 
-      <div className="field">
-        <label>模型路由（本次 Attempt 会冻结这条路由）</label>
-        <select value={modelProfileId} disabled={disabled} onChange={(e) => setModelProfileId(e.target.value)}>
+      <div className="composer-bar">
+        <button
+          type="button"
+          className={`composer-adv ${advancedOpen ? 'open' : ''}`}
+          onClick={() => setAdvancedOpen((v) => !v)}
+        >
+          ⚙ 高级{advancedOpen ? ' ▾' : ''}
+        </button>
+        {reviewerProfileId && (
+          <span className="composer-hint" title="补丁封存后由第二个模型只读审核">
+            交叉审核已开
+          </span>
+        )}
+        <span className="spacer" />
+        <select
+          className="composer-model"
+          value={effectiveModelId}
+          disabled={submitting}
+          title="本次 Attempt 会冻结这条路由；运行中不自动切换供应商或模型"
+          onChange={(e) => setModelProfileId(e.target.value)}
+        >
           {enabledModels.map((m) => (
             <option key={m.profileId} value={m.profileId}>
               {m.label} · {m.modelId}
             </option>
           ))}
         </select>
-        <div className="help">运行中不会自动切换供应商或模型；路由漂移会导致阻断而不是静默换路。</div>
-      </div>
-
-      <div className="field">
-        <label>交叉审核（可选）：第二个模型只读审补丁</label>
-        <select
-          value={reviewerProfileId}
-          disabled={disabled}
-          onChange={(e) => setReviewerProfileId(e.target.value)}
-        >
-          <option value="">不做交叉审核</option>
-          {enabledModels
-            .filter((m) => m.profileId !== modelProfileId)
-            .map((m) => (
-              <option key={m.profileId} value={m.profileId}>
-                {m.label} · {m.modelId}
-              </option>
-            ))}
-        </select>
-        <div className="help">
-          补丁封存后，由另一个模型只读审一遍并给出发现。它的"通过"<b>不等于</b>验证通过，也不代表可以接受
-          —— 是否接受仍由你决定。异构（不同供应商）的第二意见价值更高。
-        </div>
-      </div>
-
-      <div className="row">
-        <span className="spacer" />
         <button className="primary" disabled={!canSubmit} onClick={() => void submit()}>
-          {submitting ? '创建中…' : '创建并开始'}
+          {submitting ? '创建中…' : '开始'}
         </button>
       </div>
-    </Card>
+
+      {advancedOpen && (
+        <div className="composer-advanced">
+          <div className="field">
+            <label>任务类型</label>
+            <select value={taskClass} onChange={(e) => setTaskClass(e.target.value as TaskClass)}>
+              {profile.supportedTaskClasses.map((c) => (
+                <option key={c} value={c}>
+                  {TASK_CLASS_LABEL[c]}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {useCustom && (
+            <div className="field">
+              <label>自定义验证命令</label>
+              <input
+                value={customCommand}
+                placeholder="例如：pnpm --filter web build（按空格拆成 argv，不经过 shell）"
+                onChange={(e) => setCustomCommand(e.target.value)}
+              />
+            </div>
+          )}
+
+          <div className="field">
+            <label>允许修改的路径</label>
+            <input value={allowedPaths} onChange={(e) => setAllowedPaths(e.target.value)} />
+            <div className="help">
+              逗号或换行分隔。受保护路径（{profile.protectedPaths.slice(0, 3).join(', ')}…）无论如何都禁止修改。
+            </div>
+          </div>
+
+          <div className="field">
+            <label>验收条件（每行一条，可留空）</label>
+            <textarea
+              value={acceptance}
+              placeholder={'不引入新的类型错误\n不修改测试文件'}
+              onChange={(e) => setAcceptance(e.target.value)}
+              style={{ minHeight: 48 }}
+            />
+          </div>
+
+          <div className="field" style={{ marginBottom: 4 }}>
+            <label>交叉审核：第二个模型只读审补丁</label>
+            <select value={reviewerProfileId} onChange={(e) => setReviewerProfileId(e.target.value)}>
+              <option value="">不做交叉审核</option>
+              {enabledModels
+                .filter((m) => m.profileId !== effectiveModelId)
+                .map((m) => (
+                  <option key={m.profileId} value={m.profileId}>
+                    {m.label} · {m.modelId}
+                  </option>
+                ))}
+            </select>
+            <div className="help">
+              审核方"通过"<b>不等于</b>验证通过，也不代表可以接受 —— 是否接受仍由你决定。
+              异构（不同供应商）的第二意见价值更高。有阻断发现时会自动整改一次并重验（上限 2 审 1 改）。
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

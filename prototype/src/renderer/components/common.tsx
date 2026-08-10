@@ -11,6 +11,28 @@ export function Badge({
   return <span className={`badge ${tone === 'default' ? '' : tone}`}>{children}</span>;
 }
 
+/**
+ * 状态展示成人话，raw status 收进 title。
+ * 「待你审批 / 待你审查补丁」刻意带"你"字 —— 这两个状态在等的是用户，
+ * 不是系统；之前显示英文 AWAITING_PLAN_APPROVAL，用户看不出球在自己这边。
+ */
+const RUN_STATUS_TEXT: Record<RunStatus, string> = {
+  CREATED: '已创建',
+  PLANNING: '规划中',
+  AWAITING_PLAN_APPROVAL: '待你审批',
+  EXECUTING: '执行中',
+  VERIFYING: '验证中',
+  CROSS_REVIEWING: '交叉审核中',
+  AWAITING_PATCH_REVIEW: '待你审查补丁',
+  SUCCEEDED: '成功',
+  ACCEPTED_UNVERIFIED: '已接受·未验证',
+  FAILED: '失败',
+  BLOCKED: '被阻断',
+  CANCELLED: '已取消',
+  TIMED_OUT: '超时',
+  INTERRUPTED: '被打断',
+};
+
 export function RunStatusBadge({ status }: { status: RunStatus }) {
   const tone =
     status === 'SUCCEEDED'
@@ -25,7 +47,11 @@ export function RunStatusBadge({ status }: { status: RunStatus }) {
             : status === 'AWAITING_PLAN_APPROVAL' || status === 'AWAITING_PATCH_REVIEW'
               ? 'purple'
               : 'info';
-  return <Badge tone={tone}>{status}</Badge>;
+  return (
+    <span title={status}>
+      <Badge tone={tone}>{RUN_STATUS_TEXT[status] ?? status}</Badge>
+    </span>
+  );
 }
 
 export function RiskBadge({ risk }: { risk: ToolRisk }) {

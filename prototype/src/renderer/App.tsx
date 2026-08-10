@@ -14,9 +14,10 @@ import type {
   ToolCallView,
   VerificationRun,
 } from '@shared/domain';
+import { TERMINAL_RUN_STATUSES } from '@shared/domain';
 import { RequestError, call, subscribe } from './bridge';
 import { Badge, Banner, Card, DoctorBadge, RestoredBadge, RunStatusBadge } from './components/common';
-import { TaskForm } from './views/TaskForm';
+import { Composer } from './views/TaskForm';
 import { RunDetail } from './views/RunDetail';
 import { FileTreePanel } from './views/FileTree';
 import { SettingsView } from './views/Settings';
@@ -299,6 +300,19 @@ export function App() {
   const snapshotId = importState.status === 'done' ? importState.snapshot.snapshotId : null;
   const canShowFiles = Boolean(snapshotId);
 
+  /** 当前项目下、除正看着的这个之外还在进行中的运行 —— composer 用它提示，防止"以为没反应"再建一个 */
+  const activeProjectRun = useMemo(() => {
+    if (!selectedProject) return null;
+    return (
+      runs.find(
+        (r) =>
+          r.projectId === selectedProject.projectId &&
+          r.runId !== selectedRunId &&
+          !TERMINAL_RUN_STATUSES.includes(r.status),
+      ) ?? null
+    );
+  }, [runs, selectedProject, selectedRunId]);
+
   return (
     <div className={`app ${filesOpen && canShowFiles ? 'with-files' : ''}`}>
       <aside className="sidebar">
@@ -375,73 +389,90 @@ export function App() {
       </aside>
 
       <main className="main">
-        <div className="main-inner">
-          {error && (
-            <Banner tone="err">
-              <strong>{error.message}</strong>
-              {error.detail && (
-                <pre className="output" style={{ marginTop: 8, maxHeight: 160 }}>
-                  {error.detail}
-                </pre>
-              )}
-            </Banner>
-          )}
+        {!showSettings && selectedRun && <ChatHead run={selectedRun} events={events} />}
 
-          {coreStatus !== 'READY' && (
-            <Banner tone="warn">Agent Core {coreStatus === 'DOWN' ? '已退出' : '正在启动'}，操作暂不可用。</Banner>
-          )}
+        <div className="chat-scroll">
+          <div className="chat-scroll-inner">
+            {error && (
+              <Banner tone="err">
+                <strong>{error.message}</strong>
+                {error.detail && (
+                  <pre className="output" style={{ marginTop: 8, maxHeight: 160 }}>
+                    {error.detail}
+                  </pre>
+                )}
+              </Banner>
+            )}
 
-          {showSettings ? (
-            <SettingsView
-              checks={checks}
-              profiles={modelProfiles}
-              secureStorage={secureStorage}
-              onProfilesChanged={setModelProfiles}
-              onRefresh={bootstrap}
-              onError={report}
-            />
-          ) : selectedRunId && selectedRun ? (
-            <RunDetail
-              run={selectedRun}
-              events={events}
-              toolCalls={toolCalls}
-              approvals={approvals}
-              plan={plan}
-              patch={patch}
-              verifications={verifications}
-              onError={report}
-              onRefresh={() => void loadRunDetail(selectedRunId)}
-            />
-          ) : selectedProject ? (
-            <>
+            {coreStatus !== 'READY' && (
+              <Banner tone="warn">Agent Core {coreStatus === 'DOWN' ? '已退出' : '正在启动'}，操作暂不可用。</Banner>
+            )}
+
+            {showSettings ? (
+              <SettingsView
+                checks={checks}
+                profiles={modelProfiles}
+                secureStorage={secureStorage}
+                onProfilesChanged={setModelProfiles}
+                onRefresh={bootstrap}
+                onError={report}
+              />
+            ) : selectedRunId && selectedRun ? (
+              <RunDetail
+                run={selectedRun}
+                events={events}
+                toolCalls={toolCalls}
+                approvals={approvals}
+                plan={plan}
+                patch={patch}
+                verifications={verifications}
+                onError={report}
+                onRefresh={() => void loadRunDetail(selectedRunId)}
+              />
+            ) : selectedProject ? (
               <SnapshotPanel
                 project={selectedProject}
                 state={importState}
                 onImport={(req) => void importProject(selectedProject, req)}
               />
-              {importState.status === 'done' && (
-                <TaskForm
-                  project={selectedProject}
-                  snapshot={importState.snapshot}
-                  profile={importState.profile}
-                  modelProfiles={modelProfiles}
-                  onCreated={(run) => {
-                    setRuns((prev) => [run, ...prev]);
-                    setSelectedRunId(run.runId);
-                  }}
-                  onError={report}
-                />
-              )}
-            </>
-          ) : (
-            <WelcomeView
-              checks={checks}
-              enabledModelCount={enabledModelCount}
-              onPick={pickProject}
-              onSettings={() => setShowSettings(true)}
-            />
-          )}
+            ) : (
+              <WelcomeView
+                checks={checks}
+                enabledModelCount={enabledModelCount}
+                onPick={pickProject}
+                onSettings={() => setShowSettings(true)}
+              />
+            )}
+          </div>
         </div>
+
+        {/* 审批停靠条：等用户的决定永远压在可视区，不随时间线滚走 */}
+        {!showSettings && selectedRun && (
+          <ApprovalDock
+            run={selectedRun}
+            plan={plan}
+            approvals={approvals}
+            patch={patch}
+            onError={report}
+          />
+        )}
+
+        {!showSettings && selectedProject && importState.status === 'done' && (
+          <Composer
+            project={selectedProject}
+            snapshot={importState.snapshot}
+            profile={importState.profile}
+            modelProfiles={modelProfiles}
+            activeRun={activeProjectRun}
+            onCreated={(run) => {
+              setRuns((prev) => [run, ...prev]);
+              setSelectedRunId(run.runId);
+            }}
+            onOpenRun={openRun}
+            onOpenSettings={() => setShowSettings(true)}
+            onError={report}
+          />
+        )}
       </main>
 
       {filesOpen && snapshotId && (
@@ -454,6 +485,178 @@ export function App() {
       )}
     </div>
   );
+}
+
+/**
+ * 会话顶栏：标题 + 状态 + 用量。
+ * 状态徽章说人话（「待你审批」而不是 AWAITING_PLAN_APPROVAL），
+ * 用量面板只画有真实上限的维度 —— 没有的（BYOK 套餐余量）不假装知道。
+ */
+function ChatHead({ run, events }: { run: RunView; events: RunEvent[] }) {
+  const [usageOpen, setUsageOpen] = useState(false);
+  const tokens = run.ledger.inputTokens + run.ledger.outputTokens;
+  return (
+    <div className="chat-head">
+      <RunStatusBadge status={run.status} />
+      <span className="chat-head-title" title={run.runId}>
+        {run.title || run.runId}
+      </span>
+      <span className="spacer" />
+      <div className="usage-wrap">
+        <button className={`usage-chip ${usageOpen ? 'open' : ''}`} onClick={() => setUsageOpen((v) => !v)}>
+          ▦ 用量 · {run.ledger.modelTurns}/{run.limits.maxModelTurns} 轮 ·{' '}
+          {tokens > 0 ? `${(tokens / 1000).toFixed(1)}k tok` : '0 tok'}
+        </button>
+        {usageOpen && <UsagePanel run={run} events={events} />}
+      </div>
+    </div>
+  );
+}
+
+function UsageBar({ label, used, max, unit }: { label: string; used: number; max: number; unit?: string }) {
+  const ratio = max > 0 ? Math.min(1, used / max) : 0;
+  const tone = ratio >= 0.9 ? 'var(--err)' : ratio >= 0.7 ? 'var(--warn)' : 'var(--accent)';
+  return (
+    <div className="usage-row">
+      <span className="usage-label">{label}</span>
+      <span className="usage-value">
+        {used}
+        {unit ?? ''} / {max}
+        {unit ?? ''}
+      </span>
+      <div className="usage-track">
+        <div className="usage-fill" style={{ width: `${ratio * 100}%`, background: tone }} />
+      </div>
+    </div>
+  );
+}
+
+function UsagePanel({ run, events }: { run: RunView; events: RunEvent[] }) {
+  // 最近一次真实出站的上下文大小：来自 MODEL_INVOCATION 事件里的 egress manifest。
+  // provider 没回 usage 时是 null —— 显示「未知」，不填 0（null 表示无法证明，不等于 0）。
+  const lastContext = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const e = events[i]!;
+      if (e.kind !== 'MODEL_INVOCATION') continue;
+      const manifest = (e.payload as { manifest?: { inputTokens?: number | null } } | null)?.manifest;
+      if (manifest === undefined) continue;
+      return manifest.inputTokens ?? null;
+    }
+    return undefined; // 还没有任何出站
+  }, [events]);
+
+  return (
+    <div className="usage-pop">
+      <UsageBar label="模型轮次" used={run.ledger.modelTurns} max={run.limits.maxModelTurns} />
+      <UsageBar label="工具调用" used={run.ledger.toolCalls} max={run.limits.maxToolCalls} />
+      <UsageBar label="自修复轮" used={run.ledger.selfFixRounds} max={run.limits.maxSelfFixRounds} />
+      <UsageBar
+        label="token 总量"
+        used={run.ledger.inputTokens + run.ledger.outputTokens}
+        max={run.limits.maxTotalTokens}
+      />
+      <UsageBar
+        label="墙钟"
+        used={Math.round(run.ledger.elapsedMs / 1000)}
+        max={Math.round(run.limits.maxWallClockMs / 1000)}
+        unit="s"
+      />
+      <div className="usage-row">
+        <span className="usage-label">最近上下文</span>
+        <span className="usage-value">
+          {lastContext === undefined ? '尚无出站' : lastContext === null ? '未知（provider 未回报）' : `${lastContext} tok (in)`}
+        </span>
+      </div>
+      <div className="usage-note">
+        以上是本次 Run 的预算账本（超限即停，不重置）。BYOK 模式下你的套餐余量在供应商侧，
+        这里不猜。
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 审批停靠条 —— 修的是一个真实摔过的坑：待审批卡片按时间序排在时间线里，
+ * 自动滚动到底后它在视口上方，用户"根本看不到"，以为没反应又建了一个任务。
+ * 等用户决定的东西必须压在固定位置，不随滚动走。
+ */
+function ApprovalDock({
+  run,
+  plan,
+  approvals,
+  patch,
+  onError,
+}: {
+  run: RunView;
+  plan: PlanRevision | null;
+  approvals: ApprovalRequest[];
+  patch: PatchArtifact | null;
+  onError: (err: unknown) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  // 刻意不用 smooth：容器里若有未结束的平滑滚动，smooth 的 scrollIntoView 会被静默吞掉
+  // （实测于 Chromium）。这个按钮的全部意义是"一定能找到审批卡"，可靠性 > 动画。
+  const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ block: 'center' });
+
+  if (run.status === 'AWAITING_PLAN_APPROVAL' && plan && approvals.length > 0) {
+    const approval = approvals[0]!;
+    const decide = async (decision: 'APPROVE' | 'REJECT') => {
+      setBusy(true);
+      try {
+        const r = await call('approval.decide', {
+          approvalId: approval.approvalId,
+          decision,
+          subjectDigest: approval.subjectDigest,
+          note: '',
+        });
+        if (!r.accepted) onError(new Error(r.reason ?? '审批未被接受'));
+      } catch (err) {
+        onError(err);
+      } finally {
+        setBusy(false);
+      }
+    };
+    return (
+      <div className="dock dock-plan">
+        <div className="dock-text">
+          <strong>计划在等你审批</strong>
+          <span className="dock-sub">
+            {plan.steps.length} 步 · {plan.summary.slice(0, 80)}
+            {plan.summary.length > 80 ? '…' : ''}
+          </span>
+        </div>
+        <button onClick={() => jumpTo('plan-approval-card')}>看完整计划</button>
+        <button className="danger" disabled={busy} onClick={() => void decide('REJECT')}>
+          拒绝
+        </button>
+        <button className="primary" disabled={busy} onClick={() => void decide('APPROVE')}>
+          批准并执行
+        </button>
+      </div>
+    );
+  }
+
+  if (run.status === 'AWAITING_PATCH_REVIEW' && patch) {
+    const added = patch.files.reduce((n, f) => n + f.addedLines, 0);
+    const removed = patch.files.reduce((n, f) => n + f.removedLines, 0);
+    return (
+      <div className="dock dock-patch">
+        <div className="dock-text">
+          <strong>补丁在等你审查</strong>
+          <span className="dock-sub">
+            {patch.files.length} 个文件 · +{added}/-{removed} ·
+            接受与否由你决定，审核方"通过"不算数
+          </span>
+        </div>
+        <button className="primary" onClick={() => jumpTo('patch-review-card')}>
+          审查补丁
+        </button>
+      </div>
+    );
+  }
+
+  return null;
 }
 
 function WelcomeView({

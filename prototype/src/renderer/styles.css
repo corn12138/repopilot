@@ -837,3 +837,234 @@ ul.plain li {
   color: #b7c2d0;
   flex: 1;
 }
+
+/* ------------------------------------------------- chat layout (会话式主栏) */
+/*
+ * .main 从"整体滚动的页面"改成"顶栏 + 滚动区 + 停靠区 + 输入区"的固定骨架。
+ * 审批停靠条与 composer 永远压在视口内 —— 等用户决定的东西不允许随时间线滚走。
+ */
+.main {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+.chat-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 28px 20px;
+}
+.chat-scroll-inner {
+  max-width: 960px;
+  margin: 0 auto;
+}
+/* 旧的 .main-inner 仍被设置页等复用 */
+.main-inner {
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.chat-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  flex-shrink: 0;
+}
+.chat-head-title {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- usage */
+.usage-wrap {
+  position: relative;
+}
+.usage-chip {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+.usage-chip.open,
+.usage-chip:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.usage-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 30;
+  width: 320px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+.usage-row {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  grid-template-areas: 'label value' 'track track';
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+.usage-label {
+  grid-area: label;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.usage-value {
+  grid-area: value;
+  text-align: right;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text);
+}
+.usage-track {
+  grid-area: track;
+  height: 4px;
+  margin-top: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.usage-fill {
+  height: 100%;
+  border-radius: 2px;
+}
+.usage-note {
+  margin-top: 10px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+/* ---------------------------------------------------------------- dock */
+.dock {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 28px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel);
+  flex-shrink: 0;
+}
+.dock-plan {
+  border-top: 1px solid var(--purple);
+}
+.dock-patch {
+  border-top: 1px solid var(--accent);
+}
+.dock-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.dock-text strong {
+  font-size: 12.5px;
+}
+.dock-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- composer */
+.composer {
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  padding: 10px 28px 14px;
+  flex-shrink: 0;
+}
+.composer-note {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.composer-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 6px 0;
+}
+.composer-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.composer-chips-label {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-right: 2px;
+}
+.composer-unverified {
+  font-size: 11px;
+  color: var(--warn);
+}
+.composer-box textarea {
+  width: 100%;
+  min-height: 64px;
+  resize: vertical;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.composer-box textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.composer-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.composer-adv {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.composer-adv.open {
+  color: var(--accent);
+}
+.composer-hint {
+  font-size: 11px;
+  color: var(--purple);
+}
+.composer-model {
+  max-width: 320px;
+  font-size: 12px;
+}
+.composer-advanced {
+  margin-top: 10px;
+  padding: 12px 14px 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+}
+.linklike {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: inherit;
+}

@@ -155,7 +155,9 @@ export function RunDetail({
       </Card>
 
       {approvals.length > 0 && plan && run.status === 'AWAITING_PLAN_APPROVAL' && (
-        <PlanApproval approval={approvals[0]!} plan={plan} onError={onError} />
+        <div id="plan-approval-card">
+          <PlanApproval approval={approvals[0]!} plan={plan} onError={onError} />
+        </div>
       )}
 
       {run.status === 'CROSS_REVIEWING' && (
@@ -165,12 +167,14 @@ export function RunDetail({
       {crossReview && <CrossReviewPanel record={crossReview} />}
 
       {patch && (
-        <PatchReview
-          patch={patch}
-          canDecide={run.status === 'AWAITING_PATCH_REVIEW'}
-          accepted={run.status === 'SUCCEEDED' || run.status === 'ACCEPTED_UNVERIFIED'}
-          onError={onError}
-        />
+        <div id="patch-review-card">
+          <PatchReview
+            patch={patch}
+            canDecide={run.status === 'AWAITING_PATCH_REVIEW'}
+            accepted={run.status === 'SUCCEEDED' || run.status === 'ACCEPTED_UNVERIFIED'}
+            onError={onError}
+          />
+        </div>
       )}
 
       {verifications.length > 0 && <VerificationPanel verifications={verifications} />}
