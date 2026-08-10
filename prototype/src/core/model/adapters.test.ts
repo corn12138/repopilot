@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { anthropicAdapter, fetchJson } from './anthropic';
+import { anthropicAdapter, fetchJson, parseRetryAfterMs } from './anthropic';
 import { openAiWireAdapter } from './openai-compatible';
 import { ModelCallError, type AdapterCallContext, type ModelRequest } from './types';
 
@@ -264,6 +264,92 @@ describe('fetchJson: HTTP 错误分类', () => {
     } catch (err) {
       expect((err as Error).message).not.toContain('sk-secret-KEY-do-not-leak');
     }
+  });
+});
+
+/*
+ * 重试安全性的判据来源：sendState 说的是"失败发生在请求生命周期的哪一段"。
+ * 分错方向的代价不对称 —— 把"发出去了"错标成 NOT_SENT 会导致重发、可能重复执行
+ * 重复计费；把"没发出去"错标成结局不明只是少一次重试。所以宁可保守。
+ */
+describe('fetchJson: sendState 与 Retry-After（重试安全性的判据）', () => {
+  const rejectWith = (err: unknown): void => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw err;
+      }),
+    );
+  };
+
+  it('连接被拒（cause.code=ECONNREFUSED）→ NOT_SENT：请求没离开过本机，可安全重发', async () => {
+    rejectWith(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }));
+    await expect(fetchJson('https://x/y', {})).rejects.toMatchObject({
+      kind: 'NETWORK',
+      sendState: 'NOT_SENT',
+    });
+  });
+
+  it('DNS 解析失败（ENOTFOUND）→ NOT_SENT', async () => {
+    rejectWith(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ENOTFOUND' } }));
+    await expect(fetchJson('https://x/y', {})).rejects.toMatchObject({ sendState: 'NOT_SENT' });
+  });
+
+  it('连接中途被重置（ECONNRESET）→ SENT_OUTCOME_UNKNOWN：可能已执行，不可重发', async () => {
+    rejectWith(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }));
+    await expect(fetchJson('https://x/y', {})).rejects.toMatchObject({
+      kind: 'NETWORK',
+      sendState: 'SENT_OUTCOME_UNKNOWN',
+    });
+  });
+
+  it('没有 cause.code 的网络错误 → 保守判为 SENT_OUTCOME_UNKNOWN', async () => {
+    rejectWith(new Error('socket hang up'));
+    await expect(fetchJson('https://x/y', {})).rejects.toMatchObject({
+      sendState: 'SENT_OUTCOME_UNKNOWN',
+    });
+  });
+
+  it('HTTP 状态码错误 → RESPONDED：对端明确回了话', async () => {
+    stubFetchJson({ error: { message: 'boom' } }, 503);
+    await expect(fetchJson('https://x/y', {})).rejects.toMatchObject({
+      kind: 'SERVER',
+      sendState: 'RESPONDED',
+    });
+  });
+
+  it('429 的 Retry-After 秒数被换算成毫秒带出', async () => {
+    nextResponse = () =>
+      new Response(JSON.stringify({ error: { message: 'rate limited' } }), {
+        status: 429,
+        headers: { 'content-type': 'application/json', 'retry-after': '2' },
+      });
+    await expect(fetchJson('https://x/y', {})).rejects.toMatchObject({
+      kind: 'RATE_LIMIT',
+      retryAfterMs: 2000,
+    });
+  });
+
+  it('信号 reason 是 TimeoutError → TIMEOUT，且结局不明', async () => {
+    const controller = new AbortController();
+    controller.abort(new DOMException('per-attempt timeout', 'TimeoutError'));
+    rejectWith(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    await expect(fetchJson('https://x/y', { signal: controller.signal })).rejects.toMatchObject({
+      kind: 'TIMEOUT',
+      sendState: 'SENT_OUTCOME_UNKNOWN',
+    });
+  });
+
+  it('parseRetryAfterMs：秒数合法则换算，其余一律 null（交给指数退避）', () => {
+    expect(parseRetryAfterMs('2')).toBe(2000);
+    expect(parseRetryAfterMs('0')).toBe(0);
+    expect(parseRetryAfterMs('1.5')).toBe(1500);
+    expect(parseRetryAfterMs('abc')).toBeNull();
+    expect(parseRetryAfterMs('-1')).toBeNull();
+    expect(parseRetryAfterMs('')).toBeNull();
+    expect(parseRetryAfterMs(null)).toBeNull();
+    // HTTP-date 形式刻意不解析 —— 时钟相关，解析错比不解析更糟
+    expect(parseRetryAfterMs('Wed, 21 Oct 2026 07:28:00 GMT')).toBeNull();
   });
 });
 

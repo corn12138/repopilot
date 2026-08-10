@@ -112,17 +112,68 @@ function mapStop(reason: string | undefined): StopReason {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * 连接根本没建立起来的错误码 —— 请求确定没离开本机（NOT_SENT），重发是安全的。
+ * 其余网络类失败（ECONNRESET / socket hang up / body 中断 / 超时）一律按
+ * "发出去了但结局不明"处理：provider 可能已经执行并计费，默认不可重发。
+ * 对应 TD model-invocation §4：BEFORE_BYTES 可重试，AFTER_BYTES_UNKNOWN 默认禁止。
+ */
+const NOT_SENT_CODES = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
+  // TLS 握手失败也没把请求发出去；能不能靠重试恢复由 retry 层另行判断
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'CERT_HAS_EXPIRED',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+]);
+
+function causeCode(err: unknown): string {
+  const e = err as { cause?: { code?: unknown }; code?: unknown };
+  const c = e?.cause?.code ?? e?.code;
+  return typeof c === 'string' ? c : '';
+}
+
 export async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
   let res: Response;
   try {
     res = await fetch(url, init);
   } catch (err) {
     const e = err as Error;
+    // AbortSignal.timeout 的 reason 是 name=TimeoutError 的 DOMException；
+    // 不同 undici 版本可能把 reason 原样抛出，也可能包成 AbortError —— 两种都认。
+    const signalReason = (init.signal as AbortSignal | null | undefined)?.reason as
+      | { name?: string }
+      | undefined;
+    if (e.name === 'TimeoutError' || signalReason?.name === 'TimeoutError') {
+      throw new ModelCallError('单次调用超时（结局不明，不可重发）', 'TIMEOUT', null, {
+        sendState: 'SENT_OUTCOME_UNKNOWN',
+      });
+    }
     if (e.name === 'AbortError') throw new ModelCallError('调用已取消', 'CANCELLED');
-    throw new ModelCallError(`网络错误: ${e.message}`, 'NETWORK');
+    const code = causeCode(err);
+    const sendState = NOT_SENT_CODES.has(code) ? 'NOT_SENT' : 'SENT_OUTCOME_UNKNOWN';
+    throw new ModelCallError(
+      `网络错误: ${e.message}${code ? ` (${code})` : ''}`,
+      'NETWORK',
+      null,
+      { sendState },
+    );
   }
 
-  const text = await res.text();
+  let text: string;
+  try {
+    text = await res.text();
+  } catch (err) {
+    // 头都收到了正文断了 —— 请求早已送达，结局不明
+    throw new ModelCallError(`读取响应失败: ${(err as Error).message}`, 'NETWORK', null, {
+      sendState: 'SENT_OUTCOME_UNKNOWN',
+    });
+  }
 
   if (!res.ok) {
     const kind =
@@ -134,7 +185,9 @@ export async function fetchJson(url: string, init: RequestInit): Promise<unknown
             ? 'SERVER'
             : 'BAD_REQUEST';
     // 只回传状态与 provider 的错误摘要，不把整个请求体或 header 带出去
-    throw new ModelCallError(`HTTP ${res.status}: ${summarizeError(text)}`, kind, res.status);
+    throw new ModelCallError(`HTTP ${res.status}: ${summarizeError(text)}`, kind, res.status, {
+      retryAfterMs: parseRetryAfterMs(res.headers.get('retry-after')),
+    });
   }
 
   try {
@@ -142,6 +195,14 @@ export async function fetchJson(url: string, init: RequestInit): Promise<unknown
   } catch {
     throw new ModelCallError('响应不是合法 JSON', 'PARSE', res.status);
   }
+}
+
+/** 只认秒数形式；HTTP-date 形式少见且时钟相关，解析不出就交给指数退避 */
+export function parseRetryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number(header.trim());
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.round(seconds * 1000);
 }
 
 function summarizeError(text: string): string {

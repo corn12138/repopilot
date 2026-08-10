@@ -13,6 +13,14 @@ import { readJson, writeJsonAtomic } from '../store';
 import { anthropicAdapter } from './anthropic';
 import { openAiWireAdapter } from './openai-compatible';
 import {
+  DEFAULT_RETRY_POLICY,
+  type RetryPolicy,
+  attemptSignal,
+  isRetryable,
+  retryDelayMs,
+  sleep,
+} from './retry';
+import {
   type CustomProviderInput,
   allProviders,
   descriptorOf,
@@ -110,9 +118,11 @@ export class ModelGateway {
    */
   private readonly appKeys = new Map<ProviderId, string>();
   private settings: Record<string, ProfileSettings> = {};
+  private readonly retryPolicy: RetryPolicy;
 
-  constructor() {
+  constructor(retryOverrides: Partial<RetryPolicy> = {}) {
     this.settings = readJson<Record<string, ProfileSettings>>(SETTINGS_PATH, {});
+    this.retryPolicy = { ...DEFAULT_RETRY_POLICY, ...retryOverrides };
   }
 
   /** Main 在启动时和用户改动后调用；替换整份，不做增量合并 */
@@ -320,6 +330,8 @@ export class ModelGateway {
     }
 
     const started = Date.now();
+    // 探针单次、30s 超时、不重试：它的职责是报告"现在通不通"，重试会把抖动藏起来
+    const composed = attemptSignal(signal, 30_000);
     try {
       const response = await this.adapterFor(profile.wire).call(
         {
@@ -329,7 +341,7 @@ export class ModelGateway {
           maxOutputTokens: 16,
           temperature: 0,
         },
-        { apiKey, modelId: profile.modelId, signal, baseUrl: profile.origin },
+        { apiKey, modelId: profile.modelId, signal: composed.signal, baseUrl: profile.origin },
       );
       record({
         ...baseManifest,
@@ -339,6 +351,8 @@ export class ModelGateway {
         outputTokens: response.outputTokens,
         settledAt: nowIso(),
         errorKind: null,
+        sendAttempt: 1,
+        sendState: 'RESPONDED',
       });
       return {
         ok: true,
@@ -346,17 +360,26 @@ export class ModelGateway {
         latencyMs: Date.now() - started,
       };
     } catch (err) {
-      const e = err as ModelCallError;
+      const e =
+        err instanceof ModelCallError
+          ? err
+          : new ModelCallError((err as Error)?.message ?? String(err), 'NETWORK', null, {
+              sendState: 'SENT_OUTCOME_UNKNOWN',
+            });
       record({
         ...baseManifest,
-        sent: true, // 请求确实发出去了，只是没成功
+        sent: e.sendState !== 'NOT_SENT',
         blockReason: null,
         inputTokens: null,
         outputTokens: null,
         settledAt: nowIso(),
         errorKind: e.kind ?? 'UNKNOWN',
+        sendAttempt: 1,
+        sendState: e.sendState,
       });
       return { ok: false, detail: `${e.kind}: ${e.message}`, latencyMs: Date.now() - started };
+    } finally {
+      composed.clear();
     }
   }
 
@@ -399,37 +422,83 @@ export class ModelGateway {
 
     const apiKey = this.keyFor(resolution.providerId)!;
     const adapter = this.adapterFor(profile!.wire);
+    const policy = this.retryPolicy;
 
-    try {
-      const response = await adapter.call(input.request, {
-        apiKey, // 只在这一层展开，调用结束即离开作用域
-        modelId: resolution.modelId,
-        signal: input.signal,
-        // 用**冻结时**的地址，而不是当前配置 —— 运行中改设置不能改变已在飞的 Attempt
-        baseUrl: resolution.origin,
-      });
-      const manifest: ModelEgressManifest = {
-        ...base,
-        sent: true,
-        blockReason: null,
-        inputTokens: response.inputTokens,
-        outputTokens: response.outputTokens,
-        settledAt: nowIso(),
-        errorKind: null,
-      };
-      return { invocationId, response, manifest };
-    } catch (err) {
-      const e = err as ModelCallError;
-      const manifest: ModelEgressManifest = {
-        ...base,
-        sent: true, // 请求确实发出去了，只是没成功 —— 不能记成 NOT_SENT
-        blockReason: null,
-        inputTokens: null,
-        outputTokens: null,
-        settledAt: nowIso(),
-        errorKind: e.kind ?? 'UNKNOWN',
-      };
-      throw new InvocationFailed(e, manifest);
+    /*
+     * 有界同 route 重试（TD model-invocation §4 的诚实子集，语义见 retry.ts）。
+     * 路由永远是冻结那条：重试不换 provider、不换模型、不换 origin ——
+     * automaticFallback=DENY 在重试层同样成立。每次尝试独立落账（sendAttempt），
+     * 中间失败的尝试 appendEgress，最后一次随结果返回/抛出，不覆盖任何记录。
+     */
+    for (let att = 1; ; att += 1) {
+      const requestedAt = nowIso();
+      const composed = attemptSignal(input.signal, policy.perAttemptTimeoutMs);
+      try {
+        const response = await adapter.call(input.request, {
+          apiKey, // 只在这一层展开，调用结束即离开作用域
+          modelId: resolution.modelId,
+          signal: composed.signal,
+          // 用**冻结时**的地址，而不是当前配置 —— 运行中改设置不能改变已在飞的 Attempt
+          baseUrl: resolution.origin,
+        });
+        const manifest: ModelEgressManifest = {
+          ...base,
+          requestedAt,
+          sent: true,
+          blockReason: null,
+          inputTokens: response.inputTokens,
+          outputTokens: response.outputTokens,
+          settledAt: nowIso(),
+          errorKind: null,
+          sendAttempt: att,
+          sendState: 'RESPONDED',
+        };
+        return { invocationId, response, manifest };
+      } catch (err) {
+        const e =
+          err instanceof ModelCallError
+            ? err
+            : new ModelCallError((err as Error)?.message ?? String(err), 'NETWORK', null, {
+                sendState: 'SENT_OUTCOME_UNKNOWN',
+              });
+        const cancelled = input.signal.aborted;
+        const manifest: ModelEgressManifest = {
+          ...base,
+          requestedAt,
+          // NOT_SENT = 连接都没建立，请求没离开过本机；其余情况按已出站记
+          sent: e.sendState !== 'NOT_SENT',
+          blockReason: null,
+          inputTokens: null,
+          outputTokens: null,
+          settledAt: nowIso(),
+          errorKind: cancelled ? 'CANCELLED' : (e.kind ?? 'UNKNOWN'),
+          sendAttempt: att,
+          sendState: e.sendState,
+        };
+        if (!cancelled && att < policy.maxSendAttempts && isRetryable(e)) {
+          appendEgress(manifest); // 中间失败的尝试独立落账 —— 不可见等于没发生
+          await sleep(retryDelayMs(e, att, policy), input.signal);
+          if (input.signal.aborted) {
+            // 退避途中被取消：下一次尝试根本不会发起，如实记 NOT_SENT
+            throw new InvocationFailed(new ModelCallError('调用已取消', 'CANCELLED'), {
+              ...base,
+              requestedAt: nowIso(),
+              sent: false,
+              blockReason: null,
+              inputTokens: null,
+              outputTokens: null,
+              settledAt: nowIso(),
+              errorKind: 'CANCELLED',
+              sendAttempt: att + 1,
+              sendState: 'NOT_SENT',
+            });
+          }
+          continue;
+        }
+        throw new InvocationFailed(e, manifest);
+      } finally {
+        composed.clear();
+      }
     }
   }
 

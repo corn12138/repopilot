@@ -39,20 +39,36 @@ export interface ModelResponse {
   readonly outputTokens: number | null;
 }
 
+export type ModelCallErrorKind =
+  | 'AUTH'
+  | 'RATE_LIMIT'
+  | 'BAD_REQUEST'
+  | 'SERVER'
+  | 'NETWORK'
+  | 'CANCELLED'
+  /** 单次尝试超时（per-attempt deadline）。发出去之后超时结局不明，默认不可重发 */
+  | 'TIMEOUT'
+  | 'PARSE';
+
 export class ModelCallError extends Error {
+  /** 失败发生在请求生命周期的哪一段；重试安全性由它决定，见 retry.ts */
+  readonly sendState: import('@shared/domain').ModelSendState | null;
+  /** 429 响应头 Retry-After 换算的毫秒数；没有或解析不出为 null */
+  readonly retryAfterMs: number | null;
+
   constructor(
     message: string,
-    readonly kind:
-      | 'AUTH'
-      | 'RATE_LIMIT'
-      | 'BAD_REQUEST'
-      | 'SERVER'
-      | 'NETWORK'
-      | 'CANCELLED'
-      | 'PARSE',
+    readonly kind: ModelCallErrorKind,
     readonly status: number | null = null,
+    opts: {
+      sendState?: import('@shared/domain').ModelSendState | null;
+      retryAfterMs?: number | null;
+    } = {},
   ) {
     super(message);
+    // 有 HTTP 状态码 = 对端确实回了话
+    this.sendState = opts.sendState ?? (status !== null ? 'RESPONDED' : null);
+    this.retryAfterMs = opts.retryAfterMs ?? null;
   }
 }
 

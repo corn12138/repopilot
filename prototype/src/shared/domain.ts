@@ -720,6 +720,13 @@ export interface ModelInvocationRef {
   readonly resolutionId: string;
 }
 
+/**
+ * 请求相对"离开本机"处在什么状态。这是重试安全性的判据来源：
+ * 只有 NOT_SENT 的网络失败才可以重发（TD model-invocation §4 的 BEFORE_BYTES）；
+ * SENT_OUTCOME_UNKNOWN（发出去了但结局不明）默认禁止重发 —— 重发可能重复执行、重复计费。
+ */
+export type ModelSendState = 'NOT_SENT' | 'SENT_OUTCOME_UNKNOWN' | 'RESPONDED';
+
 /** 每次实际或被阻断的出站都有一条；不含 raw secret 与请求正文 */
 export interface ModelEgressManifest {
   readonly invocationId: string;
@@ -730,6 +737,11 @@ export interface ModelEgressManifest {
   readonly providerId: ProviderId;
   readonly origin: string;
   readonly modelId: string;
+  /**
+   * 请求是否离开过本机。sent=false 有两种来源，靠 blockReason 区分：
+   * 出站前置检查拦下的（blockReason 非空）和连接都没建起来的（blockReason 为空、
+   * errorKind 非空、sendState=NOT_SENT）。后者以前被如实性更差的 `sent: true` 顶着。
+   */
   readonly sent: boolean;
   readonly blockReason: string | null;
   readonly contextFileRefs: readonly string[];
@@ -738,6 +750,9 @@ export interface ModelEgressManifest {
   readonly requestedAt: Iso8601;
   readonly settledAt: Iso8601 | null;
   readonly errorKind: string | null;
+  /** 第几次发送尝试（1-based）。有界同 route 重试的每次尝试各留一条 manifest，不覆盖 */
+  readonly sendAttempt?: number;
+  readonly sendState?: ModelSendState | null;
 }
 
 // ---------------------------------------------------------------------------
