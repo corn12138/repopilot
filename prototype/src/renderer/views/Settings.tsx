@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { DoctorCheck, ModelConnectionProfile } from '@shared/domain';
 import { call } from '../bridge';
 import { Badge, Banner, Card, DoctorBadge } from '../components/common';
@@ -256,6 +256,23 @@ function ProviderRow({
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
 
+  const [modelDraft, setModelDraft] = useState(profile.modelId);
+  /** 用户主动选了「自定义…」。modelId 本来就不在清单里时不需要它也会进自定义态。 */
+  const [pickedCustom, setPickedCustom] = useState(false);
+  const modelBox = useRef<HTMLInputElement>(null);
+
+  /*
+   * updateProfile 返回的新 profile 替换掉旧的之后，把输入框拉回真值。
+   *
+   * 这里以前是 defaultValue：ProviderRow 按 profileId 做 key，profileId 不变就
+   * 永远不重挂载，于是下拉框选了 deepseek-reasoner、输入框还留着 deepseek-chat，
+   * 之后随便点一下输入框再移开，onBlur 就拿着那个旧值把模型悄悄改回去了。
+   */
+  useEffect(() => {
+    setModelDraft(profile.modelId);
+    setPickedCustom(false);
+  }, [profile.modelId]);
+
   const sourceBadge =
     profile.credentialSource === 'APP' ? (
       <Badge tone="ok">已配置</Badge>
@@ -291,6 +308,20 @@ function ProviderRow({
     } finally {
       setBusy(false);
     }
+  };
+
+  // 生效值不在清单里（自定义 provider、中转站的模型名）时天然就是自定义态
+  const customModel = pickedCustom || !profile.availableModels.includes(profile.modelId);
+  const dirtyModel = modelDraft.trim() !== profile.modelId && modelDraft.trim() !== '';
+
+  /** 空输入回弹成当前值，不产生一次无意义的写盘；没变也不写 */
+  const commitModel = (raw: string) => {
+    const next = raw.trim();
+    if (!next || next === profile.modelId) {
+      setModelDraft(profile.modelId);
+      return;
+    }
+    void updateProfile({ modelId: next });
   };
 
   const test = async () => {
@@ -400,10 +431,21 @@ function ProviderRow({
             <label>模型</label>
             <div className="row">
               <select
-                value={profile.availableModels.includes(profile.modelId) ? profile.modelId : '__custom'}
+                value={customModel ? '__custom' : profile.modelId}
                 disabled={busy}
                 onChange={(e) => {
-                  if (e.target.value !== '__custom') void updateProfile({ modelId: e.target.value });
+                  // 「自定义…」以前是个死选项：onChange 把它挡掉，什么也没发生，
+                  // 下拉框又被 value 拉回原值 —— 看上去就是"选不动"。
+                  // 现在它是一个真的动作：进自定义态，焦点交给右边的输入框，
+                  // 当前 model id 全选好当编辑起点。
+                  if (e.target.value === '__custom') {
+                    setPickedCustom(true);
+                    modelBox.current?.focus();
+                    modelBox.current?.select();
+                    return;
+                  }
+                  setPickedCustom(false);
+                  void updateProfile({ modelId: e.target.value });
                 }}
               >
                 {profile.availableModels.map((m) => (
@@ -414,16 +456,28 @@ function ProviderRow({
                 <option value="__custom">自定义…</option>
               </select>
               <input
+                ref={modelBox}
                 style={{ flex: 1 }}
-                defaultValue={profile.modelId}
+                value={modelDraft}
                 disabled={busy}
-                placeholder="或直接填写精确 model id"
-                onBlur={(e) => {
-                  if (e.target.value.trim() && e.target.value.trim() !== profile.modelId) {
-                    void updateProfile({ modelId: e.target.value });
-                  }
+                placeholder="填写精确 model id"
+                onChange={(e) => setModelDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitModel(modelDraft);
                 }}
+                onBlur={() => commitModel(modelDraft)}
               />
+            </div>
+            <div className="help">
+              下拉里只是常见值，右边可以填任意 model id —— 中转站的模型名经常和官方对不上。
+              {dirtyModel ? (
+                <span style={{ color: 'var(--warn)' }}> 未保存：回车或点开别处生效。</span>
+              ) : (
+                <>
+                  {' '}
+                  当前生效：<code>{profile.modelId || '未选'}</code>
+                </>
+              )}
             </div>
           </div>
 

@@ -338,7 +338,8 @@ class Recorder implements AgentHost {
   readonly events: Array<{ kind: RunEventKind; summary: string }> = [];
   readonly toolCalls: RecordedCall[] = [];
   planApprovedAt: number | null = null;
-  private ledger = { modelTurns: 0, toolCalls: 0, selfFixRounds: 0 };
+  // 断言消息里要读 modelTurns（见上面那条 PATCH_READY 断言），不能是 private
+  readonly ledger = { modelTurns: 0, toolCalls: 0, selfFixRounds: 0 };
 
   emit(kind: RunEventKind, summary: string): void {
     this.events.push({ kind, summary });
