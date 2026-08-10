@@ -404,6 +404,40 @@ describe('验证绑定', () => {
     expect(patch.comparison?.newlyFailing).toEqual(['test']);
     expect(patch.unverifiedItems).toEqual([]);
   });
+
+  it('挽救封存：绑定失败的验证时，失败事实与挽救标记都原样进补丁', () => {
+    // 这是"失败 Run 也要封存补丁"依赖的封存语义：验证没过 ≠ 不能封存，
+    // 而是封存出来的东西必须把"没过"写在自己身上。
+    const { ws, runId, baseSha } = open({ 'src/a.ts': 'const a = 1;\n' });
+    mutate(ws, runId, [
+      { kind: 'REPLACE_WHOLE_FILE', path: 'src/a.ts', newText: 'const a = 2;\n' },
+    ]);
+
+    const failed: VerificationRun = {
+      ...verificationRun(runId, ws.activeGeneration),
+      verificationRunId: 'vrun_failed_0001',
+      passed: false,
+    };
+    const failedComparison: VerificationComparison = {
+      fixed: [],
+      stillFailing: ['build'],
+      newlyFailing: [],
+      notRerun: [],
+    };
+    const marker = '⚠ 挽救封存：验证失败 —— 已用尽 2 轮自修复。此补丁未被证明正确，不能被接受为成功';
+
+    const patch = sealPatch(ws, runId, newId('att'), baseSha, failed, failedComparison, [marker]);
+
+    // 失败的验证照样绑定 —— "验证过没过"由 comparison 说话，不由字段缺失暗示
+    expect(patch.verificationRunId).toBe('vrun_failed_0001');
+    expect(patch.comparison?.stillFailing).toEqual(['build']);
+    expect(patch.comparison?.fixed).toEqual([]);
+    // 挽救标记必须原样出现在交付物上，UI 靠它渲染"不能接受"横幅
+    expect(patch.unverifiedItems).toEqual([marker]);
+    // 改动本体一个不少
+    expect(patch.files.map((f) => f.path)).toEqual(['src/a.ts']);
+    expect(patch.unifiedDiff).toContain('+const a = 2;');
+  });
 });
 
 describe('单文件 diff 超限截断', () => {

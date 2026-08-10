@@ -120,6 +120,35 @@ describe('状态快照读写', () => {
     writeRunState(makeState(view));
     expect(listPersistedRunIds()).toContain(view.runId);
   });
+
+  it('FAILED Run 的挽救补丁跨重启存活 —— 失败不是丢掉工作成果的理由', () => {
+    // "失败 Run 也要封存补丁"的持久化前提：挽救补丁若只活在内存里，
+    // 重启一次就没了，挽救就成了空话。终态是 FAILED 不妨碍补丁完整落盘、完整读回。
+    const view = makeView('FAILED');
+    track(view.runId);
+    const marker = '⚠ 挽救封存：验证失败 —— 已用尽 2 轮自修复。此补丁未被证明正确，不能被接受为成功';
+    const patch = {
+      patchId: 'patch_salvage_1',
+      runId: view.runId,
+      unifiedDiff: '--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+attempted\n',
+      files: [{ path: 'src/a.ts' }],
+      digest: 'sha256:salvage01',
+      unverifiedItems: [marker],
+      verificationRunId: 'vrun_failed_0001',
+    } as unknown as PatchArtifact;
+
+    writeRunState(makeState(view, { patch }));
+
+    const loaded = readRunState(view.runId);
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) {
+      expect(loaded.state.view.status).toBe('FAILED');
+      expect(loaded.state.patch!.unifiedDiff).toContain('+attempted');
+      // 挽救标记与失败验证的绑定都要回来 —— 恢复态的 UI 全靠它们说"这不能接受"
+      expect(loaded.state.patch!.unverifiedItems).toEqual([marker]);
+      expect(loaded.state.patch!.verificationRunId).toBe('vrun_failed_0001');
+    }
+  });
 });
 
 describe('损坏的状态快照不能让 Run 凭空消失', () => {

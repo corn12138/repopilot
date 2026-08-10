@@ -201,6 +201,15 @@ export function App() {
     if (!selectedRunId || !selectedRun) return;
     if (selectedRun.status === 'AWAITING_PLAN_APPROVAL' && !plan) void loadRunDetail(selectedRunId);
     if (selectedRun.status === 'AWAITING_PATCH_REVIEW' && !patch) void loadRunDetail(selectedRunId);
+    // 失败/中止也可能封存了挽救补丁 —— run.updated 只带 view，不带补丁本体
+    if (
+      (selectedRun.status === 'FAILED' ||
+        selectedRun.status === 'BLOCKED' ||
+        selectedRun.status === 'CANCELLED') &&
+      !patch
+    ) {
+      void loadRunDetail(selectedRunId);
+    }
   }, [selectedRun, selectedRunId, plan, patch, loadRunDetail]);
 
   // ---- 动作 ----

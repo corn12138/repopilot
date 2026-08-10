@@ -1026,22 +1026,42 @@ export class RunAuthority {
           this.setStatus(record, 'FAILED', result.detail);
           break;
         case 'VERIFICATION_FAILED':
+          this.sealSalvagePatch(record, workspace, {
+            marker: `验证失败 —— ${result.detail}`,
+            baseline: result.baseline,
+            finalVerification: result.finalVerification,
+          });
           this.setStatus(record, 'FAILED', result.detail);
           break;
         case 'BLOCKED':
+          this.sealSalvagePatch(record, workspace, {
+            marker: `执行被阻断 —— ${result.detail}`,
+            baseline: result.baseline,
+            finalVerification: result.finalVerification,
+          });
           this.setStatus(record, 'BLOCKED', result.detail);
           break;
       }
     } catch (err) {
+      // 异常路径同样先抢救现场再定终态；PlanningFailed 时规划是只读的、
+      // 工作区必然零改动，helper 会自然空转，无需特判
       if (err instanceof AgentCancelled || record.abort.signal.aborted) {
-        if (!isTerminal(record.view.status)) this.setStatus(record, 'CANCELLED', '已取消');
+        if (!isTerminal(record.view.status)) {
+          this.sealSalvagePatch(record, workspace, { marker: '用户取消时的执行现场' });
+          this.setStatus(record, 'CANCELLED', '已取消');
+        }
       } else if (err instanceof EgressBlocked) {
+        this.sealSalvagePatch(record, workspace, { marker: `模型出站被阻断（${err.reason}）时的执行现场` });
         this.setStatus(record, 'BLOCKED', `模型出站被阻断：${err.reason}`);
       } else if (err instanceof InvocationFailed) {
+        this.sealSalvagePatch(record, workspace, {
+          marker: `模型调用失败（${err.cause.kind}）时的执行现场`,
+        });
         this.setStatus(record, 'FAILED', `模型调用失败：${err.cause.kind} — ${err.message}`);
       } else if (err instanceof PlanningFailed) {
         this.setStatus(record, 'FAILED', `规划失败：${err.message}`);
       } else {
+        this.sealSalvagePatch(record, workspace, { marker: '运行时异常时的执行现场' });
         this.setStatus(record, 'FAILED', `运行时异常：${(err as Error).message}`);
       }
     } finally {
@@ -1461,6 +1481,61 @@ export class RunAuthority {
   // -------------------------------------------------------------------------
   // 补丁决定 —— 唯一能进入 SUCCEEDED 的入口
   // -------------------------------------------------------------------------
+
+  /**
+   * 失败 / 中止现场的挽救封存。
+   *
+   * 「工作区不是最终事实；Patch、Verification 和 Evidence 才是交付事实」（PRD §4.2）。
+   * Run 失败时工作区里往往有真实改动 —— 不封存的话，用户投入的全部 token 与时间
+   * 只剩一个 FAILED 徽章，改动躺在一个没有任何界面出口的目录里。
+   *
+   * 挽救补丁与正式补丁走同一个 sealPatch（同一坐标系、同一诚实规则），差别只在：
+   *   - unverifiedItems 头部有显式挽救标记，UI 靠它给出"不能接受"的横幅；
+   *   - 它永远无法被接受：decidePatch 只认 AWAITING_PATCH_REVIEW，
+   *     applyPatchToRepo 只认接受态 —— 两道既有门禁都在终态前面，
+   *     所以挽救补丁只能被检视 / 复制 / 存盘（__patch.content 无接受态门禁，这是有意的）。
+   *   - 封存自身失败绝不掩盖原始失败：包在 try/catch 里降级为 NOTE。
+   *
+   * 已知不做的：TIMED_OUT 路径（deadline 回调先把终态定了，之后补 patch 不会
+   * 进那次 run.updated 推送，也赶不上那次落盘）—— 如实放弃，记录在案。
+   */
+  private sealSalvagePatch(
+    record: RunRecord,
+    workspace: MaterializedWorkspace,
+    opts: {
+      marker: string;
+      baseline?: VerificationRun | null;
+      finalVerification?: VerificationRun | null;
+    },
+  ): void {
+    try {
+      if (record.patch) return; // 防御：已有补丁的路径不该走到这里
+      if (workspace.changedFilesVsBaseline().length === 0) return;
+      const baseline = opts.baseline ?? null;
+      const final = opts.finalVerification ?? null;
+      const comparison = baseline && final ? compareVerification(baseline, final) : null;
+      const patch = sealPatch(
+        workspace,
+        record.view.runId,
+        record.view.attemptId,
+        record.snapshot.baseSha,
+        final,
+        comparison,
+        [
+          `⚠ 挽救封存：${opts.marker}。此补丁未被证明正确，仅供检视与手工挽救，不能被接受为成功`,
+        ],
+      );
+      record.patch = patch;
+      this.emit(
+        record,
+        'PATCH_SEALED',
+        `失败现场已封存为挽救补丁：${patch.files.length} 个文件，+${patch.files.reduce((n, f) => n + f.addedLines, 0)}/-${patch.files.reduce((n, f) => n + f.removedLines, 0)}（不可接受，仅供导出检视）`,
+        { patchId: patch.patchId, digest: patch.digest, files: patch.files.map((f) => f.path), salvage: true },
+      );
+    } catch (err) {
+      this.emit(record, 'NOTE', `挽救封存失败（不影响 Run 终态判定）：${(err as Error).message}`);
+    }
+  }
 
   private decidePatch(input: {
     runId: string;

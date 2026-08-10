@@ -172,6 +172,9 @@ export function RunDetail({
             patch={patch}
             canDecide={run.status === 'AWAITING_PATCH_REVIEW'}
             accepted={run.status === 'SUCCEEDED' || run.status === 'ACCEPTED_UNVERIFIED'}
+            salvage={
+              run.status === 'FAILED' || run.status === 'BLOCKED' || run.status === 'CANCELLED'
+            }
             onError={onError}
           />
         </div>
@@ -288,11 +291,14 @@ function PatchReview({
   patch,
   canDecide,
   accepted,
+  salvage,
   onError,
 }: {
   patch: PatchArtifact;
   canDecide: boolean;
   accepted: boolean;
+  /** 失败/中止现场的挽救补丁：只能检视与导出，永远不能被接受 */
+  salvage?: boolean;
   onError: (err: unknown) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -347,7 +353,17 @@ function PatchReview({
   const removed = patch.files.reduce((n, f) => n + f.removedLines, 0);
 
   return (
-    <Card title="补丁审查" hint={`${patch.files.length} 个文件 · +${added} / -${removed}`}>
+    <Card
+      title={salvage ? '挽救补丁' : '补丁审查'}
+      hint={`${patch.files.length} 个文件 · +${added} / -${removed}`}
+    >
+      {salvage && (
+        <Banner tone="warn">
+          <strong>这是失败/中止现场的挽救封存。</strong>
+          它未被证明正确，<b>不能被接受</b>，也不能一键写回仓库 ——
+          只能复制或保存后人工检视、手工挽救。下面的"仍失败/未验证"标注就是它失败时的样子。
+        </Banner>
+      )}
       <div className="row wrap" style={{ marginBottom: 12 }}>
         {patch.comparison === null ? (
           <Badge tone="err">未经机器验证</Badge>
@@ -445,6 +461,29 @@ function PatchReview({
             </button>
           </div>
         </>
+      )}
+
+      {salvage && (
+        <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid var(--border)' }}>
+          <div className="row" style={{ marginBottom: 10 }}>
+            <strong style={{ fontSize: 12.5 }}>挽救导出</strong>
+            <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+              没有「应用到仓库」—— 那条路只对被接受的补丁开放
+            </span>
+            <span className="spacer" />
+            <button disabled={busy} onClick={() => void runExport('COPY')}>
+              复制到剪贴板
+            </button>
+            <button disabled={busy} onClick={() => void runExport('SAVE_FILE')}>
+              保存为 .patch
+            </button>
+          </div>
+          {exportMsg && (
+            <Banner tone={exportMsg.ok ? 'info' : 'err'}>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 11.5 }}>{exportMsg.text}</span>
+            </Banner>
+          )}
+        </div>
       )}
 
       {accepted && (
