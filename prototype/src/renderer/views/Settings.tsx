@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DoctorCheck, ModelConnectionProfile } from '@shared/domain';
+import type { DiskUsage, PurgeSummaryView, RetentionPolicyView } from '@shared/protocol';
 import { call } from '../bridge';
 import { Badge, Banner, Card, DoctorBadge } from '../components/common';
 
@@ -77,7 +78,210 @@ export function SettingsView({
           界面只显示末四位，完整值不会回传给界面、不写日志、不进事件。
         </div>
       </Card>
+
+      <RetentionCard onError={onError} />
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 数据保留
+// ---------------------------------------------------------------------------
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+const DOMAIN_LABEL: Record<string, string> = {
+  runs: 'Run 证据（事件/状态/补丁）',
+  snapshots: '导入快照',
+  workspaces: '隔离工作区',
+  artifacts: '导出产物',
+};
+
+/**
+ * 保留策略此前只有 Core 侧的 policy + sweep，没有任何界面出口 ——
+ * 用户既看不到磁盘被占了多少，也改不了保留期、触发不了清理。
+ * 这里的三条诚实规则：
+ *   - 占用是真实扫出来的数字，不是估计；
+ *   - 清理结果必须报数（扫了多少、删了多少、释放多少），INCOMPLETE 必须醒目；
+ *   - 单项失败逐条列出原因 —— 静默跳过和静默删除是同一类问题。
+ */
+function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
+  const [policy, setPolicy] = useState<RetentionPolicyView | null>(null);
+  const [usage, setUsage] = useState<DiskUsage>({});
+  const [summary, setSummary] = useState<PurgeSummaryView | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [evidenceDays, setEvidenceDays] = useState('');
+  const [graceMinutes, setGraceMinutes] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const adopt = (r: {
+    policy: RetentionPolicyView;
+    usage: DiskUsage;
+    lastSummary?: PurgeSummaryView | null;
+    summary?: PurgeSummaryView;
+  }): void => {
+    setPolicy(r.policy);
+    setUsage(r.usage);
+    setEvidenceDays(String(r.policy.evidenceDays));
+    setGraceMinutes(String(r.policy.workspaceGraceMinutes));
+    const s = r.summary ?? r.lastSummary;
+    if (s !== undefined) setSummary(s);
+  };
+
+  useEffect(() => {
+    let alive = true;
+    call('retention.get', {})
+      .then((r) => {
+        if (alive) adopt(r);
+      })
+      .catch(() => {
+        // 拉不到就明说，不装作没有这块功能
+        if (alive) setLoadFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const savePolicy = async () => {
+    const days = Number(evidenceDays);
+    const grace = Number(graceMinutes);
+    if (!Number.isInteger(days) || days < 1 || !Number.isInteger(grace) || grace < 0) {
+      onError(new Error('保留期必须是正整数天数；宽限期必须是非负整数分钟'));
+      return;
+    }
+    setBusy(true);
+    try {
+      adopt(await call('retention.update', { evidenceDays: days, workspaceGraceMinutes: grace }));
+    } catch (err) {
+      onError(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const sweepNow = async () => {
+    setBusy(true);
+    try {
+      adopt(await call('retention.sweepNow', {}));
+    } catch (err) {
+      onError(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const totalBytes = Object.values(usage).reduce((n, d) => n + d.bytes, 0);
+  const dirty =
+    policy !== null &&
+    (evidenceDays !== String(policy.evidenceDays) || graceMinutes !== String(policy.workspaceGraceMinutes));
+
+  return (
+    <Card
+      title="数据保留"
+      hint="Retention"
+      right={
+        <button disabled={busy || !policy} onClick={() => void sweepNow()}>
+          {busy ? '…' : '立即清理'}
+        </button>
+      }
+    >
+      {loadFailed && <Banner tone="err">保留策略读取失败 —— 这块功能当前不可用，不是没有数据。</Banner>}
+
+      {policy && (
+        <>
+          <div className="row wrap" style={{ marginBottom: 12 }}>
+            <Badge tone="info">受管数据共 {formatBytes(totalBytes)}</Badge>
+            {Object.entries(usage).map(([domain, d]) => (
+              <Badge key={domain}>
+                {DOMAIN_LABEL[domain] ?? domain} {formatBytes(d.bytes)} · {d.entries} 项
+              </Badge>
+            ))}
+          </div>
+
+          <div className="field">
+            <label>Run 证据保留天数（事件、状态快照、补丁）</label>
+            <div className="row">
+              <input
+                style={{ maxWidth: 120 }}
+                value={evidenceDays}
+                disabled={busy}
+                onChange={(e) => setEvidenceDays(e.target.value)}
+              />
+              <span style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>天</span>
+            </div>
+          </div>
+
+          <div className="field">
+            <label>终态 Run 的工作区宽限期（此后隔离副本可被清理）</label>
+            <div className="row">
+              <input
+                style={{ maxWidth: 120 }}
+                value={graceMinutes}
+                disabled={busy}
+                onChange={(e) => setGraceMinutes(e.target.value)}
+              />
+              <span style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>分钟</span>
+              <span className="spacer" />
+              {dirty && (
+                <button className="primary" disabled={busy} onClick={() => void savePolicy()}>
+                  保存策略
+                </button>
+              )}
+            </div>
+            <div className="help">
+              单轮清理上限 {policy.maxItemsPerSweep} 项 / {Math.round(policy.maxDurationMs / 1000)}s ——
+              超出的留给下一轮，绝不为"清干净"而无界扫描。被引用的数据（进行中的 Run、
+              待审查的补丁）无论过期与否都不会删。
+            </div>
+          </div>
+
+          {summary && (
+            <>
+              <Banner tone={summary.status === 'COMPLETE' ? 'info' : 'warn'}>
+                <strong>
+                  上次清理（{summary.status === 'COMPLETE' ? '完整' : '未完成'}）：
+                </strong>
+                扫描 {summary.scanned} 项，删除 {summary.deleted} 项，释放{' '}
+                {formatBytes(summary.bytesFreed)}。
+                {summary.incompleteReason && (
+                  <div style={{ marginTop: 4 }}>未完成原因：{summary.incompleteReason}</div>
+                )}
+              </Banner>
+              {summary.items.some((i) => i.outcome === 'FAILED') && (
+                <Banner tone="err">
+                  有 {summary.items.filter((i) => i.outcome === 'FAILED').length} 项删除失败 ——
+                  失败的残留必须可见，不能当作已清理。
+                </Banner>
+              )}
+              {summary.items.length > 0 && (
+                <details className="toolcall" style={{ marginTop: 8 }}>
+                  <summary>
+                    <span style={{ color: 'var(--text-dim)' }}>逐项结果（{summary.items.length}）</span>
+                  </summary>
+                  <div className="body">
+                    <pre className="output" style={{ maxHeight: 220 }}>
+                      {summary.items
+                        .map(
+                          (i) =>
+                            `${i.outcome.padEnd(15)} ${i.domain.padEnd(12)} ${i.target}` +
+                            `${i.bytesFreed ? ` (${formatBytes(i.bytesFreed)})` : ''}${i.reason ? ` —— ${i.reason}` : ''}`,
+                        )
+                        .join('\n')}
+                    </pre>
+                  </div>
+                </details>
+              )}
+            </>
+          )}
+        </>
+      )}
+    </Card>
   );
 }
 
