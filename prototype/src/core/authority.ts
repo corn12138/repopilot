@@ -26,11 +26,18 @@ import type {
   ToolRisk,
   VerificationRun,
 } from '@shared/domain';
-import { EMPTY_LEDGER, isTerminal } from '@shared/domain';
+import { CROSS_REVIEW_LIMITS, EMPTY_LEDGER, isTerminal } from '@shared/domain';
 import { sha256 } from '@shared/ids';
 import type { ImportOutcome, PatchExportResult, PlatformError, PushEvent } from '@shared/protocol';
 import { digestOf, newId, nowIso } from '@shared/ids';
-import { AgentCancelled, PlanningFailed, runAgent, runReviewPass, type AgentDeps } from './agent';
+import {
+  AgentCancelled,
+  PlanningFailed,
+  composeUnverifiedItems,
+  runAgent,
+  runCrossReviewCycle,
+  type AgentDeps,
+} from './agent';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { applyPatchWithGit, sealPatch } from './patch';
@@ -61,7 +68,7 @@ import {
   sweep,
 } from './retention';
 import { PATHS, ensureDataRoot, snapshotDir, workspaceDir } from './paths';
-import { compareVerification } from './verify';
+import { compareVerification, runVerification } from './verify';
 import {
   MaterializedWorkspace,
   fileDigestAt,
@@ -993,10 +1000,20 @@ export class RunAuthority {
             { patchId: patch.patchId, digest: patch.digest, files: patch.files.map((f) => f.path) },
           );
 
-          // 补丁封存后、交回人手之前：如果启用了交叉审核，先让第二个模型只读审一遍。
+          // 补丁封存后、交回人手之前：如果启用了交叉审核，先让第二个模型只读审一遍；
+          // 有阻断发现时由实现方 route 自动整改一次（重验 + 重封存），再审一轮。
           // 审核结论只是给人的第二意见，绝不改变"接受与否"仍由人决定这件事。
           if (record.reviewer) {
-            await this.runCrossReview(record, workspace, startedAt, deadline, patch, result.finalVerification);
+            await this.runCrossReview(
+              record,
+              workspace,
+              startedAt,
+              deadline,
+              patch,
+              result.finalVerification,
+              result.baseline,
+              resolution,
+            );
           }
 
           this.setStatus(record, 'AWAITING_PATCH_REVIEW', result.detail);
@@ -1040,15 +1057,15 @@ export class RunAuthority {
   }
 
   /**
-   * 补丁封存后的只读交叉审核（PRD-XAGENT-003 的诚实子集）。
+   * 补丁封存后的交叉审核收敛闭环（PRD-XAGENT-003/004 的诚实子集）。
    *
-   * 本切片只跑 1 轮审核，产出发现后**始终**交回人工（AWAITING_PATCH_REVIEW，
-   * 即 PRD 的 HUMAN_REVIEW_REQUIRED）。自动整改（remediation → 第 2 轮审核）
-   * 尚未接线：有阻断发现时如实记为交人工，counter 不虚报"用满整改次数"。
-   *
-   * 无论审核结果如何：
+   * 审核 →（有阻断）实现方整改 → 重验 → 重封存 → 第二轮审核，硬上限
+   * 2 次审核 + 1 次整改（CROSS_REVIEW_LIMITS）。收敛语义在
+   * agent.runCrossReviewCycle 里；这里只提供机制：重验怎么跑、补丁怎么重新
+   * 封存、工作区怎么恢复。无论哪种 stopReason，终点都是 AWAITING_PATCH_REVIEW ——
    *   - 绝不自动接受补丁（审核"通过" ≠ SUCCEEDED，那需要机器验证 + 人工接受）
    *   - 出错 / 取消 / 审核方不可用都吞进 stopReason，不让交叉审核的失败拖垮主 Run
+   *   - 整改后验证失败时工作区**恢复到整改前内容**：封存补丁和文件树必须指同一棵树
    */
   private async runCrossReview(
     record: RunRecord,
@@ -1057,6 +1074,8 @@ export class RunAuthority {
     deadline: PausableDeadline,
     patch: PatchArtifact,
     finalVerification: VerificationRun | null,
+    baseline: VerificationRun | null,
+    implementerResolution: ModelRouteResolution,
   ): Promise<void> {
     const reviewer = record.reviewer;
     if (!reviewer) return;
@@ -1066,6 +1085,7 @@ export class RunAuthority {
     this.emit(record, 'CROSS_REVIEW_STARTED', `交叉审核开始：${reviewer.resolution.modelId}`, {
       reviewer: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId },
       heterogeneous: reviewer.heterogeneous,
+      limits: CROSS_REVIEW_LIMITS,
     });
 
     const deps: AgentDeps = {
@@ -1074,7 +1094,8 @@ export class RunAuthority {
       profile: record.profile,
       workspace,
       gateway: this.gateway,
-      resolution: reviewer.resolution, // implementer 字段这里不会被审核路径用到，填审核方即可
+      // 整改要以实现方身份改文件；审核调用走 input.reviewerResolution，不经这里
+      resolution: implementerResolution,
       mutationPolicy: {
         ...DEFAULT_MUTATION_POLICY,
         allowedPaths: record.task.allowedPaths,
@@ -1086,28 +1107,85 @@ export class RunAuthority {
       host: this.hostFor(record, startedAt, deadline),
     };
 
-    const rounds: CrossReviewRound[] = [];
+    // 进入循环时的那一代 —— 第 1 轮审核是平台强制只读的，代号不会在审核中漂移
+    const preGen = workspace.activeGeneration;
+    const verificationEnabled = record.task.verificationCommandIds.length > 0;
+
+    let rounds: readonly CrossReviewRound[] = [];
+    let remediations = 0;
     let stopReason: CrossReviewStopReason;
     try {
-      const round = await runReviewPass(deps, {
-        reviewerResolution: reviewer.resolution,
-        patch,
-        finalVerification,
-        round: 1,
-      });
-      rounds.push(round);
-      const blocking = round.findings.filter((f) => f.blocking).length;
-      // 本切片没有自动整改：PASS/无阻断 → REVIEWER_PASSED；有阻断 → 用满可自动进行的轮次
-      stopReason = round.verdict === 'PASS' || blocking === 0 ? 'REVIEWER_PASSED' : 'COUNTER_EXHAUSTED';
+      const outcome = await runCrossReviewCycle(
+        deps,
+        { reviewerResolution: reviewer.resolution, patch, finalVerification },
+        {
+          reverify: verificationEnabled
+            ? async () => {
+                this.setStatus(record, 'CROSS_REVIEWING', '整改完成，正在重新验证');
+                this.emit(record, 'VERIFICATION_STARTED', `验证 gen-${workspace.activeGeneration}（整改后）`, {
+                  phase: 'POST_MUTATION',
+                });
+                const v = await runVerification(
+                  record.view.runId,
+                  record.view.attemptId,
+                  'POST_MUTATION',
+                  workspace,
+                  record.profile,
+                  record.task.verificationCommandIds,
+                  record.abort.signal,
+                );
+                record.verifications.push(v);
+                this.emit(
+                  record,
+                  'VERIFICATION_FINISHED',
+                  `验证${v.passed ? '通过' : '失败'}：${v.commands.map((c) => `${c.commandId}=${c.outcome}`).join(' ')}`,
+                  { phase: 'POST_MUTATION', verification: v },
+                );
+                return v;
+              }
+            : null,
+          reseal: (verification, truncationReason) => {
+            const comparison =
+              baseline && verification ? compareVerification(baseline, verification) : null;
+            return sealPatch(
+              workspace,
+              record.view.runId,
+              record.view.attemptId,
+              record.snapshot.baseSha,
+              verification,
+              comparison,
+              composeUnverifiedItems(record.task, record.profile, comparison, truncationReason),
+            );
+          },
+          adoptPatch: (p) => {
+            record.patch = p;
+            this.emit(
+              record,
+              'PATCH_SEALED',
+              `整改后补丁已重新封存：${p.files.length} 个文件，+${p.files.reduce((n, f) => n + f.addedLines, 0)}/-${p.files.reduce((n, f) => n + f.removedLines, 0)}`,
+              { patchId: p.patchId, digest: p.digest, files: p.files.map((f) => f.path), remediated: true },
+            );
+          },
+          restoreWorkspace: () => {
+            const r = workspace.restoreGeneration(preGen);
+            this.emit(
+              record,
+              'NOTE',
+              `工作区已恢复：gen-${r.generation} 复制自整改前的 gen-${preGen}，封存补丁与文件树重新一致`,
+            );
+          },
+        },
+      );
+      rounds = outcome.rounds;
+      remediations = outcome.remediations;
+      stopReason = outcome.stopReason;
     } catch (err) {
+      // 循环是全函数，能走到这里的只剩机制层异常（封存 IO、恢复 CAS 等）
       if (err instanceof AgentCancelled || record.abort.signal.aborted) {
         stopReason = 'CANCELLED';
-      } else if (err instanceof EgressBlocked) {
-        stopReason = 'REVIEWER_UNAVAILABLE';
-        this.emit(record, 'NOTE', `交叉审核出站被阻断：${err.reason}`);
       } else {
         stopReason = 'ERROR';
-        this.emit(record, 'NOTE', `交叉审核出错（不影响补丁本身）：${(err as Error).message}`);
+        this.emit(record, 'NOTE', `交叉审核机制异常（不影响已封存补丁）：${(err as Error).message}`);
       }
     }
 
@@ -1117,7 +1195,7 @@ export class RunAuthority {
       heterogeneous: reviewer.heterogeneous,
       rounds,
       reviewerInvocations: rounds.length,
-      remediations: 0,
+      remediations,
       stopReason,
       startedAt: crStart,
       finishedAt: nowIso(),
@@ -1129,8 +1207,14 @@ export class RunAuthority {
     this.emit(
       record,
       'CROSS_REVIEW_FINISHED',
-      `交叉审核结束（${stopReason}）：${findingTotal} 条发现，其中阻断 ${blockingTotal}`,
-      { stopReason, reviewerInvocations: cr.reviewerInvocations, blockingTotal, findingTotal },
+      `交叉审核结束（${stopReason}）：${cr.reviewerInvocations} 轮审核 + ${cr.remediations} 次整改，${findingTotal} 条发现（阻断 ${blockingTotal}）`,
+      {
+        stopReason,
+        reviewerInvocations: cr.reviewerInvocations,
+        remediations: cr.remediations,
+        blockingTotal,
+        findingTotal,
+      },
     );
     // 补丁审查阶段会读到 record.crossReview，把发现摆在用户面前再让其决定
   }

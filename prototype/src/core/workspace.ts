@@ -164,6 +164,38 @@ export class MaterializedWorkspace {
     rmSync(this.generationPath(stagedGeneration), { recursive: true, force: true });
   }
 
+  /**
+   * 把历史某一代的**内容**恢复成新的一代 —— 像 git revert，不像 reset。
+   *
+   * 存在的理由是交叉审核的整改路径：整改改完文件、验证反而失败时，封存补丁
+   * （绑定整改前内容）和工作区（整改后内容）会脱节，文件树展示的是一个已被
+   * 放弃的现场。恢复必须发生。
+   *
+   * 刻意**不做**"把 active 指回旧代"的倒退：generation 编号单调前进是 receipt
+   * 失效判定和 stage() 目录分配的前提 —— 倒退后 stage() 会以 active+1 撞上
+   * 残留目录，receipt 的"绑定旧代即作废"也会被"代号重复出现"搅浑。
+   * 前进式恢复不动这两条不变式，代价只是一次 APFS clone。
+   */
+  restoreGeneration(sourceGen: number): { generation: number } {
+    if (sourceGen > this.active) {
+      throw new Error(`无法恢复 gen-${sourceGen}：它在 active（gen-${this.active}）之后`);
+    }
+    const sourcePath = this.generationPath(sourceGen);
+    if (!existsSync(sourcePath)) {
+      throw new Error(`无法恢复 gen-${sourceGen}：目录不存在`);
+    }
+    const next = this.active + 1;
+    const path = this.generationPath(next);
+    rmSync(path, { recursive: true, force: true });
+    cloneTree(sourcePath, path);
+    this.linkDependencies(path);
+    if (!this.commit(next, this.active)) {
+      // commit 的三个失败条件在单线程 Core 里都不该出现；出现即为内部不变式违规
+      throw new Error(`恢复 gen-${sourceGen} 时 CAS 提交失败（active=${this.active}）`);
+    }
+    return { generation: next };
+  }
+
   /** 当前代整棵树的 digest，用于把 Patch 与验证输入绑定在同一棵树上 */
   treeDigest(): Digest {
     return digestOf(listTree(this.activePath));

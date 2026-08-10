@@ -463,6 +463,68 @@ describe('generation：stage / commit / discard', () => {
   });
 });
 
+describe('restoreGeneration：前进式恢复（revert，不是 reset）', () => {
+  /** 推进一代：改 src/app.ts 的内容为 content */
+  const advance = (ws: MaterializedWorkspace, content: string): void => {
+    const staged = ws.stage();
+    writeRaw(staged.path, 'src/app.ts', content);
+    expect(ws.commit(staged.generation, ws.activeGeneration)).toBe(true);
+  };
+
+  it('内容回到旧代，但代号继续前进 —— 恢复本身是一次新的提交', () => {
+    const ws = newWorkspace();
+    advance(ws, 'gen1 的内容\n'); // gen-1
+    advance(ws, 'gen2 整改把它改坏了\n'); // gen-2
+
+    const r = ws.restoreGeneration(1);
+    expect(r.generation).toBe(3); // 不是"退回 1"，是"前进到内容等于 gen-1 的 3"
+    expect(ws.activeGeneration).toBe(3);
+    expect(ws.readText('src/app.ts')).toBe('gen1 的内容\n');
+    // 被放弃的整改现场仍然完整保留 —— 恢复不销毁历史
+    expect(readFileSync(join(ws.generationPath(2), 'src/app.ts'), 'utf8')).toBe(
+      'gen2 整改把它改坏了\n',
+    );
+  });
+
+  it('恢复也是切代：旧 receipt 一律作废', () => {
+    const ws = newWorkspace();
+    advance(ws, 'gen1\n');
+    const { receipt } = ws.issueReceipt('src/app.ts');
+    ws.restoreGeneration(0);
+    expect(ws.getReceipt(receipt.receiptId)).toBeUndefined();
+  });
+
+  it('恢复之后可以正常继续 stage/commit —— 编号不会撞上恢复产生的目录', () => {
+    const ws = newWorkspace();
+    advance(ws, 'gen1\n');
+    ws.restoreGeneration(0); // active = 2
+    advance(ws, 'gen3\n'); // 必须能正常走到 gen-3
+    expect(ws.activeGeneration).toBe(3);
+    expect(ws.readText('src/app.ts')).toBe('gen3\n');
+  });
+
+  it('目标代不存在或在 active 之后 → 抛错且工作区不动', () => {
+    const ws = newWorkspace();
+    advance(ws, 'gen1\n');
+    const before = fingerprint(ws);
+    expect(() => ws.restoreGeneration(7)).toThrow(/之后/);
+    ws.discard(2); // 保证 gen-2 目录不存在（本来也不存在，防御性）
+    // 人为造一个"代号合法但目录已缺失"的目标：gen-0 被删掉的话应当抛"不存在"
+    rmSync(ws.generationPath(0), { recursive: true, force: true });
+    expect(() => ws.restoreGeneration(0)).toThrow(/不存在/);
+    expect(ws.activeGeneration).toBe(1);
+    expect(fingerprint(ws)).toBe(before);
+  });
+
+  it('恢复到 active 自身：产生一个内容相同的新代（幂等语义，不抛）', () => {
+    const ws = newWorkspace();
+    advance(ws, 'gen1\n');
+    const r = ws.restoreGeneration(1);
+    expect(r.generation).toBe(2);
+    expect(ws.readText('src/app.ts')).toBe('gen1\n');
+  });
+});
+
 describe('read receipt', () => {
   it('digest / byteLength 与磁盘内容一致，generation 是签发时的当前代', () => {
     const ws = newWorkspace();

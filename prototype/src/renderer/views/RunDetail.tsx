@@ -509,7 +509,7 @@ const STOP_REASON_LABEL: Record<string, string> = {
   REVIEWER_PASSED: '审核方未发现阻断问题',
   COUNTER_EXHAUSTED: '已用满可自动进行的审核/整改轮次',
   NO_DELTA: '整改后补丁无变化',
-  NO_PROGRESS: '阻断问题没有减少',
+  NO_PROGRESS: '整改未产生进展（阻断未减少 / 指纹重现 / 整改后验证失败）',
   REVIEWER_UNAVAILABLE: '审核方不可用',
   BUDGET_EXHAUSTED: '预算耗尽',
   CANCELLED: '已取消',
@@ -520,11 +520,12 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
   const findings = record.rounds.flatMap((r) => r.findings);
   const blocking = findings.filter((f) => f.blocking).length;
   const verdicts = record.rounds.map((r) => r.verdict).join(' → ') || '（无）';
+  const multiRound = record.rounds.length > 1;
 
   return (
     <Card
       title="交叉审核（第二个模型只读）"
-      hint={`${record.reviewerInvocations} 轮 · ${findings.length} 条发现 · 阻断 ${blocking}`}
+      hint={`${record.reviewerInvocations} 轮审核 · ${record.remediations} 次整改 · ${findings.length} 条发现 · 阻断 ${blocking}`}
       right={
         <Badge tone={record.heterogeneous ? 'info' : 'warn'}>
           {record.heterogeneous ? '异构审核方' : '同源审核方'}
@@ -547,35 +548,47 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
       {findings.length === 0 ? (
         <p style={{ color: 'var(--text-dim)', marginTop: 10 }}>审核方没有提出发现。</p>
       ) : (
-        <div style={{ marginTop: 10 }}>
-          {findings.map((f, i) => (
-            <details key={i} className="toolcall" open={f.blocking}>
-              <summary>
-                <Badge tone={SEVERITY_TONE[f.severity]}>{f.severity}</Badge>
-                {f.blocking && <Badge tone="err">阻断</Badge>}
-                <code style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>
-                  {f.file ?? '（无具体文件）'}
-                  {f.range ? `:${f.range[0]}-${f.range[1]}` : ''}
-                </code>
-                <span className="spacer" style={{ flex: 1 }} />
-                <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
-                  信心 {(f.confidence * 100).toFixed(0)}%
-                </span>
-              </summary>
-              <div className="body">
-                <p style={{ margin: '6px 0' }}>{f.evidence}</p>
-                {f.reproduction && (
-                  <p style={{ margin: '6px 0', color: 'var(--text-dim)' }}>复现：{f.reproduction}</p>
-                )}
-                {f.suggestedRemediation && (
-                  <p style={{ margin: '6px 0', color: 'var(--text-dim)' }}>
-                    建议：{f.suggestedRemediation}
-                  </p>
-                )}
+        record.rounds.map((round) => (
+          <div key={round.round} style={{ marginTop: 10 }}>
+            {multiRound && (
+              <div className="section-label" style={{ padding: '4px 2px' }}>
+                第 {round.round} 轮（{round.verdict}
+                {round.round === 1 && record.remediations > 0 ? ' · 之后进行了整改' : ''}） ·
+                针对补丁 <code style={{ fontSize: 10.5 }}>{round.reviewedPatchDigest.slice(0, 18)}…</code>
               </div>
-            </details>
-          ))}
-        </div>
+            )}
+            {round.findings.map((f, i) => (
+              <details key={i} className="toolcall" open={f.blocking && round.round === record.rounds.length}>
+                <summary>
+                  <Badge tone={SEVERITY_TONE[f.severity]}>{f.severity}</Badge>
+                  {f.blocking && <Badge tone="err">阻断</Badge>}
+                  <code style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>
+                    {f.file ?? '（无具体文件）'}
+                    {f.range ? `:${f.range[0]}-${f.range[1]}` : ''}
+                  </code>
+                  <span className="spacer" style={{ flex: 1 }} />
+                  <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
+                    信心 {(f.confidence * 100).toFixed(0)}%
+                  </span>
+                </summary>
+                <div className="body">
+                  <p style={{ margin: '6px 0' }}>{f.evidence}</p>
+                  {f.reproduction && (
+                    <p style={{ margin: '6px 0', color: 'var(--text-dim)' }}>复现：{f.reproduction}</p>
+                  )}
+                  {f.suggestedRemediation && (
+                    <p style={{ margin: '6px 0', color: 'var(--text-dim)' }}>
+                      建议：{f.suggestedRemediation}
+                    </p>
+                  )}
+                </div>
+              </details>
+            ))}
+            {round.findings.length === 0 && multiRound && (
+              <p style={{ color: 'var(--text-dim)', margin: '4px 2px' }}>本轮没有发现。</p>
+            )}
+          </div>
+        ))
       )}
     </Card>
   );

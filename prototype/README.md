@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 473 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
+`pnpm test` — 493 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
 
 | 断言 | 证据位置 |
 |---|---|
@@ -46,9 +46,13 @@
 - 隔离强度：`utilityProcess` + 子进程**不是**容器级沙箱。`node_modules` 目前是宿主的 symlink，构建脚本以你的用户权限运行。这是原型的显式残余风险，写在 `workspace.ts:linkDependencies` 的注释里。
 - 持久化：Run 事件是 JSONL，不是 SQLite WAL；没有加密、没有保留期、没有级联清理。
 - 崩溃恢复：事件日志能重放，但 Core 重启后不会自动恢复进行中的 Run。
-- 交叉审核只有**单轮**：审完就交回人工。PRD 允许的「最多 2 轮审核 + 1 次整改」
-  里的自动整改**没有接线**，`remediations` 恒为 0（不虚报）。多轮收敛、
-  `NO_PROGRESS` / `NO_DELTA` 早停一条都没测，因为多轮本身还没实现。
+- 交叉审核的收敛闭环（审核 → 有阻断则实现方整改一次 → 重验 → 重封存 → 再审一轮，
+  硬上限 2 审核 + 1 整改）**已接线**，收敛语义在 `agent.runCrossReviewCycle`，
+  20 条确定性测试钉住终止条件（`NO_DELTA` / `NO_PROGRESS` / 指纹重现 / 预算 /
+  取消中断恢复），其中「验证失败必须恢复工作区」「指纹重现判无进展」两条守卫做过
+  拆掉即红的反向验证。**但**：authority 侧的真实接线（真封存、真验证、真恢复串起来）
+  没有独立的端到端测试，靠的是 typecheck + 钩子级单测；真实双模型的整改质量更是
+  只能真跑才知道。
 - 一切 P1：Skill、多表面、Continuation、资源/热治理都没做。
 - 打包只做到「能双击运行的未签名 dmg」：没有签名、没有公证、没有自动更新，
   也没有 Intel 机器上的实机验证。见下面「打包」。
@@ -212,8 +216,10 @@ Intel 包要单独出，因为它得再下一份 x64 Electron，国内网络经�
 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ pnpm dist:mac:x64
 ```
 
-**x64 在本机没有构建成功过，更没有实机验证** —— 上面那条命令是推断出来的走法，
-不是验证过的结论。默认目标只留 arm64，是因为默认命令不该是一条会失败的命令。
+x64 后来用上面这条镜像命令**构建成功了**，产物在本机 Rosetta 下验证过主进程与
+Core（utilityProcess）都能启动 —— 首次启动约 20 秒是 Rosetta 转译开销。
+**仍然没有真实 Intel 机器上的验证**。默认目标只留 arm64，是因为不挂镜像时
+它是一条大概率失败的命令。
 
 **这不是发行方案。** ADR 017 现在还是 `Open / Decision Matrix and Evidence Required` ——
 Developer ID 直接分发和 Mac App Store 谁胜出没有定，签名、公证、Hardened Runtime、

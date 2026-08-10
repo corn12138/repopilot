@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type {
   CrossReviewRound,
+  CrossReviewStopReason,
   ModelRouteResolution,
   PatchArtifact,
   PlanRevision,
@@ -14,6 +15,7 @@ import type {
   ToolRisk,
   VerificationRun,
 } from '@shared/domain';
+import { CROSS_REVIEW_LIMITS } from '@shared/domain';
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
 import type { ContentBlock, ModelMessage, ToolSchema } from './model/types';
@@ -330,13 +332,7 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
   // 拿成 const 才能让 TS 收窄；lastEnd 是 let，不能跨语句窄化
   const end = lastEnd;
   const truncationReason = end?.kind === 'BUDGET_EXHAUSTED' ? end.reason : null;
-  const unverified = [
-    ...(truncationReason ? [`⚠ 执行曾被预算截断（${truncationReason}）`] : []),
-    ...(comparison.notRerun.length > 0
-      ? [`以下基线失败的命令本次未重跑，状态未知：${comparison.notRerun.join(', ')}`]
-      : []),
-    ...buildUnverifiedItems(task, profile, comparison),
-  ];
+  const unverified = composeUnverifiedItems(task, profile, comparison, truncationReason);
 
   return {
     kind: 'PATCH_READY',
@@ -726,6 +722,280 @@ function reviewSystemPrompt(deps: AgentDeps): string {
 }
 
 // ---------------------------------------------------------------------------
+// 交叉审核：整改与多轮编排（PRD-XAGENT-004 的收敛闭环）
+// ---------------------------------------------------------------------------
+
+export interface RemediationPassInput {
+  /** 审核所针对的补丁 —— 整改方需要看到自己交付了什么 */
+  readonly patch: PatchArtifact;
+  /** 只喂阻断项。提示性发现不驱动整改，避免整改被引去做范围外的"顺手优化" */
+  readonly findings: readonly ReviewFinding[];
+}
+
+export interface RemediationPassResult {
+  /** 工作区 generation 是否真的前进了 —— "模型说改了"不算 */
+  readonly mutated: boolean;
+  readonly truncationReason: string | null;
+}
+
+/**
+ * 一次自动整改：**实现方**（deps.resolution 必须是实现方 route）在同一工作区里
+ * 修复审核方给出的阻断发现。走标准执行通道（executionTurns），也就是说：
+ * mutation 依旧要 receipt + exact-span、依旧整笔失败零写入、依旧计入同一个预算账本。
+ * 整改没有任何专属特权。
+ */
+export async function runRemediationPass(
+  deps: AgentDeps,
+  input: RemediationPassInput,
+): Promise<RemediationPassResult> {
+  const before = deps.workspace.activeGeneration;
+  const conversation: ModelMessage[] = [
+    {
+      role: 'user',
+      content: [{ type: 'text', text: renderRemediationBrief(deps.task, input.patch, input.findings) }],
+    },
+  ];
+  const ended = await executionTurns(deps, conversation);
+  return {
+    mutated: deps.workspace.activeGeneration !== before,
+    truncationReason: ended.kind === 'BUDGET_EXHAUSTED' ? ended.reason : null,
+  };
+}
+
+function renderRemediationBrief(
+  task: TaskSpec,
+  patch: PatchArtifact,
+  findings: readonly ReviewFinding[],
+): string {
+  const list = findings
+    .map((f, i) => {
+      const where = f.file ? `${f.file}${f.range ? `:${f.range[0]}-${f.range[1]}` : ''}` : '（未定位）';
+      return (
+        `${i + 1}. [${f.severity}] ${where}\n` +
+        `   证据：${f.evidence}\n` +
+        (f.reproduction ? `   复现：${f.reproduction}\n` : '') +
+        (f.suggestedRemediation ? `   审核方建议：${f.suggestedRemediation}\n` : '')
+      );
+    })
+    .join('\n');
+  return `你之前提交的补丁经独立模型交叉审核，发现 ${findings.length} 条**阻断性**问题。请整改。
+
+任务目标（不变）：${task.goal}
+允许改动的路径（不变）：${task.allowedPaths.join(', ') || '（未限定）'}
+
+阻断发现：
+${list}
+被审核的补丁（你当前工作区已包含这些改动）：
+\`\`\`diff
+${patch.unifiedDiff.slice(0, 24_000)}
+\`\`\`
+${patch.unifiedDiff.length > 24_000 ? '（diff 过长已截断，可用 fs_read 读取完整文件）' : ''}
+
+规则：
+- **只**修复上面列出的阻断项。不要顺手重构、不要扩大范围 —— 范围蔓延本身就是审核要抓的问题。
+- 认为某条发现不成立时，不改它即可（下一轮审核与人工都会看到你的取舍），不要为了"响应"而乱改。
+- 修改文件前先 fs_read 拿 receipt。改完直接结束回合，无需汇报。`;
+}
+
+export interface CrossReviewCycleInput {
+  readonly reviewerResolution: ModelRouteResolution;
+  readonly patch: PatchArtifact;
+  readonly finalVerification: VerificationRun | null;
+}
+
+/**
+ * 循环需要但不属于循环的机制，由调用方（authority）注入。
+ * 这样收敛语义（何时整改、何时早停、counter 怎么走）可以在测试里用替身钉死，
+ * 而封存/验证/恢复的真实实现仍然只有一份。
+ */
+export interface CrossReviewCycleHooks {
+  /** 整改产生变更后重跑验证。未验证模式传 null —— 循环会跳过验证、按原模式重新封存 */
+  readonly reverify: (() => Promise<VerificationRun>) | null;
+  /** 用给定验证结果重新封存当前工作区（不改 record，不发事件 —— 是否采用由循环决定） */
+  readonly reseal: (verification: VerificationRun | null, truncationReason: string | null) => PatchArtifact;
+  /** 循环确认新补丁有实质变化后调用：替换 record.patch 并发 PATCH_SEALED */
+  readonly adoptPatch: (patch: PatchArtifact) => void;
+  /** 把工作区内容恢复到进入循环时的那一代（整改失败/中断时保证补丁与工作区一致） */
+  readonly restoreWorkspace: () => void;
+}
+
+export interface CrossReviewCycleOutcome {
+  readonly rounds: readonly CrossReviewRound[];
+  readonly remediations: number;
+  readonly stopReason: CrossReviewStopReason;
+}
+
+/**
+ * 交叉审核收敛循环：审核 →（有阻断）整改 → 重验 → 重封存 → 再审 → 终止判定。
+ *
+ * 硬上限来自 CROSS_REVIEW_LIMITS（2 次审核 + 1 次整改，PRD-XAGENT-004），
+ * 流程本身写成直线而不是 while —— 上限不是"循环恰好走不满"，是结构上走不满。
+ *
+ * 终止语义（全部转人工，绝不自动接受）：
+ *   REVIEWER_PASSED    某轮无阻断发现
+ *   NO_DELTA           整改没改出实质差异（没动文件，或 digest 与整改前相同）
+ *   NO_PROGRESS        整改后验证反而失败（已恢复工作区），或第二轮阻断未减少/指纹重现
+ *   COUNTER_EXHAUSTED  两轮审核 + 一次整改用满，仍有（减少了的）阻断
+ *   BUDGET_EXHAUSTED   任务预算耗尽（整改与主执行同一个账本）
+ *   CANCELLED / REVIEWER_UNAVAILABLE / ERROR  中断类，能定位到哪一侧就如实标注哪一侧
+ *
+ * 这个函数是全函数（total）：内部把可预期的异常折叠进 stopReason 并保留已完成的
+ * rounds —— 第一轮审核已经真实发生、token 已经花掉，不能因为第二阶段炸了就把
+ * 记录归零。只有真正意外的异常才继续往上抛。
+ */
+export async function runCrossReviewCycle(
+  deps: AgentDeps,
+  input: CrossReviewCycleInput,
+  hooks: CrossReviewCycleHooks,
+): Promise<CrossReviewCycleOutcome> {
+  const { host } = deps;
+  const rounds: CrossReviewRound[] = [];
+  let remediations = 0;
+  const done = (stopReason: CrossReviewStopReason): CrossReviewCycleOutcome => ({
+    rounds: [...rounds],
+    remediations,
+    stopReason,
+  });
+
+  // ---- 第 1 轮审核 ----
+  let round1: CrossReviewRound;
+  try {
+    round1 = await runReviewPass(deps, {
+      reviewerResolution: input.reviewerResolution,
+      patch: input.patch,
+      finalVerification: input.finalVerification,
+      round: 1,
+    });
+  } catch (err) {
+    return done(mapReviewFailure(err, host, deps.signal));
+  }
+  rounds.push(round1);
+  const blocking1 = round1.findings.filter((f) => f.blocking);
+  if (round1.verdict === 'PASS' || blocking1.length === 0) return done('REVIEWER_PASSED');
+
+  // ---- 整改（1/1）----
+  if (remediations >= CROSS_REVIEW_LIMITS.maxRemediations) return done('COUNTER_EXHAUSTED');
+  {
+    const b = host.budgetExceeded();
+    if (b.exceeded) {
+      host.emit('NOTE', `预算耗尽，跳过自动整改：${b.reason}`);
+      return done('BUDGET_EXHAUSTED');
+    }
+  }
+
+  host.emit(
+    'NOTE',
+    `交叉审核发现 ${blocking1.length} 条阻断 → 自动整改（1/${CROSS_REVIEW_LIMITS.maxRemediations}），由实现方 route 执行`,
+    { blocking: blocking1.length },
+  );
+  remediations += 1;
+  const genBefore = deps.workspace.activeGeneration;
+  let rem: RemediationPassResult;
+  try {
+    rem = await runRemediationPass(deps, { patch: input.patch, findings: blocking1 });
+  } catch (err) {
+    // 整改中断时工作区可能已经前进了几代 —— 恢复，让封存补丁和工作区重新一致
+    if (deps.workspace.activeGeneration !== genBefore) {
+      hooks.restoreWorkspace();
+      host.emit('NOTE', '整改中断，已把工作区恢复到整改前内容');
+    }
+    if (err instanceof AgentCancelled || deps.signal.aborted) return done('CANCELLED');
+    if (err instanceof EgressBlocked) {
+      host.emit('NOTE', `整改被出站策略阻断（实现方 route）：${err.reason} —— 转人工`);
+      return done('ERROR');
+    }
+    if (err instanceof InvocationFailed) {
+      host.emit('NOTE', `整改的模型调用失败（实现方 route）：${err.message} —— 转人工`);
+      return done('ERROR');
+    }
+    host.emit('NOTE', `整改过程异常：${(err as Error).message} —— 转人工`);
+    return done('ERROR');
+  }
+
+  if (!rem.mutated) {
+    host.emit('NOTE', '整改没有产生任何文件变更 —— 补丁维持原样，转人工');
+    return done('NO_DELTA');
+  }
+
+  // ---- 整改后重验：补丁必须绑定它自己的验证，不能挂着整改前的旧结果 ----
+  let nextVerification: VerificationRun | null = null;
+  if (hooks.reverify) {
+    nextVerification = await hooks.reverify();
+    if (deps.signal.aborted) {
+      hooks.restoreWorkspace();
+      return done('CANCELLED');
+    }
+    if (!nextVerification.passed) {
+      hooks.restoreWorkspace();
+      host.emit(
+        'NOTE',
+        '整改后验证未通过 —— 已把工作区恢复到整改前内容，补丁维持整改前版本，转人工',
+      );
+      return done('NO_PROGRESS');
+    }
+  }
+
+  const resealed = hooks.reseal(nextVerification, rem.truncationReason);
+  if (resealed.digest === input.patch.digest) {
+    host.emit('NOTE', '整改后的补丁与整改前逐字节相同 —— 无实质变化，转人工');
+    return done('NO_DELTA');
+  }
+  hooks.adoptPatch(resealed);
+
+  // ---- 第 2 轮审核（2/2）----
+  if (rounds.length >= CROSS_REVIEW_LIMITS.maxReviewerInvocations) return done('COUNTER_EXHAUSTED');
+  {
+    const b = host.budgetExceeded();
+    if (b.exceeded) {
+      host.emit('NOTE', `预算耗尽，整改后的补丁未经第二轮审核：${b.reason}`);
+      return done('BUDGET_EXHAUSTED');
+    }
+  }
+
+  let round2: CrossReviewRound;
+  try {
+    round2 = await runReviewPass(deps, {
+      reviewerResolution: input.reviewerResolution,
+      patch: resealed,
+      finalVerification: nextVerification,
+      round: 2,
+    });
+  } catch (err) {
+    return done(mapReviewFailure(err, host, deps.signal));
+  }
+  rounds.push(round2);
+  const blocking2 = round2.findings.filter((f) => f.blocking);
+  if (round2.verdict === 'PASS' || blocking2.length === 0) return done('REVIEWER_PASSED');
+
+  // 进展判定用平台算的指纹，不用模型的自我评价
+  const seen = new Set(blocking1.map((f) => f.fingerprint));
+  const repeated = blocking2.filter((f) => seen.has(f.fingerprint)).length;
+  if (blocking2.length >= blocking1.length || repeated > 0) {
+    host.emit(
+      'NOTE',
+      `第二轮审核：阻断 ${blocking1.length} → ${blocking2.length}，指纹重现 ${repeated} 条 —— 判定无进展，转人工`,
+    );
+    return done('NO_PROGRESS');
+  }
+  return done('COUNTER_EXHAUSTED');
+}
+
+/** 审核调用失败的归因：审核方 route 出不去 ≠ 泛化的 ERROR，要能对症排查 */
+function mapReviewFailure(err: unknown, host: AgentHost, signal: AbortSignal): CrossReviewStopReason {
+  if (err instanceof AgentCancelled || signal.aborted) return 'CANCELLED';
+  if (err instanceof EgressBlocked) {
+    host.emit('NOTE', `审核方出站被阻断：${err.reason}`);
+    return 'REVIEWER_UNAVAILABLE';
+  }
+  if (err instanceof InvocationFailed) {
+    host.emit('NOTE', `审核方模型调用失败：${err.message}`);
+    return 'REVIEWER_UNAVAILABLE';
+  }
+  host.emit('NOTE', `交叉审核异常：${(err as Error).message}`);
+  return 'ERROR';
+}
+
+// ---------------------------------------------------------------------------
 // 执行
 // ---------------------------------------------------------------------------
 
@@ -1091,6 +1361,26 @@ function buildUnverifiedItems(
   }
   items.push('运行时行为、视觉表现和未被测试覆盖的分支均未验证');
   return items;
+}
+
+/**
+ * 补丁封存时的完整"未验证清单"。runAgent 的 PATCH_READY 收尾和交叉审核整改后的
+ * 重新封存走的是**同一个**函数 —— 两处口径不一致的话，重封存的补丁会看起来
+ * 比第一次封存"更干净"，而那只是漏写了几行。
+ */
+export function composeUnverifiedItems(
+  task: TaskSpec,
+  profile: RepositoryHarnessProfile,
+  comparison: ReturnType<typeof compareVerification> | null,
+  truncationReason: string | null,
+): string[] {
+  return [
+    ...(truncationReason ? [`⚠ 执行曾被预算截断（${truncationReason}）`] : []),
+    ...(comparison && comparison.notRerun.length > 0
+      ? [`以下基线失败的命令本次未重跑，状态未知：${comparison.notRerun.join(', ')}`]
+      : []),
+    ...buildUnverifiedItems(task, profile, comparison),
+  ];
 }
 
 function throwIfCancelled(signal: AbortSignal): void {
