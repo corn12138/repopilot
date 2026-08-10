@@ -42,6 +42,9 @@
 | 账本：provider 未回报用量（null）计入"未知轮次"，绝不折算成 0 | `domain.test.ts` |
 | 账本：不涉及 token 的记账（工具调用）不污染未知计数 | `domain.test.ts` |
 | failureClass / unknownUsageTurns 增量字段跨重启往返，旧快照缺字段读出 undefined 而非补 0 | `persistence.test.ts` |
+| **权威层 e2e**：注册 → 导入 → 审批 → 修复 → 真验证通过 → 接受 → `SUCCEEDED`，账本逐轮对账（含用量未知轮） | `authority.e2e.test.ts` |
+| **权威层 e2e**：自修复用尽 → `FAILED` + `failureClass` + 挽救补丁封存，接受被状态门禁拒绝 | `authority.e2e.test.ts` |
+| **权威层 e2e**：交叉审核阻断 → 整改 → 重验 → 重封存（digest 变化）→ 第二轮通过，2 审 1 改如实记账 | `authority.e2e.test.ts` |
 
 ## 尚未证明的
 
@@ -49,16 +52,12 @@
 - 隔离强度：`utilityProcess` + 子进程**不是**容器级沙箱。`node_modules` 目前是宿主的 symlink，构建脚本以你的用户权限运行。这是原型的显式残余风险，写在 `workspace.ts:linkDependencies` 的注释里。
 - 持久化：Run 事件是 JSONL，不是 SQLite WAL；没有加密、没有保留期、没有级联清理。
 - 崩溃恢复：事件日志能重放，但 Core 重启后不会自动恢复进行中的 Run。
-- 交叉审核的收敛闭环（审核 → 有阻断则实现方整改一次 → 重验 → 重封存 → 再审一轮，
-  硬上限 2 审核 + 1 整改）**已接线**，收敛语义在 `agent.runCrossReviewCycle`，
-  20 条确定性测试钉住终止条件（`NO_DELTA` / `NO_PROGRESS` / 指纹重现 / 预算 /
-  取消中断恢复），其中「验证失败必须恢复工作区」「指纹重现判无进展」两条守卫做过
-  拆掉即红的反向验证。**但**：authority 侧的真实接线（真封存、真验证、真恢复串起来）
-  没有独立的端到端测试，靠的是 typecheck + 钩子级单测；真实双模型的整改质量更是
-  只能真跑才知道。
-- 挽救封存（失败 Run 的补丁）的 authority 接线没有独立 e2e：封存语义与
-  跨重启存活各有单测（`patch.test.ts` / `persistence.test.ts`），接线本身
-  靠 typecheck；TIMED_OUT 路径明确不封存（终态先于封存被写下）。
+- 交叉审核收敛闭环（2 审核 + 1 整改）：收敛语义 20 条单测钉终止条件，
+  authority 真实接线由 `authority.e2e.test.ts` 覆盖（阻断发现 → 实现方整改 →
+  真重验 → 真重封存 → 第二轮通过，两次 PATCH_SEALED digest 不同）。
+  **真实双模型下整改的质量**（改得对不对）仍只能真跑才知道 ——
+  e2e 的模型是 HTTP 层脚本，钉的是平台语义，不是模型判断力。
+- 挽救封存的 TIMED_OUT 路径明确不做（终态先于封存被写下），记录在案。
 - 一切 P1：Skill、多表面、Continuation、资源/热治理都没做。
 - 打包只做到「能双击运行的未签名 dmg」：没有签名、没有公证、没有自动更新，
   也没有 Intel 机器上的实机验证。见下面「打包」。

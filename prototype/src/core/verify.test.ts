@@ -1,7 +1,45 @@
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/*
+ * 测试绝不碰真实数据根（~/Library/Application Support/RepoPilotPrototype）：
+ * 并行的测试文件共享真根会互相踩（retention 的清扫会删掉别人的快照 ——
+ * 528 全绿的套件曾因此随机红 3-4 条），而且会在用户机器上留垃圾，
+ * 违反「自检和测试不能留下持久化改动」。vi.mock 提升到 import 之前，
+ * 本文件模块图里的 paths 全部指向进程私有临时目录。
+ */
+vi.mock('./paths', async () => {
+  const { mkdtempSync, mkdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join: j } = await import('node:path');
+  const root = mkdtempSync(j(tmpdir(), 'repopilot-test-data-'));
+  const PATHS = {
+    root,
+    projects: j(root, 'projects.json'),
+    runs: j(root, 'runs'),
+    snapshots: j(root, 'snapshots'),
+    workspaces: j(root, 'workspaces'),
+    artifacts: j(root, 'artifacts'),
+    egressLog: j(root, 'egress.jsonl'),
+  } as const;
+  const ensure = () => {
+    for (const d of [PATHS.root, PATHS.runs, PATHS.snapshots, PATHS.workspaces, PATHS.artifacts]) {
+      mkdirSync(d, { recursive: true });
+    }
+  };
+  ensure();
+  return {
+    DATA_ROOT: root,
+    PATHS,
+    ensureDataRoot: ensure,
+    runDir: (id: string) => j(PATHS.runs, id),
+    workspaceDir: (id: string) => j(PATHS.workspaces, id),
+    snapshotDir: (id: string) => j(PATHS.snapshots, id),
+  };
+});
+
 import type {
   CommandDefinition,
   CommandOutcome,
