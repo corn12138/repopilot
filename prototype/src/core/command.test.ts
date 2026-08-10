@@ -1,10 +1,10 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { getEventListeners } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { CommandDefinition, CommandOutcome } from '@shared/domain';
-import { buildChildEnv, runCommand } from './command';
+import { buildChildEnv, resolveBinary, runCommand } from './command';
 import { PREVIEW_MAX_BYTES } from './tools';
 
 /**
@@ -472,6 +472,79 @@ describe('buildChildEnv 白名单', () => {
   it('返回的 env 是 null 原型对象：constructor/toString 这类 key 不会命中原型', () => {
     const { env } = buildChildEnv({ PATH: '/usr/bin' });
     expect(Object.getPrototypeOf(env)).toBeNull();
+  });
+});
+
+/*
+ * 打包之后才暴露的一类失败：从 Finder 启动的 .app 继承 launchd 的 PATH
+ * （不含 nvm / Homebrew），于是 npm / node 找不到，每条验证命令都 SPAWN_ERROR，
+ * 而环境自检当时只查 git（/usr/bin/git 是系统 shim，永远绿）——
+ * 「自检全绿 + 每个任务都失败」。这组测试守的是"缺了要能被看见"。
+ */
+describe('resolveBinary：按子进程真正拿到的 PATH 解析可执行文件', () => {
+  let binDir: string;
+
+  beforeEach(() => {
+    binDir = mkdtempSync(join(tmpdir(), 'repopilot-bin-'));
+  });
+  afterEach(() => {
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  const putExecutable = (name: string): string => {
+    const p = join(binDir, name);
+    writeFileSync(p, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    return p;
+  };
+
+  it('PATH 里存在且可执行 → 返回绝对路径', () => {
+    const p = putExecutable('faketool');
+    expect(resolveBinary('faketool', { PATH: binDir })).toBe(p);
+  });
+
+  it('不在 PATH 里 → null，而不是抛错或返回名字本身', () => {
+    putExecutable('faketool');
+    expect(resolveBinary('faketool', { PATH: '/nonexistent-dir' })).toBeNull();
+  });
+
+  it('存在但没有执行位 → 视为找不到（否则 spawn 会以 EACCES 失败）', () => {
+    writeFileSync(join(binDir, 'noexec'), '#!/bin/sh\n', { mode: 0o644 });
+    expect(resolveBinary('noexec', { PATH: binDir })).toBeNull();
+  });
+
+  it('同名目录不能冒充可执行文件', () => {
+    mkdirSync(join(binDir, 'adir'), { recursive: true });
+    expect(resolveBinary('adir', { PATH: binDir })).toBeNull();
+  });
+
+  it('PATH 缺失或为空 → null，不去查当前工作目录', () => {
+    putExecutable('faketool');
+    expect(resolveBinary('faketool', {})).toBeNull();
+    expect(resolveBinary('faketool', { PATH: '' })).toBeNull();
+  });
+
+  it('按 PATH 顺序取第一个命中，不是最后一个', () => {
+    const second = mkdtempSync(join(tmpdir(), 'repopilot-bin2-'));
+    try {
+      const first = putExecutable('dup');
+      writeFileSync(join(second, 'dup'), '#!/bin/sh\n', { mode: 0o755 });
+      expect(resolveBinary('dup', { PATH: `${binDir}:${second}` })).toBe(first);
+    } finally {
+      rmSync(second, { recursive: true, force: true });
+    }
+  });
+
+  it('带路径分隔符时当作路径本身，不去查 PATH（与 execvp 一致）', () => {
+    const p = putExecutable('faketool');
+    expect(resolveBinary(p, { PATH: '/nonexistent-dir' })).toBe(p);
+    expect(resolveBinary('./faketool', { PATH: binDir })).toBeNull();
+  });
+
+  it('复现打包场景：GUI 的 PATH 下 npm 找不到，而 /usr/bin/git 仍然找得到', () => {
+    const guiPath = '/usr/bin:/bin:/usr/sbin:/sbin';
+    expect(resolveBinary('npm', { PATH: guiPath })).toBeNull();
+    // 这条正是旧 doctor 唯一查的东西 —— 它绿着，所以缺 npm 完全看不出来
+    expect(resolveBinary('git', { PATH: guiPath })).toBe('/usr/bin/git');
   });
 });
 

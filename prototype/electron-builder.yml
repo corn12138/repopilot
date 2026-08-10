@@ -1,0 +1,67 @@
+# RepoPilot 原型的 macOS 打包配置。
+#
+# 定位（别越读）：这只是把可丢弃 spike 装进一个能双击的 .app，方便离开 `pnpm dev`
+# 做真机试用。**不是** ADR 017 的发行方案决议 —— 那份 ADR 现在还是
+# `Open / Decision Matrix and Evidence Required`，Developer ID 与 Mac App Store
+# 谁胜出没有定，签名/公证/更新/防降级/卸载的真实包证据按 ADR 排期在 G5。
+# 所以这里刻意只做「本地未签名 dmg」，不加签名、不加公证、不加自动更新：
+# 那三样一旦接进来，就等于替一个 Open 的决策提前落子。
+#
+# 见 docs/adr/017-macos-local-topology-distribution-resource-policy.md
+
+appId: dev.repopilot.prototype
+productName: RepoPilot Prototype
+copyright: RepoPilot prototype — disposable spike
+
+directories:
+  output: dist
+  buildResources: build
+
+# electron-vite 的产物就是全部运行时代码；源码、fixture、测试都不进包。
+# fixtures/ 尤其不能进：它自带 node_modules，且只有 selftest 用得到。
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+
+# Core 跑在 utilityProcess 里，入口必须是磁盘上的真实文件路径 ——
+# asar 内的路径喂给 utilityProcess.fork 会拿不到文件。把它解包出去。
+asar: true
+asarUnpack:
+  - out/main/core.js
+
+mac:
+  category: public.app-category.developer-tools
+  # 只默认构建本机验证过的 arm64。Intel 包用 `pnpm dist:mac:x64` 单独出 ——
+  # 它要另外下一份 x64 Electron，国内网络经常中断（`The server aborted pending
+  # request`），需要 ELECTRON_MIRROR。默认目标不该是一条会失败的命令。
+  target:
+    - target: dmg
+      arch:
+        - arm64
+  # ad-hoc 签名（"-"），不是 Developer ID。
+  #
+  # 这里**不能**写 identity: null —— 那是"完全跳过签名"，结果是 app 保留
+  # Electron 二进制自带的 linker-signed 签名（Identifier=Electron、
+  # Sealed Resources=none），我们塞进去的 app.asar 根本没被封进签名。
+  # `spctl -a` 会直接判 "code has no resources but signature indicates they
+  # must be present"。ad-hoc 会重新封一遍，本机自洽。
+  #
+  # 仍然不是分发方案：ad-hoc 没有 Team ID、不能公证，别人下载后照样打不开。
+  # Developer ID / App Store 的取舍属于 ADR 017，不在这里落子。
+  identity: '-'
+  # 不开 Hardened Runtime：它要配套 entitlement 最小集，而那正是 ADR 017
+  # 要在 G0 冻结的内容之一，顺手定了就等于替它做决定。
+  hardenedRuntime: false
+
+dmg:
+  title: ${productName}
+  # 只是把 .app 拖进 Applications 的常规布局，不做花哨背景图
+  contents:
+    - x: 130
+      y: 220
+      type: file
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications

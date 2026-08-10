@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 44 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
+`pnpm test` — 473 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
 
 | 断言 | 证据位置 |
 |---|---|
@@ -46,7 +46,12 @@
 - 隔离强度：`utilityProcess` + 子进程**不是**容器级沙箱。`node_modules` 目前是宿主的 symlink，构建脚本以你的用户权限运行。这是原型的显式残余风险，写在 `workspace.ts:linkDependencies` 的注释里。
 - 持久化：Run 事件是 JSONL，不是 SQLite WAL；没有加密、没有保留期、没有级联清理。
 - 崩溃恢复：事件日志能重放，但 Core 重启后不会自动恢复进行中的 Run。
-- 一切 P1：Skill、CrossReview、多表面、Continuation、资源/热治理都没做。
+- 交叉审核只有**单轮**：审完就交回人工。PRD 允许的「最多 2 轮审核 + 1 次整改」
+  里的自动整改**没有接线**，`remediations` 恒为 0（不虚报）。多轮收敛、
+  `NO_PROGRESS` / `NO_DELTA` 早停一条都没测，因为多轮本身还没实现。
+- 一切 P1：Skill、多表面、Continuation、资源/热治理都没做。
+- 打包只做到「能双击运行的未签名 dmg」：没有签名、没有公证、没有自动更新，
+  也没有 Intel 机器上的实机验证。见下面「打包」。
 
 ## 界面
 
@@ -191,6 +196,75 @@ base URL 存的是**完整地址含版本路径** —— 智谱是 `/api/paas/v4
 ```bash
 pnpm test
 ```
+
+## 打包（macOS，未签名 dmg）
+
+```bash
+pnpm dist:mac
+```
+
+产物在 `dist/`：`RepoPilot Prototype-<version>-arm64.dmg`（约 95MB）。
+
+Intel 包要单独出，因为它得再下一份 x64 Electron，国内网络经常中断
+（`The server aborted pending request`）：
+
+```bash
+ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ pnpm dist:mac:x64
+```
+
+**x64 在本机没有构建成功过，更没有实机验证** —— 上面那条命令是推断出来的走法，
+不是验证过的结论。默认目标只留 arm64，是因为默认命令不该是一条会失败的命令。
+
+**这不是发行方案。** ADR 017 现在还是 `Open / Decision Matrix and Evidence Required` ——
+Developer ID 直接分发和 Mac App Store 谁胜出没有定，签名、公证、Hardened Runtime、
+最小 entitlement、更新、防降级、卸载的真实包证据按那份 ADR 排在 G5。
+所以这里刻意**只**做未签名 dmg：接进签名或自动更新，等于替一个 Open 的决策提前落子。
+配置里对应的取舍逐条写在 `electron-builder.yml` 的注释里。
+
+签名只到 **ad-hoc**（`identity: '-'`），不是 Developer ID：
+
+```
+Identifier=dev.repopilot.prototype   Signature=adhoc   TeamIdentifier=not set
+Sealed Resources version=2 rules=13 files=11
+codesign --verify --deep --strict → 通过
+spctl -a                          → rejected
+```
+
+ad-hoc 保证的是**本机自洽**（资源真的被封进签名），不构成任何分发承诺 ——
+`spctl` 照样拒绝，别人下载这个 dmg 打不开。
+
+> 踩过的坑：一开始写的是 `identity: null`。那不是"ad-hoc 签名"，是**完全跳过签名**，
+> 于是 app 保留 Electron 二进制自带的 linker-signed 签名 —— `Identifier=Electron`、
+> `Sealed Resources=none`，我们塞进去的 `app.asar` 压根没被封进签名，
+> `spctl` 报的是 `code has no resources but signature indicates they must be present`。
+> 「构建成功 + 产物损坏」，和上面那条 PATH 是同一类问题：得真去验，不能看构建退出码。
+
+### 打包之后才暴露的一件事：GUI 应用的 PATH 不是你的 PATH
+
+从 Finder / Dock 启动的 .app 继承的是 **launchd 的 PATH**，不是登录 shell 的。
+本机 `launchctl getenv PATH` 为空，也就是系统默认的 `/usr/bin:/bin:/usr/sbin:/sbin`：
+
+| | 终端里 | 双击 .app |
+|---|---|---|
+| `git` | `/opt/homebrew/bin/git` | `/usr/bin/git`（Xcode CLT shim，**还在**） |
+| `node` / `npm` / `npx` | nvm 目录下 | **找不到** |
+| `pnpm` | `/opt/homebrew/bin/pnpm` | **找不到** |
+
+于是每条验证命令都会以 `SPAWN_ERROR` 收场 —— 而环境自检当时只查 `git`，
+`/usr/bin/git` 永远在，自检照样全绿。**「自检全绿 + 每个任务都失败」**
+正是这个项目最不能接受的那类沉默，所以补了一条 `toolchain` 检查：
+它在**子进程真正会拿到的那份 PATH**（`buildChildEnv`）里逐个解析
+`node / npm / npx / pnpm / yarn`，缺了就 `BLOCKED` 并给出修复办法。
+负向断言在 `command.test.ts` 的 `resolveBinary` 一组里，包括直接复现
+「GUI PATH 下 npm 找不到、git 还找得到」这一条。
+
+绕开办法二选一：从终端启动，或者
+
+```bash
+sudo launchctl config user path "$PATH"
+```
+
+（后者要重启才生效，且是全局改动 —— 原型没有替你做这个决定。）
 
 ## 与文档的对应关系
 

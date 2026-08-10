@@ -11,6 +11,7 @@ import {
   type UtilityProcess,
 } from 'electron';
 import * as credentials from './credentials';
+import type { DoctorCheck } from '@shared/domain';
 import {
   IPC_CHANNEL,
   PROTOCOL_VERSION,
@@ -399,11 +400,24 @@ async function selfTest(): Promise<void> {
   let failures = 0;
   for (const method of ['doctor.run', 'model.listProfiles', 'project.list', 'run.list']) {
     const result = await callCore(method, {});
-    if (result.ok) {
-      console.log(`[selftest] PASS ${method} → ${JSON.stringify(result.data).slice(0, 220)}`);
-    } else {
+    if (!result.ok) {
       console.error(`[selftest] FAIL ${method} → ${JSON.stringify(result.error)}`);
       failures += 1;
+      continue;
+    }
+    if (method === 'doctor.run') {
+      // 逐条打印而不是截断到 220 字符：自检报告被截掉正好是这里最不该发生的事。
+      // 打包后「工具链缺失」这条排在后面，截断版本里根本看不见它。
+      const { checks } = result.data as { checks: DoctorCheck[] };
+      console.log(`[selftest] PASS doctor.run → ${checks.length} 项`);
+      for (const c of checks) {
+        console.log(
+          `[selftest]   ${c.status === 'READY' ? '✓' : '✗'} ${c.checkId}(${c.status}) ${c.detail}` +
+            `${c.remediation ? ` … ${c.remediation}` : ''}`,
+        );
+      }
+    } else {
+      console.log(`[selftest] PASS ${method} → ${JSON.stringify(result.data).slice(0, 220)}`);
     }
   }
 

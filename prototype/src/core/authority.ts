@@ -42,6 +42,7 @@ import {
   resolveProfile,
 } from './repo';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { buildChildEnv, resolveBinary } from './command';
 import { EventStore, readJson, writeJsonAtomic } from './store';
 import {
   RUN_STATE_SCHEMA_VERSION,
@@ -605,6 +606,38 @@ export class RunAuthority {
         status: 'BLOCKED',
         detail: '未找到 git 可执行文件',
         remediation: '安装 Xcode Command Line Tools: xcode-select --install',
+      });
+    }
+
+    /*
+     * 验证命令用的工具链。
+     *
+     * 这条检查是打包之后才补的：从 Finder 启动的 .app 拿到的是 launchd 的 PATH，
+     * 不是登录 shell 的。`/usr/bin/git` 是系统 shim 所以上面那条一直绿，
+     * 但 nvm / Homebrew 装的 node、npm、pnpm 全都不在 GUI 的 PATH 里，
+     * 于是每条验证命令都以 SPAWN_ERROR 收场，而自检看上去毫无问题。
+     * 检查的是**子进程真正会拿到的那份 PATH**（buildChildEnv），不是 Core 自己的。
+     */
+    {
+      const childEnv = buildChildEnv().env;
+      const found: string[] = [];
+      const missing: string[] = [];
+      for (const bin of ['node', 'npm', 'npx', 'pnpm', 'yarn']) {
+        (resolveBinary(bin, childEnv) ? found : missing).push(bin);
+      }
+      // node + 至少一个包管理器才算能跑 `<runner> run build` / `npx tsc`
+      const runnable = found.includes('node') && found.some((b) => b !== 'node');
+      checks.push({
+        checkId: 'toolchain',
+        label: '验证命令工具链',
+        status: runnable ? 'READY' : 'BLOCKED',
+        detail: runnable
+          ? `可用: ${found.join(' / ')}${missing.length ? `（缺 ${missing.join(' / ')}）` : ''}`
+          : `在验证命令的 PATH 里找不到 ${missing.join(' / ')}`,
+        remediation: runnable
+          ? null
+          : '从 Finder 启动的应用继承的是 launchd 的 PATH，不含 nvm / Homebrew。' +
+            '改从终端启动，或执行 `sudo launchctl config user path "$PATH"` 后重启。',
       });
     }
 

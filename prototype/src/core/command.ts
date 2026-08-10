@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import { accessSync, constants, statSync } from 'node:fs';
+import { delimiter, isAbsolute, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { CommandDefinition, CommandOutcome } from '@shared/domain';
 import { PREVIEW_MAX_BYTES } from './tools';
@@ -143,6 +145,43 @@ export function buildChildEnv(source: NodeJS.ProcessEnv = process.env): {
   env.NODE_ENV = source.NODE_ENV ?? 'development';
 
   return { env, droppedKeys: dropped.sort() };
+}
+
+/**
+ * 在**子进程真正会拿到的那份 PATH** 里解析一个可执行文件，找不到返回 null。
+ *
+ * 为什么要自己走一遍而不是 spawn 出去问：这个函数的调用点是环境自检，
+ * 自检不该产生副作用，也不该在缺失时把 ENOENT 当成"检查通过"。
+ *
+ * 存在的理由是打包之后才暴露的一件事：从 Finder / Dock 启动的 .app 继承的是
+ * launchd 的 PATH（本机 `launchctl getenv PATH` 为空，即系统默认
+ * `/usr/bin:/bin:/usr/sbin:/sbin`），而不是登录 shell 的 PATH。
+ * nvm / Homebrew / volta 装的 node、npm、pnpm 全都不在里面 ——
+ * 于是 `npm run build` 会以 SPAWN_ERROR 失败，而 doctor 里原来只查 git
+ * （`/usr/bin/git` 是 Xcode CLT 的 shim，一直找得到），自检照样全绿。
+ * 「看起来健康、每个任务都失败」正是本项目最不能接受的那类沉默。
+ */
+export function resolveBinary(bin: string, env: NodeJS.ProcessEnv = buildChildEnv().env): string | null {
+  const executable = (p: string): boolean => {
+    try {
+      if (!statSync(p).isFile()) return false;
+      accessSync(p, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // 带路径分隔符的当作路径本身，不查 PATH —— 与 execvp 的行为一致
+  if (bin.includes('/') || isAbsolute(bin)) return executable(bin) ? bin : null;
+
+  const pathValue = env.PATH ?? '';
+  for (const dir of pathValue.split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, bin);
+    if (executable(candidate)) return candidate;
+  }
+  return null;
 }
 
 /**
