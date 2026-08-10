@@ -1418,7 +1418,10 @@ export class RunAuthority {
    * 以及 toolCall/patch 引用了哪些 artifact。让清理器反向依赖 authority 会绕成环。
    */
   private liveReferences(): LiveReferences {
-    const runs = new Map<string, { terminal: boolean; terminalAt: number | null; updatedAt: number }>();
+    const runs = new Map<
+      string,
+      { terminal: boolean; terminalAt: number | null; updatedAt: number; snapshotId: string | null }
+    >();
     const snapshots = new Set<string>();
     const artifacts = new Set<string>();
 
@@ -1428,6 +1431,8 @@ export class RunAuthority {
         terminal,
         terminalAt: terminal ? Date.parse(record.view.updatedAt) : null,
         updatedAt: Date.parse(record.view.updatedAt),
+        // 供清理器扣减「本轮刚被删掉证据的 Run」所独占的快照
+        snapshotId: record.snapshot?.snapshotId ?? null,
       });
       if (record.snapshot?.snapshotId) snapshots.add(record.snapshot.snapshotId);
       for (const tc of record.toolCalls.values()) {

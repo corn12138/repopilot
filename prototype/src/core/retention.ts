@@ -67,8 +67,16 @@ export interface PurgeSummary {
 
 /** 清理时需要知道哪些东西还活着 —— 由 Core 提供，避免 retention 反向依赖 authority */
 export interface LiveReferences {
-  /** runId → 该 Run 是否处于终态，以及终态时间 */
-  readonly runs: ReadonlyMap<string, { terminal: boolean; terminalAt: number | null; updatedAt: number }>;
+  /**
+   * runId → 该 Run 的终态信息与它引用的快照。
+   *
+   * snapshotId 是必要的：第 3 步要扣掉「刚在第 2 步被删掉证据的那些 Run」所独占的快照，
+   * 否则它们要等下一轮（6 小时后）才回收 —— 而那时它们已经没有任何引用者了。
+   */
+  readonly runs: ReadonlyMap<
+    string,
+    { terminal: boolean; terminalAt: number | null; updatedAt: number; snapshotId: string | null }
+  >;
   /** 仍被引用的 snapshotId */
   readonly snapshots: ReadonlySet<string>;
   /** 仍被引用的 artifact id（来自 toolCall.artifactRef、patch 文件名等） */
@@ -187,8 +195,25 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
     if (r.outcome === 'DELETED') purgedRuns.add(runId);
   }
 
-  // ---- 3. 快照：引用计数归零（要扣掉刚删掉的那些 Run） ----
+  // ---- 3. 快照：引用计数归零，且要扣掉第 2 步刚删掉证据的那些 Run ----
+  // refs 是 sweep 开始前算好的，里面还算着刚在第 2 步被删掉证据的 Run。
+  // 不扣的话，只被它们引用的快照本轮判 KEPT_REFERENCED，要等下一轮（6 小时后）
+  // 才回收 —— 而那时它们已经没有任何引用者了。
+  // 只做**扣减**、不重算：refs.snapshots 里可能有不来自 refs.runs 的引用来源，
+  // 重算会把那些误删。
   const liveSnapshots = new Set(refs.snapshots);
+  if (purgedRuns.size > 0) {
+    const stillReferenced = new Set<string>();
+    for (const [runId, info] of refs.runs) {
+      if (purgedRuns.has(runId)) continue;
+      if (info.snapshotId) stillReferenced.add(info.snapshotId);
+    }
+    for (const runId of purgedRuns) {
+      const sid = refs.runs.get(runId)?.snapshotId;
+      // 只有「没有任何存活 Run 还引用它」时才摘掉
+      if (sid && !stillReferenced.has(sid)) liveSnapshots.delete(sid);
+    }
+  }
   for (const snapshotId of listDirs(PATHS.snapshots)) {
     if (!budgetLeft()) break;
     scanned += 1;

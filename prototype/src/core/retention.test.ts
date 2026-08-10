@@ -62,7 +62,7 @@ function mkArtifact(id: string): string {
 }
 
 function refs(
-  runs: Record<string, { terminal: boolean; ageDays: number }>,
+  runs: Record<string, { terminal: boolean; ageDays: number; snapshotId?: string }>,
   snapshots: string[] = [],
   artifacts: string[] = [],
 ): LiveReferences {
@@ -74,6 +74,7 @@ function refs(
           terminal: r.terminal,
           terminalAt: r.terminal ? NOW - r.ageDays * DAY : null,
           updatedAt: NOW - r.ageDays * DAY,
+          snapshotId: r.snapshotId ?? null,
         },
       ]),
     ),
@@ -195,6 +196,52 @@ describe('快照与 artifact：引用计数', () => {
       'DELETED',
     );
     expect(existsSync(snapshotDir(snapId))).toBe(false);
+  });
+
+  it('本轮刚被删掉证据的 Run，其独占快照同一轮就回收（不用等下一轮）', () => {
+    // 之前 purgedRuns 是只写不读的死变量，注释写着"要扣掉刚删掉的那些 Run"却没扣，
+    // 于是这个快照要等 6 小时后的下一轮才回收 —— 而那时它已经没有任何引用者了。
+    const snapId = mkSnapshot(newId('snap'));
+    const oldRun = mkRun(newId('run'));
+    const s = sweep(
+      refs({ [oldRun]: { terminal: true, ageDays: 400, snapshotId: snapId } }, [snapId]),
+      POLICY,
+      NOW,
+    );
+
+    // 前提：证据确实在本轮被删了，否则下面的断言什么都没验证
+    expect(s.items.find((i) => i.domain === 'RUN_EVIDENCE' && i.target === oldRun)!.outcome).toBe(
+      'DELETED',
+    );
+    expect(s.items.find((i) => i.domain === 'SNAPSHOT' && i.target === snapId)!.outcome).toBe(
+      'DELETED',
+    );
+    expect(existsSync(snapshotDir(snapId))).toBe(false);
+  });
+
+  it('快照还被别的存活 Run 引用时，即使一个引用者被清掉也不能删', () => {
+    const snapId = mkSnapshot(newId('snap'));
+    const oldRun = mkRun(newId('run'));
+    const liveRun = mkRun(newId('run'));
+    const s = sweep(
+      refs(
+        {
+          [oldRun]: { terminal: true, ageDays: 400, snapshotId: snapId },
+          [liveRun]: { terminal: false, ageDays: 0, snapshotId: snapId },
+        },
+        [snapId],
+      ),
+      POLICY,
+      NOW,
+    );
+
+    expect(s.items.find((i) => i.domain === 'RUN_EVIDENCE' && i.target === oldRun)!.outcome).toBe(
+      'DELETED',
+    );
+    expect(s.items.find((i) => i.domain === 'SNAPSHOT' && i.target === snapId)!.outcome).toBe(
+      'KEPT_REFERENCED',
+    );
+    expect(existsSync(snapshotDir(snapId))).toBe(true);
   });
 
   it('被工具调用引用的 artifact 不删，孤儿删', () => {

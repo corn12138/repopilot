@@ -476,7 +476,9 @@ export class PlanningFailed extends Error {}
  *
  * 因为 Anthropic 要求 role 严格交替（连续两条 user 返回
  * `roles must alternate between "user" and "assistant"`，同样是 400），
- * 而 OpenAI 兼容端对此宽容 —— 只在一家上炸的错误最容易漏。
+ * 而在 OpenAI 兼容端这个坏序列压根不成立 —— toWireMessages 按块类型拆，
+ * 纯 tool_result 的那条会变成 role:'tool'，所以那边看到的是合法的
+ * assistant → tool → user。只在一家上炸的错误最容易漏。
  *
  * 这个坑是修孤儿 tool_use 时自己造出来的：规划期提交计划后先回填 tool_result（user），
  * 紧接着 runAgent 又 push 审批通知（user）。合并对两家都合法：
@@ -564,15 +566,12 @@ export async function runReviewPass(
     if (uses.length === 0) {
       // 只回了文本没提交结论 —— 要求它用 submit_review
       conversation.push({ role: 'assistant', content: response.content });
-      conversation.push({
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: '请调用 submit_review 工具提交结构化审核结论（verdict + findings）。纯文字不计入审核记录。',
-          },
-        ],
-      });
+      pushUser(conversation, [
+        {
+          type: 'text',
+          text: '请调用 submit_review 工具提交结构化审核结论（verdict + findings）。纯文字不计入审核记录。',
+        },
+      ]);
       continue;
     }
 

@@ -20,7 +20,7 @@ import {
   type ModelInvoker,
 } from './agent';
 import type { ContentBlock, ModelResponse } from './model/types';
-import { findOrphanToolUse } from './model/types';
+import { findWireViolation } from './model/types';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { resolveManaged, type MaterializedWorkspace } from './workspace';
 
@@ -109,13 +109,13 @@ function toolUse(name: string, input: unknown): ModelResponse {
   };
 }
 
-/** 按脚本回应的审核方替身；同时用 findOrphanToolUse 守住消息序列合法性 */
+/** 按脚本回应的审核方替身；同时用 findWireViolation 守住消息序列合法性（孤儿 tool_use + role 交替）*/
 class ScriptedReviewer implements ModelInvoker {
   turn = 0;
   constructor(private readonly script: (turn: number) => ModelResponse) {}
   async invoke(input: Parameters<ModelInvoker['invoke']>[0]) {
     this.turn += 1;
-    const orphan = findOrphanToolUse(input.request.messages);
+    const orphan = findWireViolation(input.request.messages);
     if (orphan) throw new Error(`审核方收到非法消息序列：${orphan}`);
     const response = this.script(this.turn);
     return {
@@ -327,7 +327,7 @@ describe('runReviewPass', () => {
     // 每轮只回文本，从不 submit_review
     const gateway: ModelInvoker = {
       async invoke(input) {
-        const orphan = findOrphanToolUse(input.request.messages);
+        const orphan = findWireViolation(input.request.messages);
         if (orphan) throw new Error(orphan);
         return {
           invocationId: 'inv',
