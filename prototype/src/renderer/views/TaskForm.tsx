@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useMemo, useRef, useState, type ReactNode } from 'react';
 import type {
   ModelConnectionProfile,
   ProjectRef,
@@ -189,13 +189,76 @@ export function Composer({
       </div>
 
       <div className="composer-bar">
-        <button
-          type="button"
-          className={`composer-adv ${advancedOpen ? 'open' : ''}`}
-          onClick={() => setAdvancedOpen((v) => !v)}
-        >
-          ⚙ 高级{advancedOpen ? ' ▾' : ''}
-        </button>
+        <div className="composer-adv-wrap">
+          <button
+            type="button"
+            className={`composer-adv ${advancedOpen ? 'open' : ''}`}
+            onClick={() => setAdvancedOpen((v) => !v)}
+          >
+            ⚙ 任务选项 {advancedOpen ? '▾' : '▸'}
+          </button>
+          {advancedOpen && (
+            <AdvancedPopover onClose={() => setAdvancedOpen(false)}>
+              <div className="field">
+                <label>任务类型</label>
+                <select value={taskClass} onChange={(e) => setTaskClass(e.target.value as TaskClass)}>
+                  {profile.supportedTaskClasses.map((c) => (
+                    <option key={c} value={c}>
+                      {TASK_CLASS_LABEL[c]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {useCustom && (
+                <div className="field">
+                  <label>自定义验证命令</label>
+                  <input
+                    value={customCommand}
+                    placeholder="例如：pnpm --filter web build（按空格拆成 argv，不经过 shell）"
+                    onChange={(e) => setCustomCommand(e.target.value)}
+                  />
+                </div>
+              )}
+
+              <div className="field">
+                <label>允许修改的路径</label>
+                <input value={allowedPaths} onChange={(e) => setAllowedPaths(e.target.value)} />
+                <div className="help">
+                  逗号或换行分隔。受保护路径（{profile.protectedPaths.slice(0, 3).join(', ')}…）无论如何都禁止修改。
+                </div>
+              </div>
+
+              <div className="field">
+                <label>验收条件（每行一条，可留空）</label>
+                <textarea
+                  value={acceptance}
+                  placeholder={'不引入新的类型错误\n不修改测试文件'}
+                  onChange={(e) => setAcceptance(e.target.value)}
+                  style={{ minHeight: 48 }}
+                />
+              </div>
+
+              <div className="field" style={{ marginBottom: 4 }}>
+                <label>交叉审核：第二个模型只读审补丁</label>
+                <select value={reviewerProfileId} onChange={(e) => setReviewerProfileId(e.target.value)}>
+                  <option value="">不做交叉审核</option>
+                  {enabledModels
+                    .filter((m) => m.profileId !== effectiveModelId)
+                    .map((m) => (
+                      <option key={m.profileId} value={m.profileId}>
+                        {m.label} · {m.modelId}
+                      </option>
+                    ))}
+                </select>
+                <div className="help">
+                  审核方"通过"<b>不等于</b>验证通过，也不代表可以接受 —— 是否接受仍由你决定。
+                  异构（不同供应商）的第二意见价值更高。有阻断发现时会自动整改一次并重验（上限 2 审 1 改）。
+                </div>
+              </div>
+            </AdvancedPopover>
+          )}
+        </div>
         {reviewerProfileId && (
           <span className="composer-hint" title="补丁封存后由第二个模型只读审核">
             交叉审核已开
@@ -220,67 +283,31 @@ export function Composer({
         </button>
       </div>
 
-      {advancedOpen && (
-        <div className="composer-advanced">
-          <div className="field">
-            <label>任务类型</label>
-            <select value={taskClass} onChange={(e) => setTaskClass(e.target.value as TaskClass)}>
-              {profile.supportedTaskClasses.map((c) => (
-                <option key={c} value={c}>
-                  {TASK_CLASS_LABEL[c]}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {useCustom && (
-            <div className="field">
-              <label>自定义验证命令</label>
-              <input
-                value={customCommand}
-                placeholder="例如：pnpm --filter web build（按空格拆成 argv，不经过 shell）"
-                onChange={(e) => setCustomCommand(e.target.value)}
-              />
-            </div>
-          )}
-
-          <div className="field">
-            <label>允许修改的路径</label>
-            <input value={allowedPaths} onChange={(e) => setAllowedPaths(e.target.value)} />
-            <div className="help">
-              逗号或换行分隔。受保护路径（{profile.protectedPaths.slice(0, 3).join(', ')}…）无论如何都禁止修改。
-            </div>
-          </div>
-
-          <div className="field">
-            <label>验收条件（每行一条，可留空）</label>
-            <textarea
-              value={acceptance}
-              placeholder={'不引入新的类型错误\n不修改测试文件'}
-              onChange={(e) => setAcceptance(e.target.value)}
-              style={{ minHeight: 48 }}
-            />
-          </div>
-
-          <div className="field" style={{ marginBottom: 4 }}>
-            <label>交叉审核：第二个模型只读审补丁</label>
-            <select value={reviewerProfileId} onChange={(e) => setReviewerProfileId(e.target.value)}>
-              <option value="">不做交叉审核</option>
-              {enabledModels
-                .filter((m) => m.profileId !== effectiveModelId)
-                .map((m) => (
-                  <option key={m.profileId} value={m.profileId}>
-                    {m.label} · {m.modelId}
-                  </option>
-                ))}
-            </select>
-            <div className="help">
-              审核方"通过"<b>不等于</b>验证通过，也不代表可以接受 —— 是否接受仍由你决定。
-              异构（不同供应商）的第二意见价值更高。有阻断发现时会自动整改一次并重验（上限 2 审 1 改）。
-            </div>
-          </div>
-        </div>
-      )}
     </div>
+  );
+}
+
+/**
+ * 「任务选项」弹层：向上展开、带标题栏和关闭键、点外面也能关。
+ * 反馈原话是「打开后没有关闭的地方」和「不怎么高级」——
+ * 前者靠 ✕ / 点击外部 / 再点按钮三条路；后者改名：里面装的是
+ * 有默认值的任务配置，不是什么高级功能，名字不该端着。
+ */
+function AdvancedPopover({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  return (
+    <>
+      <div className="popover-backdrop" onClick={onClose} />
+      <div className="composer-advanced" role="dialog" aria-label="任务选项">
+        <div className="composer-advanced-head">
+          <strong>任务选项</strong>
+          <span className="composer-advanced-hint">都有能直接开跑的默认值</span>
+          <span className="spacer" />
+          <button type="button" onClick={onClose} aria-label="关闭">
+            ✕ 收起
+          </button>
+        </div>
+        {children}
+      </div>
+    </>
   );
 }
