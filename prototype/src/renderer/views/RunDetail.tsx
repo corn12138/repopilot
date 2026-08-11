@@ -172,6 +172,10 @@ export function RunDetail({
 
       {crossReview && <CrossReviewPanel record={crossReview} />}
 
+      {crossReview && (
+        <CrossReviewContinueGate run={run} record={crossReview} onError={onError} />
+      )}
+
       {patch && (
         <div id="patch-review-card">
           <PatchReview
@@ -592,6 +596,79 @@ const STOP_REASON_LABEL: Record<string, string> = {
   ERROR: '审核过程出错',
 };
 
+const CONTINUABLE_STOP_REASONS = new Set(['COUNTER_EXHAUSTED', 'NO_PROGRESS', 'NO_DELTA']);
+
+/**
+ * 循环续期的用户闸门。自动轮次每循环硬上限（2 审 1 改），
+ * 跨循环只能由这里的人手推进 —— 这就是"一写一审"互动的防死循环设计：
+ * 平台绝不自己"再试一次"，续得越多、警示越重。
+ */
+function CrossReviewContinueGate({
+  run,
+  record,
+  onError,
+}: {
+  run: RunView;
+  record: CrossReviewRecord;
+  onError: (err: unknown) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const continuations = record.userContinuations ?? 0;
+
+  const applicable =
+    run.status === 'AWAITING_PATCH_REVIEW' &&
+    !run.restored &&
+    record.stopReason !== null &&
+    CONTINUABLE_STOP_REASONS.has(record.stopReason);
+  if (!applicable) return null;
+
+  const lastRound = record.rounds[record.rounds.length - 1];
+  const lastBlocking = lastRound?.findings.filter((f) => f.blocking).length ?? 0;
+
+  const requestContinue = async () => {
+    setBusy(true);
+    try {
+      const r = await call('crossreview.continue', { runId: run.runId });
+      if (!r.accepted) onError(new Error(r.reason ?? '续期未被接受'));
+    } catch (err) {
+      onError(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card title="要再循环一轮吗" hint="写 → 审 → 改 的续期由你决定">
+      <Banner tone={continuations >= 2 ? 'err' : continuations >= 1 ? 'warn' : 'info'}>
+        {continuations >= 2 ? (
+          <>
+            <strong>已手动续期 {continuations} 次仍未收敛。</strong>
+            连续多轮"审出问题 → 改 → 再审出问题"通常说明双方在原地打转 ——
+            这正是该<b>人工接手</b>的信号：直接审查下方补丁，自己决定接受、拒绝或改需求。
+          </>
+        ) : (
+          <>
+            上一循环{lastBlocking > 0 ? `还剩 ${lastBlocking} 条阻断发现` : '未收敛'}。
+            你可以授权<b>再跑一轮</b>（最多 2 次审核 + 1 次整改，用完再回到这里），
+            也可以直接在下方审查补丁自行决定。自动轮次有硬上限，跨轮只能由你推进 ——
+            不存在会自己转下去的循环。
+          </>
+        )}
+      </Banner>
+      <div className="row" style={{ marginTop: 10 }}>
+        <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+          累计：{record.reviewerInvocations} 轮审核 · {record.remediations} 次整改
+          {continuations > 0 ? ` · 用户续期 ${continuations} 次` : ''}（计数只增不清）
+        </span>
+        <span className="spacer" />
+        <button className={continuations >= 2 ? '' : 'primary'} disabled={busy} onClick={() => void requestContinue()}>
+          {busy ? '启动中…' : '再循环一轮（2 审 1 改）'}
+        </button>
+      </div>
+    </Card>
+  );
+}
+
 function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
   const findings = record.rounds.flatMap((r) => r.findings);
   const blocking = findings.filter((f) => f.blocking).length;
@@ -601,7 +678,7 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
   return (
     <Card
       title="交叉审核（第二个模型只读）"
-      hint={`${record.reviewerInvocations} 轮审核 · ${record.remediations} 次整改 · ${findings.length} 条发现 · 阻断 ${blocking}`}
+      hint={`${record.reviewerInvocations} 轮审核 · ${record.remediations} 次整改${(record.userContinuations ?? 0) > 0 ? ` · 用户续期 ${record.userContinuations} 次` : ''} · ${findings.length} 条发现 · 阻断 ${blocking}`}
       right={
         <Badge tone={record.heterogeneous ? 'info' : 'warn'}>
           {record.heterogeneous ? '异构审核方' : '同源审核方'}

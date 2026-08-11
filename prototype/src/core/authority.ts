@@ -177,6 +177,9 @@ interface RunRecord {
   reviewer: { resolution: ModelRouteResolution; heterogeneous: boolean } | null;
   /** 交叉审核聚合记录；跑过才有 */
   crossReview: CrossReviewRecord | null;
+  /** 实现方冻结路由 + 执行起点。交叉审核续期（crossreview.continue）复用；恢复态没有 */
+  implementerResolution?: ModelRouteResolution | null;
+  executionStartedAt?: number | null;
 }
 
 /**
@@ -516,6 +519,9 @@ export class RunAuthority {
 
       case 'crossreview.get':
         return { crossReview: this.runs.get(String(payload.runId))?.crossReview ?? null };
+
+      case 'crossreview.continue':
+        return this.continueCrossReview(String(payload.runId));
 
       case 'patch.decide':
         return this.decidePatch(payload as never);
@@ -944,6 +950,9 @@ export class RunAuthority {
       return;
     }
 
+    record.implementerResolution = resolution;
+    record.executionStartedAt = startedAt;
+
     const deadline = new PausableDeadline(record.task.budget.maxWallClockMs, () => {
       if (!isTerminal(record.view.status)) {
         record.abort.abort();
@@ -1099,16 +1108,23 @@ export class RunAuthority {
     finalVerification: VerificationRun | null,
     baseline: VerificationRun | null,
     implementerResolution: ModelRouteResolution,
+    isContinuation = false,
   ): Promise<void> {
     const reviewer = record.reviewer;
     if (!reviewer) return;
 
-    this.setStatus(record, 'CROSS_REVIEWING', '第二个模型正在只读交叉审核');
+    const prior = record.crossReview;
+    this.setStatus(
+      record,
+      'CROSS_REVIEWING',
+      isContinuation ? '用户授权续期：第二个模型再次只读交叉审核' : '第二个模型正在只读交叉审核',
+    );
     const crStart = nowIso();
     this.emit(record, 'CROSS_REVIEW_STARTED', `交叉审核开始：${reviewer.resolution.modelId}`, {
       reviewer: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId },
       heterogeneous: reviewer.heterogeneous,
       limits: CROSS_REVIEW_LIMITS,
+      ...(isContinuation ? { continuation: (prior?.userContinuations ?? 0) + 1 } : {}),
     });
 
     const deps: AgentDeps = {
@@ -1212,21 +1228,25 @@ export class RunAuthority {
       }
     }
 
+    // 续期时累计而非覆盖：counter 只增不清（PRD-XAGENT-004），轮次跨循环连续编号
+    const priorRounds = prior?.rounds ?? [];
+    const renumbered = rounds.map((r, i) => ({ ...r, round: priorRounds.length + i + 1 }));
     const cr: CrossReviewRecord = {
       enabled: true,
       reviewerProfileId: reviewer.resolution.profileId,
       heterogeneous: reviewer.heterogeneous,
-      rounds,
-      reviewerInvocations: rounds.length,
-      remediations,
+      rounds: [...priorRounds, ...renumbered],
+      reviewerInvocations: (prior?.reviewerInvocations ?? 0) + rounds.length,
+      remediations: (prior?.remediations ?? 0) + remediations,
+      userContinuations: (prior?.userContinuations ?? 0) + (isContinuation ? 1 : 0),
       stopReason,
-      startedAt: crStart,
+      startedAt: prior?.startedAt ?? crStart,
       finishedAt: nowIso(),
     };
     record.crossReview = cr;
 
-    const blockingTotal = rounds.flatMap((r) => r.findings).filter((f) => f.blocking).length;
-    const findingTotal = rounds.flatMap((r) => r.findings).length;
+    const blockingTotal = cr.rounds.flatMap((r) => r.findings).filter((f) => f.blocking).length;
+    const findingTotal = cr.rounds.flatMap((r) => r.findings).length;
     this.emit(
       record,
       'CROSS_REVIEW_FINISHED',
@@ -1235,6 +1255,7 @@ export class RunAuthority {
         stopReason,
         reviewerInvocations: cr.reviewerInvocations,
         remediations: cr.remediations,
+        userContinuations: cr.userContinuations ?? 0,
         blockingTotal,
         findingTotal,
       },
@@ -1477,6 +1498,101 @@ export class RunAuthority {
   // -------------------------------------------------------------------------
   // 补丁决定 —— 唯一能进入 SUCCEEDED 的入口
   // -------------------------------------------------------------------------
+
+  /** 续期只对"上一循环没收敛"的三种收场开放；其余没有可续的东西 */
+  private static readonly CONTINUABLE_STOP_REASONS: ReadonlySet<string> = new Set([
+    'COUNTER_EXHAUSTED',
+    'NO_PROGRESS',
+    'NO_DELTA',
+  ]);
+
+  /**
+   * 用户显式授权再跑一轮交叉审核循环（2 审 + 1 改）。
+   *
+   * 防死循环的完整设计是两半：自动轮次每循环硬上限（CROSS_REVIEW_LIMITS，
+   * 结构上走不满），跨循环只能由人推进 —— 平台绝不自己"再试一次"。
+   * 每次续期落一条授权事件，累计计数只增不清；拒绝走 accepted=false + reason，
+   * 拒绝是决定，不是异常。
+   */
+  private continueCrossReview(runId: string): { run: RunView; accepted: boolean; reason: string | null } {
+    const record = this.require(runId);
+    const deny = (reason: string) => ({ run: record.view, accepted: false, reason });
+
+    if (record.view.restored || !record.workspace) {
+      return deny('该 Run 已从磁盘恢复，没有活的执行器，无法续期');
+    }
+    if (record.view.status !== 'AWAITING_PATCH_REVIEW') {
+      return deny(`当前状态 ${record.view.status} 不能续期交叉审核`);
+    }
+    if (!record.reviewer) return deny('本任务未启用交叉审核');
+    if (!record.patch) return deny('没有已封存的补丁可审');
+    const cr = record.crossReview;
+    if (!cr || !cr.stopReason) return deny('尚未完成过一轮交叉审核');
+    if (!RunAuthority.CONTINUABLE_STOP_REASONS.has(cr.stopReason)) {
+      return deny(`上一循环以 ${cr.stopReason} 收场，没有可续期的东西`);
+    }
+    const resolution = record.implementerResolution;
+    const startedAt = record.executionStartedAt;
+    if (!resolution || startedAt === undefined || startedAt === null) {
+      return deny('实现方执行上下文不可用，无法续期');
+    }
+    const remainingMs = record.task.budget.maxWallClockMs - record.view.ledger.elapsedMs;
+    if (remainingMs <= 0) return deny('任务时间预算已耗尽，无法续期');
+
+    const continuation = (cr.userContinuations ?? 0) + 1;
+    this.emit(
+      record,
+      'NOTE',
+      `用户授权继续交叉审核循环（第 ${continuation} 次续期）：再跑最多 ${CROSS_REVIEW_LIMITS.maxReviewerInvocations} 轮审核 + ${CROSS_REVIEW_LIMITS.maxRemediations} 次整改`,
+      { kind: 'CROSS_REVIEW_CONTINUATION', continuation },
+    );
+
+    const workspace = record.workspace;
+    const patch = record.patch;
+    const baseline = record.verifications.find((v) => v.phase === 'BASELINE') ?? null;
+    const finalVerification =
+      [...record.verifications].reverse().find((v) => v.phase === 'POST_MUTATION') ?? null;
+
+    const deadline = new PausableDeadline(remainingMs, () => {
+      if (!isTerminal(record.view.status)) {
+        record.abort.abort();
+        this.cleanupPendingApprovals(record);
+        this.setStatus(record, 'TIMED_OUT', '超过任务时间预算', 'TIMEOUT');
+      }
+    });
+    record.deadline = deadline;
+
+    // 与 execute 的收尾同构：循环语义全函数，出错折叠进 stopReason，终点仍是人工审查
+    void (async () => {
+      try {
+        await this.runCrossReview(
+          record,
+          workspace,
+          startedAt,
+          deadline,
+          patch,
+          finalVerification,
+          baseline,
+          resolution,
+          true,
+        );
+        if (!isTerminal(record.view.status)) {
+          this.setStatus(record, 'AWAITING_PATCH_REVIEW', '续期的交叉审核已结束，等待你审查补丁');
+        }
+      } catch (err) {
+        this.emit(record, 'NOTE', `续期交叉审核异常（补丁不受影响）：${(err as Error).message}`);
+        if (!isTerminal(record.view.status)) {
+          this.setStatus(record, 'AWAITING_PATCH_REVIEW', '续期的交叉审核异常结束，补丁仍可审查');
+        }
+      } finally {
+        deadline.clear();
+        record.deadline = null;
+      }
+    })();
+
+    // runCrossReview 的开头在 spawn 的同步段里已把状态置为 CROSS_REVIEWING
+    return { run: record.view, accepted: true, reason: null };
+  }
 
   /**
    * 失败 / 中止现场的挽救封存。

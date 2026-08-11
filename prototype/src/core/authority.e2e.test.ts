@@ -325,6 +325,14 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
       expect(decided.reason).toBeNull();
       expect(decided.run.status).toBe('SUCCEEDED');
       expect(decided.run.terminalFacts?.verificationRunId).toBe(patch.verificationRunId);
+
+      // 终态续期必须被拒 —— 拒绝是决定不是异常
+      const cont = await harness.call<{ accepted: boolean; reason: string | null }>(
+        'crossreview.continue',
+        { runId },
+      );
+      expect(cont.accepted).toBe(false);
+      expect(cont.reason).toContain('SUCCEEDED');
     },
     30_000,
   );
@@ -442,6 +450,109 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
       const { patch } = await harness.call<{ patch: PatchArtifact }>('patch.get', { runId });
       expect(patch.unifiedDiff).toContain('// reviewed');
       expect(patch.digest).toBe(sealed[1]!.payload.digest);
+
+      // REVIEWER_PASSED 之后没有可续期的东西
+      const cont = await harness.call<{ accepted: boolean; reason: string | null }>(
+        'crossreview.continue',
+        { runId },
+      );
+      expect(cont.accepted).toBe(false);
+      expect(cont.reason).toContain('REVIEWER_PASSED');
+    },
+    40_000,
+  );
+
+  it(
+    '用户闸门：COUNTER_EXHAUSTED 后由用户授权续循环，续期那轮收敛通过',
+    async () => {
+      harness.script(IMPL, [
+        () => planCall(),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('修复完成。'),
+        // ---- 循环 1 的整改 ----
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed'; // v2\n"),
+        () => oaText('整改完成。'),
+        // ---- 用户续期后循环 2 的整改 ----
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed'; // v3 documented\n"),
+        () => oaText('续期整改完成。'),
+      ]);
+      const blockingFinding = (line: number, evidence: string) => ({
+        severity: 'HIGH',
+        confidence: 0.9,
+        file: APP_FILE,
+        startLine: line,
+        endLine: line,
+        evidence,
+        blocking: true,
+      });
+      harness.script(REVIEWER, [
+        // 循环 1：两轮都有阻断，但阻断数 2→1 且指纹不同 = 有进展 → COUNTER_EXHAUSTED
+        () =>
+          oaToolCall('submit_review', {
+            verdict: 'CHANGES_REQUESTED',
+            findings: [blockingFinding(1, '缺少意图注释'), blockingFinding(1, '缺少变更说明')],
+          }),
+        () =>
+          oaToolCall('submit_review', {
+            verdict: 'CHANGES_REQUESTED',
+            findings: [blockingFinding(2, 'v2 注释仍未说明为什么')],
+          }),
+        // 循环 2（用户续期）：一条阻断 → 整改 → 通过
+        () =>
+          oaToolCall('submit_review', {
+            verdict: 'CHANGES_REQUESTED',
+            findings: [blockingFinding(3, '还差文档化说明')],
+          }),
+        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        reviewerModelProfileId: 'profile_moonshot-cn',
+      });
+      await harness.approvePlan(runId);
+      await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+
+      const first = await harness.call<{ crossReview: { stopReason: string } | null }>(
+        'crossreview.get',
+        { runId },
+      );
+      expect(first.crossReview?.stopReason).toBe('COUNTER_EXHAUSTED');
+
+      // ---- 用户闸门：显式授权再来一轮 ----
+      const cont = await harness.call<{ run: RunView; accepted: boolean; reason: string | null }>(
+        'crossreview.continue',
+        { runId },
+      );
+      expect(cont.accepted).toBe(true);
+      expect(cont.run.status).toBe('CROSS_REVIEWING'); // 响应返回时已在审
+
+      await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+      const { crossReview } = await harness.call<{
+        crossReview: {
+          stopReason: string;
+          reviewerInvocations: number;
+          remediations: number;
+          userContinuations?: number;
+          rounds: Array<{ round: number }>;
+        } | null;
+      }>('crossreview.get', { runId });
+
+      // 累计只增不清：2 循环 = 4 轮审核 + 2 次整改 + 1 次用户续期，轮次连续编号
+      expect(crossReview?.stopReason).toBe('REVIEWER_PASSED');
+      expect(crossReview?.reviewerInvocations).toBe(4);
+      expect(crossReview?.remediations).toBe(2);
+      expect(crossReview?.userContinuations).toBe(1);
+      expect(crossReview?.rounds.map((r) => r.round)).toEqual([1, 2, 3, 4]);
+
+      // 授权事件落账；终态补丁是续期整改后的那份
+      const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+      expect(events.some((e) => e.payload?.kind === 'CROSS_REVIEW_CONTINUATION')).toBe(true);
+      const { patch } = await harness.call<{ patch: PatchArtifact }>('patch.get', { runId });
+      expect(patch.unifiedDiff).toContain('v3 documented');
     },
     40_000,
   );

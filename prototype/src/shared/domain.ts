@@ -702,10 +702,18 @@ export interface CrossReviewRecord {
   /** 两条 route 是否异构（不同 provider）—— 同源审核价值有限，如实标注 */
   readonly heterogeneous: boolean;
   readonly rounds: readonly CrossReviewRound[];
-  /** 已消耗的 reviewer invocation 次数（上限 2） */
+  /** 已消耗的 reviewer invocation 次数。累计值：跨用户续期只增不清 */
   readonly reviewerInvocations: number;
-  /** 已消耗的 remediation 次数（上限 1） */
+  /** 已消耗的 remediation 次数。累计值：跨用户续期只增不清 */
   readonly remediations: number;
+  /**
+   * 用户显式授权的续期次数。防死循环的闸门：自动轮次每循环硬上限
+   * （CROSS_REVIEW_LIMITS），跨循环只能由人推进 —— 平台绝不自己"再试一次"。
+   * PRD-XAGENT-004 的「counter 不重置」指平台不得自动重置；
+   * 这里每一次续期都是一条带授权事件的用户决定，且累计数如实保留。
+   * 可选：旧记录没有此字段。
+   */
+  readonly userContinuations?: number;
   readonly stopReason: CrossReviewStopReason | null;
   readonly startedAt: Iso8601;
   readonly finishedAt: Iso8601 | null;

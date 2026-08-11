@@ -170,6 +170,7 @@ const ALLOWED_METHODS = new Set([
   'approval.decide',
   'patch.get',
   'crossreview.get',
+  'crossreview.continue',
   'patch.decide',
   'patch.export',
   'verification.list',

@@ -170,6 +170,16 @@ export interface RequestMap {
   'patch.get': { req: { runId: string }; res: { patch: PatchArtifact | null } };
   /** 交叉审核记录（第二个模型的只读发现）；没启用或没跑过为 null */
   'crossreview.get': { req: { runId: string }; res: { crossReview: CrossReviewRecord | null } };
+  /**
+   * 用户显式授权再跑一轮交叉审核循环（2 审 + 1 改）。
+   * 只在 AWAITING_PATCH_REVIEW 且上一循环以 COUNTER_EXHAUSTED / NO_PROGRESS /
+   * NO_DELTA 收场时可用；恢复态（无活执行器）与时间预算耗尽会被拒。
+   * accepted=false 时 reason 说明为什么 —— 拒绝不是异常，是决定。
+   */
+  'crossreview.continue': {
+    req: { runId: string };
+    res: { run: RunView; accepted: boolean; reason: string | null };
+  };
   'patch.decide': {
     req: {
       runId: string;
