@@ -1098,3 +1098,16 @@ ul.plain li {
   cursor: pointer;
   font-size: inherit;
 }
+
+/* 建议值行：放在多行输入框下面的可点 chips —— 比 datalist 直观（不点也看得见），
+   也不会让输入框长出下拉箭头、看着又像"只能选" */
+.suggest-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.composer-advanced textarea {
+  width: 100%;
+  resize: vertical;
+}

@@ -66,8 +66,8 @@ export function Composer({
     commandIds.includes('build') ? ['build'] : commandIds.slice(0, 1),
   );
   const [modelProfileId, setModelProfileId] = useState(enabledModels[0]?.profileId ?? '');
-  /** 空串 = 不做交叉审核。自由文本，但**精确匹配** —— 不做模糊匹配是本项目的底线 */
-  const [reviewerProfileId, setReviewerProfileId] = useState('');
+  /** 多行文本原文；空 = 不做交叉审核。解析后**精确匹配** —— 不做模糊匹配是本项目的底线 */
+  const [reviewerInput, setReviewerInput] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [customCommand, setCustomCommand] = useState('');
   const [useCustom, setUseCustom] = useState(false);
@@ -88,13 +88,19 @@ export function Composer({
     () => enabledModels.filter((m) => m.profileId !== effectiveModelId),
     [enabledModels, effectiveModelId],
   );
+  /** 逐行拆分并丢掉空行 —— 多行只是输入形态，语义上仍是"一个审核方" */
+  const reviewerLines = useMemo(
+    () => reviewerInput.split('\n').map((l) => l.trim()).filter(Boolean),
+    [reviewerInput],
+  );
+  const reviewerProfileId = reviewerLines.length === 1 ? reviewerLines[0]! : '';
   const reviewerResolved = reviewerCandidates.some((m) => m.profileId === reviewerProfileId);
 
   const canSubmit =
     goal.trim().length > 0 &&
     effectiveModelId.length > 0 &&
-    // 填了但填错不放行：静默忽略等于"我以为开了交叉审核，其实没开"
-    (reviewerProfileId === '' || reviewerResolved) &&
+    // 填了但填错 / 填了多个都不放行：静默忽略等于"我以为开了交叉审核，其实没开"
+    (reviewerLines.length === 0 || (reviewerLines.length === 1 && reviewerResolved)) &&
     !submitting;
 
   const submit = async () => {
@@ -221,22 +227,29 @@ export function Composer({
             <AdvancedPopover onClose={() => setAdvancedOpen(false)}>
               <div className="field">
                 <label>任务类型（可留空，也可自己写）</label>
-                <input
-                  list="repopilot-task-classes"
+                <textarea
                   value={taskClass}
-                  placeholder="例如：构建失败修复 / 文档站样式回归 / e2e 偶发失败"
+                  rows={2}
+                  placeholder={'例如：构建失败修复\n也可以写长一点：文档站升级 vite 后样式回归，只在生产构建复现'}
                   onChange={(e) => setTaskClass(e.target.value)}
                 />
-                <datalist id="repopilot-task-classes">
+                {/* 建议值用 chips 而不是 datalist：不点也看得见，且不会让输入框长得像下拉 */}
+                <div className="suggest-row">
                   {[...new Set([...profile.supportedTaskClasses, ...COMMON_TASK_CLASSES])].map((c) => (
-                    <option key={c} value={c}>
-                      {TASK_CLASS_HINT[c] ?? ''}
-                    </option>
+                    <button
+                      key={c}
+                      type="button"
+                      className="chip"
+                      title={TASK_CLASS_HINT[c] ?? c}
+                      onClick={() => setTaskClass(TASK_CLASS_HINT[c] ?? c)}
+                    >
+                      {TASK_CLASS_HINT[c] ?? c}
+                    </button>
                   ))}
-                </datalist>
+                </div>
                 <div className="help">
                   纯描述性元数据，不设门禁、也不进提示词 —— 写你自己的说法就行，
-                  建议里那几个只是常见写法。
+                  上面几个只是常见写法。
                 </div>
               </div>
 
@@ -275,21 +288,39 @@ export function Composer({
 
               <div className="field" style={{ marginBottom: 4 }}>
                 <label>交叉审核：第二个模型只读审补丁（可留空）</label>
-                <input
-                  list="repopilot-reviewers"
-                  value={reviewerProfileId}
-                  placeholder="留空 = 不做交叉审核；填审核方 id（下拉有建议）"
-                  onChange={(e) => setReviewerProfileId(e.target.value.trim())}
+                <textarea
+                  value={reviewerInput}
+                  rows={2}
+                  placeholder={'留空 = 不做交叉审核\n填一个审核方 id，例如 profile_anthropic（下面可点）'}
+                  onChange={(e) => setReviewerInput(e.target.value)}
                 />
-                <datalist id="repopilot-reviewers">
-                  {reviewerCandidates.map((m) => (
-                    <option key={m.profileId} value={m.profileId}>
-                      {m.label} · {m.modelId}
-                    </option>
-                  ))}
-                </datalist>
-                {reviewerProfileId && !reviewerResolved && (
-                  // 不做模糊匹配：填错就明说填错了，并列出可用的，不静默忽略
+                <div className="suggest-row">
+                  {reviewerCandidates.length === 0 ? (
+                    <span className="help" style={{ padding: 0 }}>
+                      没有可用的第二个审核方 —— 再配一个供应商的 API Key 就有了。
+                    </span>
+                  ) : (
+                    reviewerCandidates.map((m) => (
+                      <button
+                        key={m.profileId}
+                        type="button"
+                        className={`chip ${reviewerProfileId === m.profileId ? 'selected' : ''}`}
+                        title={`${m.label} · ${m.modelId}`}
+                        onClick={() => setReviewerInput(m.profileId)}
+                      >
+                        {m.label}
+                      </button>
+                    ))
+                  )}
+                </div>
+                {reviewerLines.length > 1 && (
+                  // 多行是输入形态，不是"支持多个审核方"—— 别静默只取第一行
+                  <div className="help" style={{ color: 'var(--err)' }}>
+                    目前只支持一个审核方，这里填了 {reviewerLines.length} 个。
+                  </div>
+                )}
+                {reviewerLines.length === 1 && !reviewerResolved && (
+                  // 不做模糊匹配：填错就明说，并列出可用的，不静默忽略
                   <div className="help" style={{ color: 'var(--err)' }}>
                     没有这个审核方。可用：{reviewerCandidates.map((m) => m.profileId).join('、') || '（无）'}
                   </div>
@@ -302,7 +333,7 @@ export function Composer({
             </AdvancedPopover>
           )}
         </div>
-        {reviewerProfileId && (
+        {reviewerResolved && (
           <span className="composer-hint" title="补丁封存后由第二个模型只读审核">
             交叉审核已开
           </span>
