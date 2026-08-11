@@ -124,7 +124,22 @@ export interface CommandDefinition {
   readonly source: 'DETECTED' | 'USER';
 }
 
-export type TaskClass = 'BUILD_FAILURE_FIX' | 'TEST_FAILURE_FIX' | 'TYPE_ERROR_FIX';
+/**
+ * 任务类型：**自由文本**，不是封闭枚举。
+ *
+ * 它是纯描述性元数据 —— 不设任何门禁，也不进系统提示词。用三个值把用户限死，
+ * 换不到任何东西："文档站构建挂了"、"e2e 偶发失败" 这类真实场景一个都装不下。
+ * 封闭枚举留给**平台自己判定**的东西（RunStatus、failureClass、命令 outcome）；
+ * 用户描述自己的任务，该用用户自己的话。
+ */
+export type TaskClass = string;
+
+/** 常见任务类型，仅作输入建议，不构成约束 */
+export const COMMON_TASK_CLASSES = [
+  'BUILD_FAILURE_FIX',
+  'TEST_FAILURE_FIX',
+  'TYPE_ERROR_FIX',
+] as const;
 
 // ---------------------------------------------------------------------------
 // 任务

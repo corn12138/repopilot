@@ -7,9 +7,11 @@ import type {
   RunView,
   TaskClass,
 } from '@shared/domain';
+import { COMMON_TASK_CLASSES } from '@shared/domain';
 import { call } from '../bridge';
 
-const TASK_CLASS_LABEL: Record<TaskClass, string> = {
+/** 常见值的中文说明，仅用于 datalist 的提示文案 —— 不是可选项清单 */
+const TASK_CLASS_HINT: Record<string, string> = {
   BUILD_FAILURE_FIX: '构建失败修复',
   TEST_FAILURE_FIX: '测试失败修复',
   TYPE_ERROR_FIX: '类型错误修复',
@@ -50,9 +52,8 @@ export function Composer({
   const commandIds = useMemo(() => Object.keys(profile.commands), [profile]);
 
   const [goal, setGoal] = useState('');
-  const [taskClass, setTaskClass] = useState<TaskClass>(
-    profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX',
-  );
+  // 默认留空：它不设门禁也不进提示词，预填一个值只会让人以为"必须选一个"
+  const [taskClass, setTaskClass] = useState<TaskClass>('');
   /**
    * 默认为空 = 整个仓库都可改（受保护路径除外）。
    * 以前默认 'src/**'：用户什么都没选，却被一条看不见的规则收窄了范围 ——
@@ -65,6 +66,7 @@ export function Composer({
     commandIds.includes('build') ? ['build'] : commandIds.slice(0, 1),
   );
   const [modelProfileId, setModelProfileId] = useState(enabledModels[0]?.profileId ?? '');
+  /** 空串 = 不做交叉审核。自由文本，但**精确匹配** —— 不做模糊匹配是本项目的底线 */
   const [reviewerProfileId, setReviewerProfileId] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [customCommand, setCustomCommand] = useState('');
@@ -81,7 +83,19 @@ export function Composer({
     ? modelProfileId
     : (enabledModels[0]?.profileId ?? '');
 
-  const canSubmit = goal.trim().length > 0 && effectiveModelId.length > 0 && !submitting;
+  /** 可选审核方：已启用且不是实现方自己（同一个 profile 一写一审没有第二意见价值） */
+  const reviewerCandidates = useMemo(
+    () => enabledModels.filter((m) => m.profileId !== effectiveModelId),
+    [enabledModels, effectiveModelId],
+  );
+  const reviewerResolved = reviewerCandidates.some((m) => m.profileId === reviewerProfileId);
+
+  const canSubmit =
+    goal.trim().length > 0 &&
+    effectiveModelId.length > 0 &&
+    // 填了但填错不放行：静默忽略等于"我以为开了交叉审核，其实没开"
+    (reviewerProfileId === '' || reviewerResolved) &&
+    !submitting;
 
   const submit = async () => {
     if (!canSubmit) return;
@@ -206,14 +220,24 @@ export function Composer({
           {advancedOpen && (
             <AdvancedPopover onClose={() => setAdvancedOpen(false)}>
               <div className="field">
-                <label>任务类型</label>
-                <select value={taskClass} onChange={(e) => setTaskClass(e.target.value as TaskClass)}>
-                  {profile.supportedTaskClasses.map((c) => (
+                <label>任务类型（可留空，也可自己写）</label>
+                <input
+                  list="repopilot-task-classes"
+                  value={taskClass}
+                  placeholder="例如：构建失败修复 / 文档站样式回归 / e2e 偶发失败"
+                  onChange={(e) => setTaskClass(e.target.value)}
+                />
+                <datalist id="repopilot-task-classes">
+                  {[...new Set([...profile.supportedTaskClasses, ...COMMON_TASK_CLASSES])].map((c) => (
                     <option key={c} value={c}>
-                      {TASK_CLASS_LABEL[c]}
+                      {TASK_CLASS_HINT[c] ?? ''}
                     </option>
                   ))}
-                </select>
+                </datalist>
+                <div className="help">
+                  纯描述性元数据，不设门禁、也不进提示词 —— 写你自己的说法就行，
+                  建议里那几个只是常见写法。
+                </div>
               </div>
 
               {useCustom && (
@@ -250,17 +274,26 @@ export function Composer({
               </div>
 
               <div className="field" style={{ marginBottom: 4 }}>
-                <label>交叉审核：第二个模型只读审补丁</label>
-                <select value={reviewerProfileId} onChange={(e) => setReviewerProfileId(e.target.value)}>
-                  <option value="">不做交叉审核</option>
-                  {enabledModels
-                    .filter((m) => m.profileId !== effectiveModelId)
-                    .map((m) => (
-                      <option key={m.profileId} value={m.profileId}>
-                        {m.label} · {m.modelId}
-                      </option>
-                    ))}
-                </select>
+                <label>交叉审核：第二个模型只读审补丁（可留空）</label>
+                <input
+                  list="repopilot-reviewers"
+                  value={reviewerProfileId}
+                  placeholder="留空 = 不做交叉审核；填审核方 id（下拉有建议）"
+                  onChange={(e) => setReviewerProfileId(e.target.value.trim())}
+                />
+                <datalist id="repopilot-reviewers">
+                  {reviewerCandidates.map((m) => (
+                    <option key={m.profileId} value={m.profileId}>
+                      {m.label} · {m.modelId}
+                    </option>
+                  ))}
+                </datalist>
+                {reviewerProfileId && !reviewerResolved && (
+                  // 不做模糊匹配：填错就明说填错了，并列出可用的，不静默忽略
+                  <div className="help" style={{ color: 'var(--err)' }}>
+                    没有这个审核方。可用：{reviewerCandidates.map((m) => m.profileId).join('、') || '（无）'}
+                  </div>
+                )}
                 <div className="help">
                   审核方"通过"<b>不等于</b>验证通过，也不代表可以接受 —— 是否接受仍由你决定。
                   异构（不同供应商）的第二意见价值更高。有阻断发现时会自动整改一次并重验（上限 2 审 1 改）。
