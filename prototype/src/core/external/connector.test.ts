@@ -138,6 +138,7 @@ describe('连接器发现与身份探测', () => {
       ...fake,
       binaries: ['definitely-not-installed-xyz'],
       appBundles: [], // 本机真装了 ChatGPT.app，这里要的是"什么都没有"那一支
+      bundledBinaryRelPaths: [],
     });
     expect(profile.state).toBe('NOT_INSTALLED');
     expect(profile.binaryPath).toBeNull();
@@ -172,6 +173,7 @@ describe('连接器发现与身份探测', () => {
       ...descriptorOfConnector('codex-cli')!,
       binaries: ['definitely-not-installed-xyz'],
       appBundles: [bundle],
+      bundledBinaryRelPaths: [],
     });
     expect(p.state).toBe('PRESENT_NOT_AUTOMATABLE');
     expect(p.form).toBe('DESKTOP_APP');
@@ -180,6 +182,71 @@ describe('连接器发现与身份探测', () => {
     // 必须说清楚"为什么用不了"和"那该用什么"
     expect(p.remediation).toContain('GUI');
     expect(p.remediation).toContain('API');
+  });
+
+  it('.app 内打包了 CLI → BUNDLED_CLI 可用，而不是判成"不可自动化"', () => {
+    // 这条钉住一次真实的判断错误：早先版本只看 PATH，PATH 上没有就宣布
+    // "只能 GUI 自动化"。而 ChatGPT.app 的 Contents/Resources/codex
+    // 是一个完整的非交互 CLI —— 因为没装在常规位置就说它不存在，是错的。
+    const appDir = tempDir('repopilot-bundled-');
+    const bundle = join(appDir, 'ChatGPT.app');
+    const res = join(bundle, 'Contents', 'Resources');
+    mkdirSync(res, { recursive: true });
+    const exe = join(res, 'codex');
+    writeFileSync(exe, '#!/bin/sh\necho "codex-cli 0.147.0"\n');
+    chmodSync(exe, 0o755);
+
+    const p = probeConnector({
+      ...descriptorOfConnector('codex-cli')!,
+      binaries: ['definitely-not-installed-xyz'],
+      appBundles: [bundle],
+      bundledBinaryRelPaths: ['Contents/Resources/codex'],
+    });
+    expect(p.state).toBe('READY');
+    expect(p.form).toBe('BUNDLED_CLI');
+    expect(p.binaryPath).toBe(exe);
+    expect(p.version).toBe('codex-cli 0.147.0');
+    // 来源要能看出来：卸载/升级桌面应用会让它消失
+    expect(p.detail).toContain('随桌面应用分发');
+  });
+
+  it('.app 存在但里面没有 CLI → 这才是真的不可自动化（Claude.app 实测如此）', () => {
+    const appDir = tempDir('repopilot-noclibundle-');
+    const bundle = join(appDir, 'Claude.app');
+    mkdirSync(join(bundle, 'Contents', 'MacOS'), { recursive: true });
+
+    const p = probeConnector({
+      ...descriptorOfConnector('claude-cli')!,
+      binaries: ['definitely-not-installed-xyz'],
+      appBundles: [bundle],
+      bundledBinaryRelPaths: ['Contents/Resources/claude'],
+    });
+    expect(p.state).toBe('PRESENT_NOT_AUTOMATABLE');
+    expect(p.form).toBe('DESKTOP_APP');
+    expect(p.remediation).toContain('API');
+  });
+
+  it('独立 CLI 优先于 bundle 内的那份 —— 用户自己装的更可控', () => {
+    const bin = tempDir('repopilot-standalone-');
+    const exe = join(bin, 'standalonecli');
+    writeFileSync(exe, '#!/bin/sh\necho "standalone 3.0"\n');
+    chmodSync(exe, 0o755);
+    const appDir = tempDir('repopilot-alsoapp-');
+    const bundle = join(appDir, 'ChatGPT.app');
+    const res = join(bundle, 'Contents', 'Resources');
+    mkdirSync(res, { recursive: true });
+    const bundled = join(res, 'codex');
+    writeFileSync(bundled, '#!/bin/sh\necho "bundled 0.1"\n');
+    chmodSync(bundled, 0o755);
+
+    const p = probeConnector({
+      ...descriptorOfConnector('codex-cli')!,
+      binaries: [exe],
+      appBundles: [bundle],
+      bundledBinaryRelPaths: ['Contents/Resources/codex'],
+    });
+    expect(p.form).toBe('CLI');
+    expect(p.binaryPath).toBe(exe);
   });
 
   it('CLI 与桌面应用同时存在时优先 CLI —— 可自动化的那个才是入口', () => {
@@ -195,6 +262,7 @@ describe('连接器发现与身份探测', () => {
       ...descriptorOfConnector('codex-cli')!,
       binaries: [exe],
       appBundles: [bundle],
+      bundledBinaryRelPaths: [],
     });
     expect(p.state).toBe('READY');
     expect(p.form).toBe('CLI');

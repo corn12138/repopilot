@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 564 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
+`pnpm test` — 567 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
 
 | 断言 | 证据位置 |
 |---|---|
@@ -49,7 +49,7 @@
 | 外部 CLI 隔离（**真子进程**）：外部代理看到的 HOME 不是真实 HOME、读不到 `~/.claude`、宿主凭据与 `GITHUB_TOKEN` 不在其环境、cwd 是一次性目录、调用后 HOME 被删 | `external/connector.test.ts` |
 | 外部 CLI：无显式凭据拒绝启动（不以宿主登录态运行）、非零退出/不可解析输出一律 FAILED 且不编造发现、manifest 不含 raw secret 与 prompt 正文 | `external/connector.test.ts` |
 | 外部 CLI：同厂商审核直接拒绝（`SAME_VENDOR_REVIEW_DENIED`），异构是不变式不是披露项 | `external/connector.test.ts` |
-| 动态形态探测：只有桌面应用 → `PRESENT_NOT_AUTOMATABLE` 且指向 API；CLI 与 .app 并存时优先 CLI；环境变量可覆盖路径且指错时 BLOCKED 不静默回落 | `external/connector.test.ts` |
+| 动态形态探测：**.app 内打包的 CLI 被认出来并可用**（`BUNDLED_CLI`）；bundle 里确实没 CLI 才判不可自动化；独立 CLI 优先于 bundle 内那份；env 覆盖生效且指错时 BLOCKED 不静默回落 | `external/connector.test.ts` |
 
 ## 尚未证明的
 
@@ -200,15 +200,19 @@ base URL 存的是**完整地址含版本路径** —— 智谱是 `/api/paas/v4
 |---|---|---|
 | **多供应商 API**（推荐） | ✅ | 最顺的路径：不依赖你装了什么、路由可冻结、用量可记账、异构随便配。用自己买的两家 key 就能跑一写一审 |
 | **CLI**（`claude` / `codex`） | ✅ | 装了就能用的补充。装在非常规位置时设 `REPOPILOT_CLAUDE_CLI_PATH` / `REPOPILOT_CODEX_CLI_PATH` 指过去 |
-| **桌面应用**（Claude.app / ChatGPT.app） | ❌ | 检测得到，但**用不了**：驱动它只能靠 GUI 自动化/屏幕点击，那是合同明令禁止的，也脆弱、也会动用你的登录态。检测到时会如实告诉你并指向 API |
+| **.app 内打包的 CLI** | ✅ | ChatGPT.app 的 `Contents/Resources/codex` 就是一个完整的 `codex-cli`（带 `exec` / `review` 非交互子命令）。随桌面应用分发，界面上标为「随桌面应用分发」以便与独立安装区分 |
+| **纯桌面应用**（bundle 里没 CLI，如 Claude.app） | ❌ | 只能靠 GUI 自动化/屏幕点击驱动 —— 合同明令禁止，也脆弱、也会动你的登录态。检测到时如实告知并指向 API |
 
 环境自检的「交叉审核可用出口」会把三条道一起报出来，并判断你**够不够做异构
 一写一审**（需要两个不同来源）。本机实测输出长这样：
 
 ```
-✓ externalAgents(READY) API 已启用 1 个 provider；CLI 可用：Claude Code 2.1.207；
-  桌面应用 Codex（检测到但不可自动化）
+✓ externalAgents(READY) API 已启用 1 个 provider；
+  CLI 可用：Claude Code 2.1.207 / Codex codex-cli 0.147.0-alpha.6.5
 ```
+
+（这台机器上 `claude` 是独立安装的，`codex` 来自 ChatGPT.app 内打包的那份 ——
+两者厂商互异，够做异构一写一审。）
 
 CLI 跑起来时的隔离是硬的：
 

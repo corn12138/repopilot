@@ -29,11 +29,16 @@ import { buildChildEnv, resolveBinary, runCommand } from '../command';
  *   - **只读**：cwd 是空的一次性目录，不挂载工作区；产出只有 finding，
  *     没有 mutation、没有终态权限。
  *
- * 形态是**动态探测**的，不假设用户装了 CLI：同一厂商可能以 CLI、桌面应用两种
- * 形态存在（Codex 现在主要活在 ChatGPT 桌面应用里；Claude 既有 .app 也有 CLI）。
- * 桌面应用能被检测到，但**不可自动化** —— 驱动它只能靠 GUI 自动化/屏幕点击，
- * 那是合同第 2 节明令禁止的，也脆弱、也会动用户的登录态。所以检测到 .app 时
- * 如实报 `PRESENT_NOT_AUTOMATABLE` 并指向 API 路径，绝不假装"接上了"。
+ * 形态是**动态探测**的，不假设用户装了 CLI。三种入口按可自动化程度排序：
+ *   1. PATH 上的 CLI（或 env 显式指路）；
+ *   2. **桌面应用 bundle 内打包的 CLI** —— ChatGPT.app 里就有一个完整的
+ *      `Contents/Resources/codex`（codex-cli，带 exec/review 非交互子命令）。
+ *      这不是 GUI 自动化，是合同允许的"可验证的非交互 CLI"，只是它随 .app 分发。
+ *      早先版本把"装了 .app"一律判成不可自动化是**错的** —— 只看 PATH 就下结论，
+ *      等于因为工具没装在常规位置就说它不存在。
+ *   3. 只有 .app 且里面确实没有 CLI（Claude.app 实测如此）→ 才是真的不可自动化：
+ *      驱动它只能靠 GUI 自动化/屏幕点击，那是合同第 2 节明令禁止的，也脆弱、
+ *      也会动用户的登录态。这时如实报 `PRESENT_NOT_AUTOMATABLE` 并指向 API。
  *
  * 顺带一条产品判断：**用自己买的多家 API 做一写一审是最顺的路径** ——
  * 不依赖用户装了什么、不受 GUI 摆布、路由可冻结、用量可记账、异构随便配。
@@ -56,8 +61,12 @@ export type ExternalConnectorState =
   | 'PRESENT_NOT_AUTOMATABLE'
   | 'BLOCKED';
 
-/** 同一厂商可能有多种形态；只有 CLI 这种非交互入口才可能自动化 */
-export type ExternalAgentForm = 'CLI' | 'DESKTOP_APP';
+/**
+ * 检测到的入口形态。前两种可自动化（都是非交互 CLI）。
+ * BUNDLED_CLI 单独标出来是因为它随 .app 分发 —— 升级/卸载桌面应用会让它消失，
+ * 值得在界面上与独立安装的 CLI 区分。
+ */
+export type ExternalAgentForm = 'CLI' | 'BUNDLED_CLI' | 'DESKTOP_APP';
 
 export interface ExternalConnectorDescriptor {
   readonly connectorId: string;
@@ -74,8 +83,14 @@ export interface ExternalConnectorDescriptor {
    * 不逼用户改 PATH（GUI 应用继承的是 launchd 的 PATH，改了也未必生效）。
    */
   readonly binaryPathEnv: string;
-  /** 桌面应用候选位置（macOS bundle）。检测到只用于如实告知，不代表可用 */
+  /** 桌面应用候选位置（macOS bundle） */
   readonly appBundles: readonly string[];
+  /**
+   * bundle 内可能打包的 CLI 相对路径。ChatGPT.app 就在
+   * `Contents/Resources/codex` 放了一个完整的 codex-cli。
+   * 命中它 = 拿到合法的非交互入口，与 GUI 自动化无关。
+   */
+  readonly bundledBinaryRelPaths: readonly string[];
   /** 探测版本用的参数 */
   readonly versionArgv: readonly string[];
   /**
@@ -96,6 +111,8 @@ const DESCRIPTORS: readonly ExternalConnectorDescriptor[] = [
     binaries: ['claude'],
     binaryPathEnv: 'REPOPILOT_CLAUDE_CLI_PATH',
     appBundles: ['/Applications/Claude.app', join(homedir(), 'Applications', 'Claude.app')],
+    // Claude.app 实测不打包 CLI（`claude` 需单独安装）；留空数组而不是瞎猜路径
+    bundledBinaryRelPaths: [],
     versionArgv: ['--version'],
     // -p/--print = 非交互一次性执行，prompt 从 stdin 读
     reviewArgv: ['-p'],
@@ -114,8 +131,15 @@ const DESCRIPTORS: readonly ExternalConnectorDescriptor[] = [
       join(homedir(), 'Applications', 'ChatGPT.app'),
       '/Applications/Codex.app',
     ],
+    bundledBinaryRelPaths: ['Contents/Resources/codex'],
     versionArgv: ['--version'],
-    reviewArgv: ['exec', '-'],
+    /*
+     * exec 非交互；`-` 表示 prompt 从 stdin 读（codex 自己的 help 写明）。
+     * --skip-git-repo-check：我们的 cwd 是空的一次性目录，本来就不是仓库。
+     * --ignore-user-config / --ephemeral：不读用户 ~/.codex 配置、不留会话 ——
+     * 与 synthetic HOME 是同一目的的两道保险。
+     */
+    reviewArgv: ['exec', '--skip-git-repo-check', '--ignore-user-config', '--ephemeral', '-'],
     credentialEnvVar: 'OPENAI_API_KEY',
   },
 ];
@@ -168,9 +192,24 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
 
   // 解析顺序：显式覆盖 > PATH 上的候选名。覆盖优先是因为 GUI 应用的 PATH 靠不住
   const override = process.env[d.binaryPathEnv]?.trim();
-  const binaryPath = override
-    ? resolveBinary(override, childEnv)
-    : (d.binaries.map((b) => resolveBinary(b, childEnv)).find((p) => p !== null) ?? null);
+  let form: ExternalAgentForm | null = null;
+  let binaryPath: string | null = null;
+  if (override) {
+    binaryPath = resolveBinary(override, childEnv);
+    if (binaryPath) form = 'CLI';
+  } else {
+    binaryPath = d.binaries.map((b) => resolveBinary(b, childEnv)).find((p) => p !== null) ?? null;
+    if (binaryPath) {
+      form = 'CLI';
+    } else if (appPath) {
+      // PATH 上没有，不代表没有可自动化入口 —— .app 里可能就打包着 CLI
+      binaryPath =
+        d.bundledBinaryRelPaths
+          .map((rel) => resolveBinary(join(appPath, rel), childEnv))
+          .find((p) => p !== null) ?? null;
+      if (binaryPath) form = 'BUNDLED_CLI';
+    }
+  }
 
   if (!binaryPath) {
     // 装了桌面应用但没有可自动化入口：检测得到 ≠ 用得上，必须说清楚而不是报"没装"
@@ -183,7 +222,7 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
         binaryPath: null,
         version: null,
         identityDigest: null,
-        detail: `检测到桌面应用 ${appPath}，但它没有可自动化的非交互入口`,
+        detail: `检测到桌面应用 ${appPath}，但 bundle 里没有可自动化的非交互 CLI`,
         remediation:
           `桌面应用只能靠 GUI 自动化驱动，那既被合同禁止也会动用你的登录态 —— ` +
           `请改用${d.vendor === 'OPENAI' ? ' OpenAI' : ' Anthropic'} API 做交叉审核（更顺，也可记账），` +
@@ -235,7 +274,7 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
     return {
       ...base,
       state: 'BLOCKED',
-      form: 'CLI',
+      form,
       appPath,
       binaryPath,
       version: null,
@@ -250,12 +289,12 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
   return {
     ...base,
     state: 'READY',
-    form: 'CLI',
+    form,
     appPath,
     binaryPath,
     version,
     identityDigest: digestOf({ binaryPath, version }),
-    detail: `${version} @ ${binaryPath}`,
+    detail: `${version} @ ${binaryPath}${form === 'BUNDLED_CLI' ? '（随桌面应用分发）' : ''}`,
     remediation: null,
   };
 }
