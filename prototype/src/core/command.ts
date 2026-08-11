@@ -194,10 +194,22 @@ export function resolveBinary(bin: string, env: NodeJS.ProcessEnv = buildChildEn
  *     非零退出、被信号杀死、超时都**不可能**被当成成功。
  *   - 输出保留尾部并按字节截断，截断与否由缓冲层自己回报，不在外面靠阈值猜。
  */
+export interface RunCommandOptions {
+  /**
+   * 完全替换子进程环境（不走 buildChildEnv 的宿主白名单）。
+   * 外部 CLI 连接器用它做强隔离：只给 synthetic HOME 与显式凭据，
+   * 真实 HOME/auth/history 一律看不见。传入什么就是全部，不做合并。
+   */
+  readonly env?: NodeJS.ProcessEnv;
+  /** 写入子进程 stdin 后立即关闭。大段 prompt 走这里，不塞进 argv */
+  readonly stdin?: string;
+}
+
 export async function runCommand(
   def: CommandDefinition,
   cwd: string,
   signal: AbortSignal,
+  opts: RunCommandOptions = {},
 ): Promise<CommandOutcome> {
   const started = Date.now();
 
@@ -213,7 +225,8 @@ export async function runCommand(
     return outcome(def, 'SPAWN_ERROR', null, null, started, '', 'argv 为空', false);
   }
 
-  const childEnv = buildChildEnv();
+  // env 显式给定时**整份替换**，不与宿主环境合并 —— 隔离的意义就在于"没给的就是没有"
+  const childEnv = opts.env ? { env: opts.env, droppedKeys: [] as readonly string[] } : buildChildEnv();
 
   return new Promise<CommandOutcome>((resolve) => {
     const out = new TailBuffer();
@@ -227,8 +240,14 @@ export async function runCommand(
       detached: true, // 建立独立进程组，便于整树终止
       // 白名单裁剪：仓库脚本不该看到宿主的 BYOK 凭据。见 buildChildEnv
       env: childEnv.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [opts.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
+
+    if (opts.stdin !== undefined) {
+      // EPIPE：子进程可能没读就退了 —— 那是它的事，不该把父进程炸掉
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(opts.stdin);
+    }
 
     child.stdout?.on('data', (c: Buffer) => out.push(c));
     child.stderr?.on('data', (c: Buffer) => err.push(c));

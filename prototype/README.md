@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 532 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
+`pnpm test` — 560 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
 
 | 断言 | 证据位置 |
 |---|---|
@@ -46,6 +46,9 @@
 | **权威层 e2e**：自修复用尽 → `FAILED` + `failureClass` + 挽救补丁封存，接受被状态门禁拒绝 | `authority.e2e.test.ts` |
 | **权威层 e2e**：交叉审核阻断 → 整改 → 重验 → 重封存（digest 变化）→ 第二轮通过，2 审 1 改如实记账 | `authority.e2e.test.ts` |
 | **权威层 e2e**：`COUNTER_EXHAUSTED` 后用户授权续循环 → 续期轮收敛，累计 4 审 2 改 1 续期、轮次连续编号；终态/`REVIEWER_PASSED` 续期被拒 | `authority.e2e.test.ts` |
+| 外部 CLI 隔离（**真子进程**）：外部代理看到的 HOME 不是真实 HOME、读不到 `~/.claude`、宿主凭据与 `GITHUB_TOKEN` 不在其环境、cwd 是一次性目录、调用后 HOME 被删 | `external/connector.test.ts` |
+| 外部 CLI：无显式凭据拒绝启动（不以宿主登录态运行）、非零退出/不可解析输出一律 FAILED 且不编造发现、manifest 不含 raw secret 与 prompt 正文 | `external/connector.test.ts` |
+| 外部 CLI：同厂商审核直接拒绝（`SAME_VENDOR_REVIEW_DENIED`），异构是不变式不是披露项 | `external/connector.test.ts` |
 
 ## 尚未证明的
 
@@ -59,11 +62,18 @@
   **真实双模型下整改的质量**（改得对不对）仍只能真跑才知道 ——
   e2e 的模型是 HTTP 层脚本，钉的是平台语义，不是模型判断力。
 - 挽救封存的 TIMED_OUT 路径明确不做（终态先于封存被写下），记录在案。
-- 交叉审核的"写手/审核方"目前是两个**模型 API** profile。接真正的外部编码
-  代理 CLI（官方 Claude Code / Codex 的非交互接口，含 binary identity、
-  capability probe、隔离候选工作区）是 P1 合同
-  `docs/contracts/external-coding-agent-cross-review.md`，尚未实现 ——
-  交互语义（一写一审、有界整改、用户续期闸门）已就位，届时只换"选手"不换规则。
+- 外部编码代理 CLI 连接器（`core/external/connector.ts`）：**发现 + 身份探测 +
+  隔离调用 + 输出解析**已实现并有真子进程证据（见上表三行），环境自检里能看到
+  本机检测到哪些 CLI。**但尚未接进交叉审核循环** —— 现在任务里能选的审核方
+  仍只有模型 API profile。把连接器接成可选审核方是下一步（纯接线，语义已就位）。
+- 外部 CLI 的 **CANDIDATE_AUTHOR 角色（让外部 CLI 写代码）明确不做**：
+  那需要 disposable candidate workspace + single-writer epoch + normalizer，
+  风险高一个量级。本切片只做 READ_ONLY_REVIEWER：只读一段 diff 文本、
+  只吐结构化发现，碰不到工作区。
+- 上面这些是 P1 合同 `docs/contracts/external-coding-agent-cross-review.md` 的
+  **可丢弃 spike 子集，不是那份合同的实现**：没有 connector 评审流程、
+  没有 terms/版本准入、没有 network manifest、没有 resource/thermal 治理。
+  合同状态仍是 `P1_DEFERRED / FEATURE_DISABLED`，不因为原型跑通了就改。
 - 一切 P1：Skill、多表面、Continuation、资源/热治理都没做。
 - 打包只做到「能双击运行的未签名 dmg」：没有签名、没有公证、没有自动更新，
   也没有 Intel 机器上的实机验证。见下面「打包」。
@@ -180,6 +190,22 @@ base URL 存的是**完整地址含版本路径** —— 智谱是 `/api/paas/v4
   平台**绝不自己"再试一次"**。累计计数（审核轮次 / 整改次数 / 用户续期次数）
   只增不清，每次续期都落一条授权事件；续到第 2 次界面会明确提示
   "连续不收敛通常该人工接手了"。
+
+#### 用本机的 Claude Code / Codex 当审核方（连接器基础层）
+
+环境自检里的「外部代理 CLI」会告诉你本机检测到了什么（在**子进程真正拿到的
+那份 PATH** 里找，所以从 Finder 启动也能正确判断）。跑起来时的隔离是硬的：
+
+| 外部 CLI 能看到 | 不能看到 |
+|---|---|
+| 一次性 synthetic HOME/XDG（用完即删） | 你真实的 HOME、`~/.claude`、登录态、历史、settings |
+| 你显式配给它的那一个 API Key | 宿主环境里的任何其他凭据（`GITHUB_TOKEN`、`AWS_*`…） |
+| stdin 里的补丁摘要 | 工作区、仓库 —— cwd 是那个空的一次性目录 |
+
+环境是**整份替换**不是合并：没给的就是没有。没有显式凭据时**拒绝启动**——
+绝不让它用你的宿主登录态（那会静默消耗你的订阅，还把你的 settings 带进审核）。
+输出必须是结构化 JSON；解析不出来就是 `FAILED`，不会把无法解析的输出
+补成"没有发现"。同厂商审核直接拒绝：异构是不变式，不是披露一下就能继续。
 
 然后：授权仓库 → 快照导入 → 填 TaskSpec 选验证命令 → 创建 → 审批计划 → 看时间线 → 审查 diff → 接受或拒绝。
 

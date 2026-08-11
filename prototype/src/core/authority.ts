@@ -51,6 +51,7 @@ import {
 } from './repo';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { buildChildEnv, resolveBinary } from './command';
+import { discoverConnectors } from './external/connector';
 import { EventStore, readJson, writeJsonAtomic } from './store';
 import {
   RUN_STATE_SCHEMA_VERSION,
@@ -654,6 +655,30 @@ export class RunAuthority {
           ? null
           : '从 Finder 启动的应用继承的是 launchd 的 PATH，不含 nvm / Homebrew。' +
             '改从终端启动，或执行 `sudo launchctl config user path "$PATH"` 后重启。',
+      });
+    }
+
+    /*
+     * 外部编码代理 CLI（本机的 Claude Code / Codex 当交叉审核选手）。
+     * 只报告，不阻断：没装是常态，装了才多一个选择。DEGRADED 而不是 BLOCKED ——
+     * 缺它不影响主链路，说成"阻断"是虚报严重度。
+     */
+    {
+      const connectors = discoverConnectors();
+      const ready = connectors.filter((c) => c.state === 'READY');
+      checks.push({
+        checkId: 'externalAgents',
+        label: '外部代理 CLI',
+        status: ready.length > 0 ? 'READY' : 'DEGRADED',
+        detail:
+          ready.length > 0
+            ? `可用：${ready.map((c) => `${c.label} ${c.version ?? ''}`.trim()).join(' / ')}` +
+              `${connectors.length > ready.length ? `（另 ${connectors.length - ready.length} 个未就绪）` : ''}`
+            : `未检测到可用的外部 CLI（${connectors.map((c) => c.label).join(' / ')}）`,
+        remediation:
+          ready.length > 0
+            ? null
+            : '装好 Claude Code / Codex CLI 可用它们做交叉审核；不装也不影响主链路',
       });
     }
 
