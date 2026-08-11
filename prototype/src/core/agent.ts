@@ -673,6 +673,14 @@ export async function runReviewPass(
   };
 }
 
+/** 允许路径的提示词渲染：['**'] / 空 = 没有额外限制，别让模型看到光秃秃的 "**" */
+function renderAllowedPaths(paths: readonly string[]): string {
+  if (paths.length === 0 || (paths.length === 1 && paths[0] === '**')) {
+    return '整个仓库（仅受保护路径禁止）';
+  }
+  return paths.join(', ');
+}
+
 function renderReviewBrief(
   task: TaskSpec,
   patch: PatchArtifact,
@@ -690,7 +698,7 @@ function renderReviewBrief(
 ${acc}
 明确的非目标（改了这些属于范围蔓延，应报为发现）：
 ${nonGoals}
-允许改动的路径：${task.allowedPaths.join(', ') || '（未限定）'}
+允许改动的路径：${renderAllowedPaths(task.allowedPaths)}
 ${verifyLine}
 
 补丁 digest：${patch.digest}
@@ -782,7 +790,7 @@ function renderRemediationBrief(
   return `你之前提交的补丁经独立模型交叉审核，发现 ${findings.length} 条**阻断性**问题。请整改。
 
 任务目标（不变）：${task.goal}
-允许改动的路径（不变）：${task.allowedPaths.join(', ') || '（未限定）'}
+允许改动的路径（不变）：${renderAllowedPaths(task.allowedPaths)}
 
 阻断发现：
 ${list}
@@ -1266,7 +1274,7 @@ ${commands || '  （无）'}
 
 任务：
 - 目标: ${task.goal}
-- 允许修改的路径: ${task.allowedPaths.join(', ')}
+- 允许修改的路径: ${renderAllowedPaths(task.allowedPaths)}
 - 受保护路径（禁止修改）: ${task.protectedPaths.join(', ') || '（无）'}
 - 验收条件:
 ${task.acceptance.map((a) => `  - ${a}`).join('\n') || '  （无）'}

@@ -193,6 +193,8 @@ class Harness {
   async createRun(input: {
     hostPath: string;
     reviewerModelProfileId?: string;
+    /** 缺省 []：零配置路径 —— 用户什么都没设置时不允许有任何暗中收窄 */
+    allowedPaths?: string[];
   }): Promise<{ runId: string }> {
     const reg = await this.call<{ project: { projectId: string } }>('__project.register', {
       hostPath: input.hostPath,
@@ -212,7 +214,7 @@ class Harness {
       modelProfileId: 'profile_deepseek',
       goal: '修复 node check.mjs 失败：src/app.js 的 STATUS 仍是 broken',
       taskClass: imported.profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX',
-      allowedPaths: ['src/**'],
+      allowedPaths: input.allowedPaths ?? [],
       acceptance: [],
       verificationCommandIds: ['user1'],
       customCommands: [{ label: 'node check.mjs', argv: ['node', 'check.mjs'] }],
@@ -407,6 +409,7 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
       const { runId } = await harness.createRun({
         hostPath: makeFixtureRepo(),
         reviewerModelProfileId: 'profile_moonshot-cn',
+        allowedPaths: ['src/**'], // 显式收窄的变体在这条覆盖；另两条走零配置路径
       });
       await harness.approvePlan(runId);
 

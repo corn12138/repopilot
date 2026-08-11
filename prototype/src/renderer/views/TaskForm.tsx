@@ -53,7 +53,13 @@ export function Composer({
   const [taskClass, setTaskClass] = useState<TaskClass>(
     profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX',
   );
-  const [allowedPaths, setAllowedPaths] = useState('src/**');
+  /**
+   * 默认为空 = 整个仓库都可改（受保护路径除外）。
+   * 以前默认 'src/**'：用户什么都没选，却被一条看不见的规则收窄了范围 ——
+   * 项目没有 src/ 目录、或修复要动根上的配置文件时，mutation 会被莫名其妙地拒。
+   * 任务选项是锦上添花，不设置就必须不干扰。
+   */
+  const [allowedPaths, setAllowedPaths] = useState('');
   const [acceptance, setAcceptance] = useState('');
   const [selectedCommands, setSelectedCommands] = useState<string[]>(
     commandIds.includes('build') ? ['build'] : commandIds.slice(0, 1),
@@ -222,10 +228,14 @@ export function Composer({
               )}
 
               <div className="field">
-                <label>允许修改的路径</label>
-                <input value={allowedPaths} onChange={(e) => setAllowedPaths(e.target.value)} />
+                <label>允许修改的路径（可留空）</label>
+                <input
+                  value={allowedPaths}
+                  placeholder="留空 = 整个仓库都可改；填了才收窄，如 src/**"
+                  onChange={(e) => setAllowedPaths(e.target.value)}
+                />
                 <div className="help">
-                  逗号或换行分隔。受保护路径（{profile.protectedPaths.slice(0, 3).join(', ')}…）无论如何都禁止修改。
+                  逗号或换行分隔。无论填不填，受保护路径（{profile.protectedPaths.slice(0, 3).join(', ')}…）都禁止修改。
                 </div>
               </div>
 
