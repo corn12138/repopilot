@@ -134,10 +134,16 @@ describe('连接器发现与身份探测', () => {
 
   it('没装的连接器报 NOT_INSTALLED 并给修复建议，不是静默消失', () => {
     const fake = descriptorOfConnector('codex-cli')!;
-    const profile = probeConnector({ ...fake, binary: 'definitely-not-installed-xyz' });
+    const profile = probeConnector({
+      ...fake,
+      binaries: ['definitely-not-installed-xyz'],
+      appBundles: [], // 本机真装了 ChatGPT.app，这里要的是"什么都没有"那一支
+    });
     expect(profile.state).toBe('NOT_INSTALLED');
     expect(profile.binaryPath).toBeNull();
-    expect(profile.remediation).toContain('PATH');
+    expect(profile.form).toBeNull();
+    // 没装不是错误：如实告诉用户 API 才是更顺的路径
+    expect(profile.remediation).toContain('API');
   });
 
   it('探测得到版本时给出身份摘要；版本变了摘要就变', () => {
@@ -146,7 +152,7 @@ describe('连接器发现与身份探测', () => {
     writeFileSync(exe, '#!/bin/sh\necho "fakecli 1.2.3"\n');
     chmodSync(exe, 0o755);
 
-    const d = { ...descriptorOfConnector('codex-cli')!, binary: exe };
+    const d = { ...descriptorOfConnector('codex-cli')!, binaries: [exe], appBundles: [] };
     const p1 = probeConnector(d);
     expect(p1.state).toBe('READY');
     expect(p1.version).toBe('fakecli 1.2.3');
@@ -157,12 +163,84 @@ describe('连接器发现与身份探测', () => {
     expect(probeConnector(d).identityDigest).not.toBe(p1.identityDigest);
   });
 
+  it('只装了桌面应用 → PRESENT_NOT_AUTOMATABLE，并指向 API 而不是假装能用', () => {
+    const appDir = tempDir('repopilot-fakeapp-');
+    const bundle = join(appDir, 'ChatGPT.app');
+    mkdirSync(bundle, { recursive: true });
+
+    const p = probeConnector({
+      ...descriptorOfConnector('codex-cli')!,
+      binaries: ['definitely-not-installed-xyz'],
+      appBundles: [bundle],
+    });
+    expect(p.state).toBe('PRESENT_NOT_AUTOMATABLE');
+    expect(p.form).toBe('DESKTOP_APP');
+    expect(p.appPath).toBe(bundle);
+    expect(p.binaryPath).toBeNull();
+    // 必须说清楚"为什么用不了"和"那该用什么"
+    expect(p.remediation).toContain('GUI');
+    expect(p.remediation).toContain('API');
+  });
+
+  it('CLI 与桌面应用同时存在时优先 CLI —— 可自动化的那个才是入口', () => {
+    const bin = tempDir('repopilot-bothcli-');
+    const exe = join(bin, 'bothcli');
+    writeFileSync(exe, '#!/bin/sh\necho "both 1.0"\n');
+    chmodSync(exe, 0o755);
+    const appDir = tempDir('repopilot-bothapp-');
+    const bundle = join(appDir, 'ChatGPT.app');
+    mkdirSync(bundle, { recursive: true });
+
+    const p = probeConnector({
+      ...descriptorOfConnector('codex-cli')!,
+      binaries: [exe],
+      appBundles: [bundle],
+    });
+    expect(p.state).toBe('READY');
+    expect(p.form).toBe('CLI');
+    expect(p.appPath).toBe(bundle); // 桌面应用照样如实记录
+  });
+
+  it('环境变量可覆盖路径 —— 装在非常规位置也能用，不逼用户改 PATH', () => {
+    const bin = tempDir('repopilot-overridecli-');
+    const exe = join(bin, 'weird-name');
+    writeFileSync(exe, '#!/bin/sh\necho "weird 2.0"\n');
+    chmodSync(exe, 0o755);
+    const d = descriptorOfConnector('codex-cli')!;
+
+    process.env[d.binaryPathEnv] = exe;
+    try {
+      const p = probeConnector({ ...d, binaries: ['nope-xyz'], appBundles: [] });
+      expect(p.state).toBe('READY');
+      expect(p.binaryPath).toBe(exe);
+      expect(p.version).toBe('weird 2.0');
+    } finally {
+      delete process.env[d.binaryPathEnv];
+    }
+  });
+
+  it('覆盖变量指向不存在的路径 → BLOCKED，不静默回落到 PATH', () => {
+    const d = descriptorOfConnector('codex-cli')!;
+    process.env[d.binaryPathEnv] = '/nonexistent/nope';
+    try {
+      const p = probeConnector({ ...d, binaries: ['sh'], appBundles: [] });
+      expect(p.state).toBe('BLOCKED');
+      expect(p.detail).toContain(d.binaryPathEnv);
+    } finally {
+      delete process.env[d.binaryPathEnv];
+    }
+  });
+
   it('二进制存在但探测失败 → BLOCKED，与"没装"区分开', () => {
     const bin = tempDir('repopilot-badbin-');
     const exe = join(bin, 'badcli');
     writeFileSync(exe, '#!/bin/sh\nexit 3\n');
     chmodSync(exe, 0o755);
-    const p = probeConnector({ ...descriptorOfConnector('codex-cli')!, binary: exe });
+    const p = probeConnector({
+      ...descriptorOfConnector('codex-cli')!,
+      binaries: [exe],
+      appBundles: [],
+    });
     expect(p.state).toBe('BLOCKED');
     expect(p.binaryPath).toBe(exe);
   });
@@ -187,6 +265,8 @@ describe('runExternalCliReview：隔离的负向断言（真子进程）', () =>
       vendor: 'OPENAI',
       label: 'spy',
       state: 'READY',
+      form: 'CLI',
+      appPath: null,
       binaryPath: exe,
       version: 'spy 1.0',
       identityDigest: 'sha256:spy',
@@ -301,6 +381,8 @@ describe('runExternalCliReview：失败与拒绝路径都封存 manifest', () =>
     vendor: 'OPENAI',
     label: 'x',
     state: 'READY',
+    form: 'CLI',
+    appPath: null,
     binaryPath: '/bin/echo',
     version: '1',
     identityDigest: 'sha256:x',
@@ -322,7 +404,10 @@ describe('runExternalCliReview：失败与拒绝路径都封存 manifest', () =>
     });
 
   it('连接器不 READY → PREFLIGHT 阶段 BLOCKED，根本不发起', async () => {
-    const r = await call(profileOf({ state: 'NOT_INSTALLED', binaryPath: null, detail: '没装' }), 'k');
+    const r = await call(
+      profileOf({ state: 'NOT_INSTALLED', form: null, binaryPath: null, detail: '没装' }),
+      'k',
+    );
     expect(r.manifest.state).toBe('BLOCKED');
     expect(r.submission).toBeNull();
     expect(r.manifest.failureDetail).toContain('没装');

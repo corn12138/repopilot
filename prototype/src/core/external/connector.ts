@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CommandDefinition, CrossReviewVerdict } from '@shared/domain';
 import { digestOf, newId, nowIso } from '@shared/ids';
@@ -28,6 +28,16 @@ import { buildChildEnv, resolveBinary, runCommand } from '../command';
  *     （SAME_VENDOR_REVIEW_DENIED），不是"披露一下就能继续"。
  *   - **只读**：cwd 是空的一次性目录，不挂载工作区；产出只有 finding，
  *     没有 mutation、没有终态权限。
+ *
+ * 形态是**动态探测**的，不假设用户装了 CLI：同一厂商可能以 CLI、桌面应用两种
+ * 形态存在（Codex 现在主要活在 ChatGPT 桌面应用里；Claude 既有 .app 也有 CLI）。
+ * 桌面应用能被检测到，但**不可自动化** —— 驱动它只能靠 GUI 自动化/屏幕点击，
+ * 那是合同第 2 节明令禁止的，也脆弱、也会动用户的登录态。所以检测到 .app 时
+ * 如实报 `PRESENT_NOT_AUTOMATABLE` 并指向 API 路径，绝不假装"接上了"。
+ *
+ * 顺带一条产品判断：**用自己买的多家 API 做一写一审是最顺的路径** ——
+ * 不依赖用户装了什么、不受 GUI 摆布、路由可冻结、用量可记账、异构随便配。
+ * CLI 只是"你已经装了那就也能用"的补充。doctor 的推荐顺序按这个来。
  */
 
 export type ExternalVendor = 'ANTHROPIC' | 'OPENAI';
@@ -39,14 +49,33 @@ export type ExternalConnectorKind = 'CLAUDE_CLI' | 'CODEX_CLI';
  * 刻意把"没装"和"装了但不可用"分开 —— 合同枚举里两者都是 BLOCKED，
  * 但对用户来说前者是"去装一个"，后者是"去修一下"，混在一起没法给修复建议。
  */
-export type ExternalConnectorState = 'READY' | 'NOT_INSTALLED' | 'BLOCKED';
+export type ExternalConnectorState =
+  | 'READY'
+  | 'NOT_INSTALLED'
+  /** 装了桌面应用但没有可自动化入口 —— 检测得到，用不了，必须说清楚 */
+  | 'PRESENT_NOT_AUTOMATABLE'
+  | 'BLOCKED';
+
+/** 同一厂商可能有多种形态；只有 CLI 这种非交互入口才可能自动化 */
+export type ExternalAgentForm = 'CLI' | 'DESKTOP_APP';
 
 export interface ExternalConnectorDescriptor {
   readonly connectorId: string;
   readonly kind: ExternalConnectorKind;
   readonly vendor: ExternalVendor;
   readonly label: string;
-  readonly binary: string;
+  /**
+   * 候选可执行名，按顺序试第一个命中的。多候选是因为同一工具在不同安装方式下
+   * 名字可能不同 —— 写死一个名字等于假设用户的安装方式。
+   */
+  readonly binaries: readonly string[];
+  /**
+   * 显式覆盖路径的环境变量：装在非常规位置时的逃生口，
+   * 不逼用户改 PATH（GUI 应用继承的是 launchd 的 PATH，改了也未必生效）。
+   */
+  readonly binaryPathEnv: string;
+  /** 桌面应用候选位置（macOS bundle）。检测到只用于如实告知，不代表可用 */
+  readonly appBundles: readonly string[];
   /** 探测版本用的参数 */
   readonly versionArgv: readonly string[];
   /**
@@ -63,8 +92,10 @@ const DESCRIPTORS: readonly ExternalConnectorDescriptor[] = [
     connectorId: 'claude-cli',
     kind: 'CLAUDE_CLI',
     vendor: 'ANTHROPIC',
-    label: 'Claude Code CLI',
-    binary: 'claude',
+    label: 'Claude Code',
+    binaries: ['claude'],
+    binaryPathEnv: 'REPOPILOT_CLAUDE_CLI_PATH',
+    appBundles: ['/Applications/Claude.app', join(homedir(), 'Applications', 'Claude.app')],
     versionArgv: ['--version'],
     // -p/--print = 非交互一次性执行，prompt 从 stdin 读
     reviewArgv: ['-p'],
@@ -74,8 +105,15 @@ const DESCRIPTORS: readonly ExternalConnectorDescriptor[] = [
     connectorId: 'codex-cli',
     kind: 'CODEX_CLI',
     vendor: 'OPENAI',
-    label: 'Codex CLI',
-    binary: 'codex',
+    label: 'Codex',
+    binaries: ['codex', 'codex-cli'],
+    binaryPathEnv: 'REPOPILOT_CODEX_CLI_PATH',
+    // Codex 现在主要随 ChatGPT 桌面应用分发，未必存在独立 CLI
+    appBundles: [
+      '/Applications/ChatGPT.app',
+      join(homedir(), 'Applications', 'ChatGPT.app'),
+      '/Applications/Codex.app',
+    ],
     versionArgv: ['--version'],
     reviewArgv: ['exec', '-'],
     credentialEnvVar: 'OPENAI_API_KEY',
@@ -88,7 +126,11 @@ export interface ExternalConnectorProfile {
   readonly vendor: ExternalVendor;
   readonly label: string;
   readonly state: ExternalConnectorState;
-  /** 解析到的绝对路径；没装为 null */
+  /** 实际检测到的形态；什么都没检测到为 null */
+  readonly form: ExternalAgentForm | null;
+  /** 检测到的桌面应用位置（仅用于告知，不可自动化） */
+  readonly appPath: string | null;
+  /** 解析到的绝对路径；没有可自动化 CLI 时为 null */
   readonly binaryPath: string | null;
   readonly version: string | null;
   /** 身份摘要：路径 + 版本。换了二进制或升级了版本，这个值就变 */
@@ -122,16 +164,57 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
     credentialEnvVar: d.credentialEnvVar,
   };
   const childEnv = buildChildEnv().env;
-  const binaryPath = resolveBinary(d.binary, childEnv);
+  const appPath = d.appBundles.find((p) => existsSync(p)) ?? null;
+
+  // 解析顺序：显式覆盖 > PATH 上的候选名。覆盖优先是因为 GUI 应用的 PATH 靠不住
+  const override = process.env[d.binaryPathEnv]?.trim();
+  const binaryPath = override
+    ? resolveBinary(override, childEnv)
+    : (d.binaries.map((b) => resolveBinary(b, childEnv)).find((p) => p !== null) ?? null);
+
   if (!binaryPath) {
+    // 装了桌面应用但没有可自动化入口：检测得到 ≠ 用得上，必须说清楚而不是报"没装"
+    if (appPath) {
+      return {
+        ...base,
+        state: 'PRESENT_NOT_AUTOMATABLE',
+        form: 'DESKTOP_APP',
+        appPath,
+        binaryPath: null,
+        version: null,
+        identityDigest: null,
+        detail: `检测到桌面应用 ${appPath}，但它没有可自动化的非交互入口`,
+        remediation:
+          `桌面应用只能靠 GUI 自动化驱动，那既被合同禁止也会动用你的登录态 —— ` +
+          `请改用${d.vendor === 'OPENAI' ? ' OpenAI' : ' Anthropic'} API 做交叉审核（更顺，也可记账），` +
+          `或安装其 CLI 后设 ${d.binaryPathEnv} 指向它`,
+      };
+    }
+    if (override) {
+      return {
+        ...base,
+        state: 'BLOCKED',
+        form: null,
+        appPath: null,
+        binaryPath: null,
+        version: null,
+        identityDigest: null,
+        detail: `${d.binaryPathEnv} 指向 ${override}，但那里没有可执行文件`,
+        remediation: `修正 ${d.binaryPathEnv}，或清空它回落到 PATH 探测`,
+      };
+    }
     return {
       ...base,
       state: 'NOT_INSTALLED',
+      form: null,
+      appPath: null,
       binaryPath: null,
       version: null,
       identityDigest: null,
-      detail: `PATH 里没有 ${d.binary}`,
-      remediation: `装好 ${d.label} 后重启应用；从 Finder 启动时 PATH 不含 ~/.local/bin 与 Homebrew`,
+      detail: `没有找到 ${d.binaries.join(' / ')}，也没有检测到桌面应用`,
+      remediation:
+        `不装也行 —— 用 API 做交叉审核是更顺的路径。若要用 CLI：装好后重启应用，` +
+        `或设 ${d.binaryPathEnv} 指向它（从 Finder 启动时 PATH 不含 ~/.local/bin 与 Homebrew）`,
     };
   }
 
@@ -152,11 +235,13 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
     return {
       ...base,
       state: 'BLOCKED',
+      form: 'CLI',
+      appPath,
       binaryPath,
       version: null,
       identityDigest: null,
       detail: `找到了 ${binaryPath}，但 ${d.versionArgv.join(' ')} 探测失败：${(err as Error).message.slice(0, 160)}`,
-      remediation: '确认该 CLI 能在隔离环境下非交互运行',
+      remediation: '确认该 CLI 能在隔离环境下非交互运行（不依赖你的登录态与真实 HOME）',
     };
   } finally {
     rmSync(probeHome, { recursive: true, force: true });
@@ -165,6 +250,8 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
   return {
     ...base,
     state: 'READY',
+    form: 'CLI',
+    appPath,
     binaryPath,
     version,
     identityDigest: digestOf({ binaryPath, version }),

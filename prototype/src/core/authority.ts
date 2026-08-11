@@ -659,26 +659,49 @@ export class RunAuthority {
     }
 
     /*
-     * 外部编码代理 CLI（本机的 Claude Code / Codex 当交叉审核选手）。
-     * 只报告，不阻断：没装是常态，装了才多一个选择。DEGRADED 而不是 BLOCKED ——
-     * 缺它不影响主链路，说成"阻断"是虚报严重度。
+     * 外部编码代理（本机的 Claude / Codex）。三条道分开报，因为它们能力不同：
+     *   API      —— 推荐路径：不依赖用户装了什么、路由可冻结、用量可记账、异构随便配
+     *   CLI      —— 装了就能用的补充
+     *   桌面应用 —— 检测得到但**不可自动化**（驱动它只能靠 GUI 自动化，合同禁止）
+     *
+     * 状态取 DEGRADED 而非 BLOCKED：交叉审核本来就是可选项，缺它不影响主链路，
+     * 说成"阻断"是虚报严重度。
      */
     {
       const connectors = discoverConnectors();
-      const ready = connectors.filter((c) => c.state === 'READY');
+      const apiVendors = this.gateway
+        .listProfiles()
+        .filter((p) => p.enabled)
+        .map((p) => p.providerId);
+      const cliReady = connectors.filter((c) => c.state === 'READY');
+      const appOnly = connectors.filter((c) => c.state === 'PRESENT_NOT_AUTOMATABLE');
+
+      // 能不能做异构一写一审：至少两个不同厂商的可用出口（API 已启用的 profile 各算一个）
+      const usableVendors = new Set<string>([
+        ...apiVendors,
+        ...cliReady.map((c) => `cli:${c.vendor}`),
+      ]);
+      const parts = [
+        `API 已启用 ${apiVendors.length} 个 provider`,
+        cliReady.length > 0
+          ? `CLI 可用：${cliReady.map((c) => `${c.label} ${c.version ?? ''}`.trim()).join(' / ')}`
+          : 'CLI 无可用',
+        ...(appOnly.length > 0
+          ? [`桌面应用 ${appOnly.map((c) => c.label).join(' / ')}（检测到但不可自动化）`]
+          : []),
+      ];
+      const canCrossReview = usableVendors.size >= 2;
       checks.push({
         checkId: 'externalAgents',
-        label: '外部代理 CLI',
-        status: ready.length > 0 ? 'READY' : 'DEGRADED',
-        detail:
-          ready.length > 0
-            ? `可用：${ready.map((c) => `${c.label} ${c.version ?? ''}`.trim()).join(' / ')}` +
-              `${connectors.length > ready.length ? `（另 ${connectors.length - ready.length} 个未就绪）` : ''}`
-            : `未检测到可用的外部 CLI（${connectors.map((c) => c.label).join(' / ')}）`,
-        remediation:
-          ready.length > 0
-            ? null
-            : '装好 Claude Code / Codex CLI 可用它们做交叉审核；不装也不影响主链路',
+        label: '交叉审核可用出口',
+        status: canCrossReview ? 'READY' : 'DEGRADED',
+        detail: parts.join('；'),
+        remediation: canCrossReview
+          ? null
+          : '一写一审需要两个不同来源。最省事的做法是再配一个供应商的 API Key' +
+            (appOnly.length > 0
+              ? '；桌面应用只能人工使用，驱动它需要 GUI 自动化，本产品不做'
+              : ''),
       });
     }
 

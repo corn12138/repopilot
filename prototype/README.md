@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 560 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
+`pnpm test` — 564 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
 
 | 断言 | 证据位置 |
 |---|---|
@@ -49,6 +49,7 @@
 | 外部 CLI 隔离（**真子进程**）：外部代理看到的 HOME 不是真实 HOME、读不到 `~/.claude`、宿主凭据与 `GITHUB_TOKEN` 不在其环境、cwd 是一次性目录、调用后 HOME 被删 | `external/connector.test.ts` |
 | 外部 CLI：无显式凭据拒绝启动（不以宿主登录态运行）、非零退出/不可解析输出一律 FAILED 且不编造发现、manifest 不含 raw secret 与 prompt 正文 | `external/connector.test.ts` |
 | 外部 CLI：同厂商审核直接拒绝（`SAME_VENDOR_REVIEW_DENIED`），异构是不变式不是披露项 | `external/connector.test.ts` |
+| 动态形态探测：只有桌面应用 → `PRESENT_NOT_AUTOMATABLE` 且指向 API；CLI 与 .app 并存时优先 CLI；环境变量可覆盖路径且指错时 BLOCKED 不静默回落 | `external/connector.test.ts` |
 
 ## 尚未证明的
 
@@ -191,10 +192,25 @@ base URL 存的是**完整地址含版本路径** —— 智谱是 `/api/paas/v4
   只增不清，每次续期都落一条授权事件；续到第 2 次界面会明确提示
   "连续不收敛通常该人工接手了"。
 
-#### 用本机的 Claude Code / Codex 当审核方（连接器基础层）
+#### 一写一审的三条出口：API（推荐）/ CLI / 桌面应用
 
-环境自检里的「外部代理 CLI」会告诉你本机检测到了什么（在**子进程真正拿到的
-那份 PATH** 里找，所以从 Finder 启动也能正确判断）。跑起来时的隔离是硬的：
+同一个厂商可能以多种形态存在，产品**动态探测**，不假设你装了 CLI：
+
+| 出口 | 能不能自动化 | 说明 |
+|---|---|---|
+| **多供应商 API**（推荐） | ✅ | 最顺的路径：不依赖你装了什么、路由可冻结、用量可记账、异构随便配。用自己买的两家 key 就能跑一写一审 |
+| **CLI**（`claude` / `codex`） | ✅ | 装了就能用的补充。装在非常规位置时设 `REPOPILOT_CLAUDE_CLI_PATH` / `REPOPILOT_CODEX_CLI_PATH` 指过去 |
+| **桌面应用**（Claude.app / ChatGPT.app） | ❌ | 检测得到，但**用不了**：驱动它只能靠 GUI 自动化/屏幕点击，那是合同明令禁止的，也脆弱、也会动用你的登录态。检测到时会如实告诉你并指向 API |
+
+环境自检的「交叉审核可用出口」会把三条道一起报出来，并判断你**够不够做异构
+一写一审**（需要两个不同来源）。本机实测输出长这样：
+
+```
+✓ externalAgents(READY) API 已启用 1 个 provider；CLI 可用：Claude Code 2.1.207；
+  桌面应用 Codex（检测到但不可自动化）
+```
+
+CLI 跑起来时的隔离是硬的：
 
 | 外部 CLI 能看到 | 不能看到 |
 |---|---|
