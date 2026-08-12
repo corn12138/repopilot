@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type {
   CrossReviewRound,
+  CrossReviewVerdict,
   CrossReviewStopReason,
   ModelRouteResolution,
   PatchArtifact,
@@ -507,6 +508,56 @@ const reviewFindingSchema = z.object({
   blocking: z.boolean(),
 });
 
+/**
+ * 把审核方交上来的原始 finding 归一化成平台事实。
+ *
+ * **谁来审都走这一个函数** —— 模型 API 走 submit_review 工具，外部 CLI 走
+ * stdout 里的 JSON，但校验与指纹计算必须是同一套。指纹由平台按
+ * (severity, file, range, evidence) 计算，绝不采信审核方自报的那个：
+ * 它是"多轮之间有没有进展"的判据，让被审方能操纵它，收敛判定就废了。
+ * 这也是"只换选手不换规则"的落点。
+ */
+export function normalizeFindings(
+  raw: readonly z.infer<typeof reviewSchema>['findings'][number][],
+): ReviewFinding[] {
+  return raw.map((f) => {
+    const range: readonly [number, number] | null =
+      f.startLine != null && f.endLine != null ? [f.startLine, f.endLine] : null;
+    return {
+      severity: f.severity,
+      confidence: f.confidence,
+      file: f.file ?? null,
+      range,
+      evidence: f.evidence,
+      reproduction: f.reproduction ?? null,
+      suggestedRemediation: f.suggestedRemediation ?? null,
+      blocking: f.blocking,
+      fingerprint: digestOf({
+        severity: f.severity,
+        file: f.file ?? null,
+        range,
+        evidence: f.evidence.trim().slice(0, 400),
+      }),
+    };
+  });
+}
+
+/**
+ * 校验外部 CLI 吐回来的审核结论。
+ *
+ * 与模型 API 路径共用 reviewSchema —— 换了选手不等于放宽校验。
+ * 校验不过返回 null，由调用方记 INCONCLUSIVE：宁可"这轮没有结论"，
+ * 也不把半个不合法的对象当成发现。
+ */
+export function parseExternalSubmission(
+  verdict: CrossReviewVerdict,
+  rawFindings: readonly Record<string, unknown>[],
+): { verdict: CrossReviewVerdict; findings: ReviewFinding[] } | null {
+  const parsed = reviewSchema.safeParse({ verdict, findings: rawFindings });
+  if (!parsed.success) return null;
+  return { verdict: parsed.data.verdict, findings: normalizeFindings(parsed.data.findings) };
+}
+
 const reviewSchema = z.object({
   verdict: z.enum(['PASS', 'CHANGES_REQUESTED', 'INCONCLUSIVE']),
   findings: z.array(reviewFindingSchema),
@@ -619,27 +670,7 @@ export async function runReviewPass(
     pushUser(conversation, results);
 
     if (submitted) {
-      const findings: ReviewFinding[] = submitted.findings.map((f) => {
-        const range: readonly [number, number] | null =
-          f.startLine != null && f.endLine != null ? [f.startLine, f.endLine] : null;
-        return {
-          severity: f.severity,
-          confidence: f.confidence,
-          file: f.file ?? null,
-          range,
-          evidence: f.evidence,
-          reproduction: f.reproduction ?? null,
-          suggestedRemediation: f.suggestedRemediation ?? null,
-          blocking: f.blocking,
-          // 指纹由平台算，不用模型自报的 —— 它是"有没有进展"的判据
-          fingerprint: digestOf({
-            severity: f.severity,
-            file: f.file ?? null,
-            range,
-            evidence: f.evidence.trim().slice(0, 400),
-          }),
-        };
-      });
+      const findings = normalizeFindings(submitted.findings);
       host.emit(
         'CROSS_REVIEW_ROUND',
         `第 ${input.round} 轮交叉审核：${submitted.verdict}，${findings.length} 条发现（阻断 ${findings.filter((x) => x.blocking).length}）`,

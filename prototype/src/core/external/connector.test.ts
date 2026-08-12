@@ -13,6 +13,7 @@ import {
   runExternalCliReview,
   type ExternalConnectorProfile,
 } from './connector';
+import { parseExternalSubmission } from '../agent';
 
 /**
  * 外部 CLI 连接器。
@@ -514,5 +515,51 @@ describe('runExternalCliReview：失败与拒绝路径都封存 manifest', () =>
     expect(JSON.stringify(r.manifest)).not.toContain('sk-super-secret');
     expect(JSON.stringify(r.manifest)).not.toContain('只读审核');
     expect(r.manifest.inputDigest).toMatch(/^sha256:/);
+  });
+});
+
+/*
+ * "只换选手不换规则"的落点：外部 CLI 交回的发现，必须和模型 API 走
+ * 同一套 schema 校验与同一套平台指纹。指纹是"多轮之间有没有进展"的判据 ——
+ * 换个选手就能自报指纹，收敛判定立刻废掉。
+ */
+describe('外部 CLI 的发现与模型 API 走同一套归一化', () => {
+  const finding = (over: Record<string, unknown> = {}) => ({
+    severity: 'HIGH',
+    confidence: 0.9,
+    file: 'src/app.ts',
+    startLine: 1,
+    endLine: 2,
+    evidence: '缺少空值检查',
+    blocking: true,
+    ...over,
+  });
+
+  it('合法结论被接受，指纹由平台计算', () => {
+    const r = parseExternalSubmission('CHANGES_REQUESTED', [finding()]);
+    expect(r?.verdict).toBe('CHANGES_REQUESTED');
+    expect(r?.findings[0]!.fingerprint).toMatch(/^sha256:/);
+    expect(r?.findings[0]!.range).toEqual([1, 2]);
+  });
+
+  it('CLI 自报的 fingerprint 被忽略 —— 被审方不能操纵进展判据', () => {
+    const withFake = parseExternalSubmission('CHANGES_REQUESTED', [
+      finding({ fingerprint: 'CLI_SUPPLIED_FAKE' }),
+    ]);
+    const without = parseExternalSubmission('CHANGES_REQUESTED', [finding()]);
+    expect(withFake?.findings[0]!.fingerprint).not.toBe('CLI_SUPPLIED_FAKE');
+    // 同样的事实 → 同样的指纹，与是谁报的、报没报指纹无关
+    expect(withFake?.findings[0]!.fingerprint).toBe(without?.findings[0]!.fingerprint);
+  });
+
+  it('不合法的 finding 整条结论作废 → null，不吞掉坏项凑数', () => {
+    expect(parseExternalSubmission('PASS', [finding({ severity: 'CATASTROPHIC' })])).toBeNull();
+    expect(parseExternalSubmission('PASS', [finding({ evidence: 123 })])).toBeNull();
+  });
+
+  it('PASS + 空 findings 合法', () => {
+    const r = parseExternalSubmission('PASS', []);
+    expect(r?.verdict).toBe('PASS');
+    expect(r?.findings).toEqual([]);
   });
 });
