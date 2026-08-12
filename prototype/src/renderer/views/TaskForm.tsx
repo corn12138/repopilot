@@ -101,6 +101,24 @@ export function Composer({
   const reviewerProfileId = reviewerLines.length === 1 ? reviewerLines[0]! : '';
   const reviewerResolved = reviewerCandidates.some((m) => m.profileId === reviewerProfileId);
 
+  /**
+   * 任务选项里**真正被设置过**的条目。用于让弹层关掉之后仍然看得见 ——
+   * 填完就消失等于没有反馈，用户无从判断自己填的东西有没有生效。
+   * 判据是"与默认值不同"，不是"碰过这个控件"。
+   */
+  const configured = useMemo(() => {
+    const out: Array<{ label: string; value: string }> = [];
+    if (taskClass.trim()) out.push({ label: '任务类型', value: taskClass.trim() });
+    if (hasCustom) out.push({ label: '自定义命令', value: customCommand.trim() });
+    if (allowedPaths.trim()) out.push({ label: '限定路径', value: allowedPaths.trim() });
+    const acc = acceptance.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (acc.length > 0) out.push({ label: `验收 ${acc.length} 条`, value: acc.join('；') });
+    if (reviewerProfileId && reviewerResolved) {
+      out.push({ label: '交叉审核', value: reviewerProfileId });
+    }
+    return out;
+  }, [taskClass, hasCustom, customCommand, allowedPaths, acceptance, reviewerProfileId, reviewerResolved]);
+
   const canSubmit =
     goal.trim().length > 0 &&
     effectiveModelId.length > 0 &&
@@ -210,15 +228,31 @@ export function Composer({
             {id}
           </button>
         ))}
+        {/*
+          三态如实显示。之前只有"选中/未选中"两态，于是"开了但没填"看起来
+          和"已生效"一模一样 —— 而它实际上什么也没做（hasCustom 要求 argv 非空）。
+          界面说生效、实际不生效，是最坏的一种模糊。
+        */}
         <button
           type="button"
-          className={`chip ${useCustom ? 'selected' : ''}`}
+          className={`chip ${hasCustom ? 'selected' : useCustom ? 'pending' : ''}`}
+          title={
+            hasCustom
+              ? `自定义验证命令：${customCommand}`
+              : useCustom
+                ? '已打开自定义，但还没填命令 —— 现在不会生效'
+                : '添加一条自己的验证命令'
+          }
           onClick={() => {
             setUseCustom((v) => !v);
             setAdvancedOpen(true);
           }}
         >
-          + 自定义
+          {hasCustom
+            ? `自定义 · ${customCommand.length > 24 ? `${customCommand.slice(0, 24)}…` : customCommand}`
+            : useCustom
+              ? '自定义 · 未填写'
+              : '+ 自定义'}
         </button>
         {unverifiedMode && (
           <span className="composer-unverified" title="没有验证命令时，终态最多是 ACCEPTED_UNVERIFIED，不会是 SUCCEEDED">
@@ -247,11 +281,28 @@ export function Composer({
         <div className="composer-adv-wrap">
           <button
             type="button"
-            className={`composer-adv ${advancedOpen ? 'open' : ''}`}
+            className={`composer-adv ${advancedOpen ? 'open' : ''} ${configured.length > 0 ? 'has-config' : ''}`}
+            title={
+              configured.length > 0
+                ? `已设置：${configured.map((c) => `${c.label}（${c.value}）`).join('；')}`
+                : '都有能直接开跑的默认值，可以不管'
+            }
             onClick={() => setAdvancedOpen((v) => !v)}
           >
-            ⚙ 任务选项 {advancedOpen ? '▾' : '▸'}
+            ⚙ 任务选项
+            {configured.length > 0 && <span className="adv-count">{configured.length}</span>}{' '}
+            {advancedOpen ? '▾' : '▸'}
           </button>
+          {/* 关掉弹层后也看得见自己设过什么 —— 不然"填了没生效"完全无感 */}
+          {configured.length > 0 && !advancedOpen && (
+            <span className="composer-configured">
+              {configured.map((c) => (
+                <span key={c.label} className="configured-chip" title={c.value}>
+                  {c.label}
+                </span>
+              ))}
+            </span>
+          )}
           {advancedOpen && (
             <AdvancedPopover onClose={() => setAdvancedOpen(false)}>
               <div className="field">
