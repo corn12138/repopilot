@@ -477,6 +477,7 @@ export function App() {
               setRuns((prev) => [run, ...prev]);
               setSelectedRunId(run.runId);
             }}
+            onReimport={() => void importProject(selectedProject)}
             onOpenRun={openRun}
             onOpenSettings={() => setShowSettings(true)}
             onError={report}

@@ -8,7 +8,7 @@ import type {
   TaskClass,
 } from '@shared/domain';
 import { COMMON_TASK_CLASSES } from '@shared/domain';
-import { call } from '../bridge';
+import { RequestError, call } from '../bridge';
 
 /** 常见值的中文说明，仅用于 datalist 的提示文案 —— 不是可选项清单 */
 const TASK_CLASS_HINT: Record<string, string> = {
@@ -33,6 +33,7 @@ export function Composer({
   modelProfiles,
   activeRun,
   onCreated,
+  onReimport,
   onOpenRun,
   onOpenSettings,
   onError,
@@ -44,6 +45,8 @@ export function Composer({
   /** 该项目下仍在进行中的 Run（若有）—— 用来提示，避免"以为没反应"而重复创建 */
   activeRun: RunView | null;
   onCreated: (run: RunView) => void;
+  /** 快照失效时的自救出口：重新导入一次（会生成新快照） */
+  onReimport: () => void;
   onOpenRun: (run: RunView) => void;
   onOpenSettings: () => void;
   onError: (err: unknown) => void;
@@ -72,6 +75,8 @@ export function Composer({
   const [customCommand, setCustomCommand] = useState('');
   const [useCustom, setUseCustom] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  /** 快照已被清理回收 —— 提交时才发现，就地自救 */
+  const [staleSnapshot, setStaleSnapshot] = useState(false);
   const boxRef = useRef<HTMLTextAreaElement>(null);
 
   const customArgv = customCommand.trim().split(/\s+/).filter(Boolean);
@@ -129,9 +134,17 @@ export function Composer({
         ...(reviewerProfileId ? { reviewerModelProfileId: reviewerProfileId } : {}),
       });
       setGoal('');
+      setStaleSnapshot(false);
       onCreated(run);
     } catch (err) {
-      onError(err);
+      // 快照被保留策略回收后，界面手里的 snapshotId 就是悬空的。
+      // 这不是"未知错误"，是有明确下一步的状态：就地给出重新导入的按钮，
+      // 而不是把一条红色堆栈丢给用户自己琢磨。
+      if (err instanceof RequestError && err.code === 'CONFLICT' && err.message.includes('快照')) {
+        setStaleSnapshot(true);
+      } else {
+        onError(err);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -153,6 +166,22 @@ export function Composer({
 
   return (
     <div className="composer">
+      {staleSnapshot && (
+        <div className="composer-note" style={{ color: 'var(--warn)' }}>
+          这个项目的快照已被数据保留清理回收，不能再用它建任务。
+          <button
+            className="linklike"
+            onClick={() => {
+              setStaleSnapshot(false);
+              onReimport();
+            }}
+          >
+            重新导入
+          </button>
+          后即可继续（会生成一个新快照）。
+        </div>
+      )}
+
       {activeRun && (
         <div className="composer-note">
           这个项目有一个进行中的运行（{activeRun.title || activeRun.runId}）。

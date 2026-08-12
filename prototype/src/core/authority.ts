@@ -894,6 +894,24 @@ export class RunAuthority {
       createdAt: nowIso(),
     };
 
+    /*
+     * 快照目录必须还在磁盘上。
+     *
+     * 内存里的 snapshots map 有它、磁盘上却没有，是一个真实会发生的组合：
+     * 保留策略的清理会回收"无 Run 引用"的快照，而刚导入还没建任务的快照
+     * 恰好就是这个状态。之前这里不校验，直接进 cloneTree，抛出的是
+     * 带宿主绝对路径的裸 ENOENT，一路冒泡成 `[core] unhandled` ——
+     * 用户看到的是一个没有原因、也不知道怎么办的失败。
+     * 悬空引用要在入口处判死，并且告诉用户下一步做什么。
+     */
+    if (!existsSync(snapshotDir(snapshot.snapshotId))) {
+      throw platformError(
+        'CONFLICT',
+        '这个快照已不在磁盘上（多半是被数据保留清理回收了），无法用它创建任务',
+        '点项目名重新导入一次即可 —— 重新导入会生成新的快照。',
+      );
+    }
+
     const runId = newId('run');
     const attemptId = newId('att');
     // 依赖复用要指向快照对应的那个目录：子包导入时是子包自己的 node_modules

@@ -214,6 +214,14 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
       if (sid && !stillReferenced.has(sid)) liveSnapshots.delete(sid);
     }
   }
+  /*
+   * 快照同样要有宽限期。
+   *
+   * "无 Run 引用"并不等于"没人要"：刚导入、还没创建任务的快照天然就是这个状态，
+   * 而那恰恰是用户正盯着界面准备开工的时刻。之前这里直接删，结果是清理一跑，
+   * 界面里攥着的 snapshotId 就成了悬空引用，点「开始」时 cloneTree 抛 ENOENT。
+   * 复用工作区那条宽限期：新鲜的快照一律留着。
+   */
   for (const snapshotId of listDirs(PATHS.snapshots)) {
     if (!budgetLeft()) break;
     scanned += 1;
@@ -221,7 +229,20 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
       items.push(keep('SNAPSHOT', snapshotId, 'KEPT_REFERENCED', '仍被至少一个 Run 引用'));
       continue;
     }
-    items.push(remove('SNAPSHOT', snapshotId, snapshotDir(snapshotId), '无 Run 引用'));
+    const createdAt = dirMtime(snapshotDir(snapshotId));
+    const due = createdAt + workspaceGrace;
+    if (createdAt > 0 && now < due) {
+      items.push(
+        keep(
+          'SNAPSHOT',
+          snapshotId,
+          'KEPT_NOT_DUE',
+          `刚导入、宽限期未过（还剩 ${Math.ceil((due - now) / 60000)} 分钟）—— 可能正要用它建任务`,
+        ),
+      );
+      continue;
+    }
+    items.push(remove('SNAPSHOT', snapshotId, snapshotDir(snapshotId), '无 Run 引用且过了宽限期'));
   }
 
   // ---- 4. artifact：无引用的孤儿 ----

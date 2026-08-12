@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -83,10 +83,17 @@ function mkWorkspace(runId: string): void {
   made.push(workspaceDir(runId));
 }
 
-function mkSnapshot(id: string): string {
+/**
+ * 造一个快照目录。`ageMinutes` 把目录的 mtime 相对 NOW 往前拨 ——
+ * 快照的回收判据里有宽限期，"多久以前导入的"必须能被测试控制，
+ * 否则拿到的永远是真实当下的时间戳（相对固定的 NOW 永远算"新鲜"）。
+ */
+function mkSnapshot(id: string, ageMinutes = 0): string {
   const dir = snapshotDir(id);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'a.ts'), 'y'.repeat(300), 'utf8');
+  const at = new Date(NOW - ageMinutes * 60_000);
+  utimesSync(dir, at, at);
   made.push(dir);
   return id;
 }
@@ -226,8 +233,24 @@ describe('快照与 artifact：引用计数', () => {
     expect(existsSync(snapshotDir(snapId))).toBe(true);
   });
 
-  it('无引用的快照删掉', () => {
-    const snapId = mkSnapshot(newId('snap'));
+  it('刚导入、还没建任务的快照不删 —— 那正是用户准备开工的时刻', () => {
+    /*
+     * 这条钉住一个真实事故：用户导入项目后跑了一次「立即清理」，
+     * 快照因"无 Run 引用"被删，界面还攥着那个 snapshotId，
+     * 点「开始」时 cloneTree 抛裸 ENOENT，冒泡成 [core] unhandled。
+     * "无 Run 引用"不等于"没人要"——刚导入的快照天然就是这个状态。
+     */
+    const fresh = mkSnapshot(newId('snap'), 0);
+    const s = sweep(refs({}, []), POLICY, NOW);
+
+    const item = s.items.find((i) => i.domain === 'SNAPSHOT' && i.target === fresh)!;
+    expect(item.outcome).toBe('KEPT_NOT_DUE');
+    expect(item.reason).toContain('宽限期未过');
+    expect(existsSync(snapshotDir(fresh))).toBe(true);
+  });
+
+  it('无引用且过了宽限期的快照才删掉', () => {
+    const snapId = mkSnapshot(newId('snap'), POLICY.workspaceGraceMinutes + 10);
     const s = sweep(refs({}, []), POLICY, NOW);
 
     expect(s.items.find((i) => i.domain === 'SNAPSHOT' && i.target === snapId)!.outcome).toBe(
@@ -239,7 +262,7 @@ describe('快照与 artifact：引用计数', () => {
   it('本轮刚被删掉证据的 Run，其独占快照同一轮就回收（不用等下一轮）', () => {
     // 之前 purgedRuns 是只写不读的死变量，注释写着"要扣掉刚删掉的那些 Run"却没扣，
     // 于是这个快照要等 6 小时后的下一轮才回收 —— 而那时它已经没有任何引用者了。
-    const snapId = mkSnapshot(newId('snap'));
+    const snapId = mkSnapshot(newId('snap'), POLICY.workspaceGraceMinutes + 10);
     const oldRun = mkRun(newId('run'));
     const s = sweep(
       refs({ [oldRun]: { terminal: true, ageDays: 400, snapshotId: snapId } }, [snapId]),
