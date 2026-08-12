@@ -143,6 +143,11 @@ export interface RequestMap {
        * **绝不**回落到 implementer 的 route（那就成了自审）。
        */
       reviewerModelProfileId?: string;
+      /**
+       * 可选：用本机的外部编码代理 CLI 当只读审核方（与 reviewerModelProfileId 二选一）。
+       * 同厂商会被拒绝 —— 异构是硬不变式。
+       */
+      reviewerConnectorId?: string;
     };
     res: { task: TaskSpec; run: RunView };
   };
@@ -176,6 +181,14 @@ export interface RequestMap {
    * NO_DELTA 收场时可用；恢复态（无活执行器）与时间预算耗尽会被拒。
    * accepted=false 时 reason 说明为什么 —— 拒绝不是异常，是决定。
    */
+  /**
+   * 可选审核方清单：模型 API profile + 本机检测到的外部 CLI 连接器。
+   * 界面据此给建议；不可用的也返回，带上原因，不静默消失。
+   */
+  'crossreview.reviewers': {
+    req: Record<string, never>;
+    res: { reviewers: readonly ReviewerOption[] };
+  };
   'crossreview.continue': {
     req: { runId: string };
     res: { run: RunView; accepted: boolean; reason: string | null };
@@ -257,6 +270,18 @@ export interface RequestMap {
     };
     res: PatchExportResult;
   };
+}
+
+/** 一个可选（或不可选）的审核方 */
+export interface ReviewerOption {
+  /** 传给 task.create 的值：模型 API 用 profileId，CLI 用 connectorId */
+  readonly id: string;
+  readonly kind: 'MODEL_API' | 'EXTERNAL_CLI';
+  readonly label: string;
+  readonly detail: string;
+  readonly available: boolean;
+  /** 不可用的原因 / 修复建议；可用时为 null */
+  readonly reason: string | null;
 }
 
 export interface RetentionPolicyView {

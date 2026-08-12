@@ -383,6 +383,23 @@ export class ModelGateway {
     }
   }
 
+  /**
+   * 按**凭据环境变量名**取 key，供外部 CLI 连接器使用。
+   *
+   * 外部 CLI 的 audience 是"某个厂商的 API Key"，不是某个 profile ——
+   * 所以按变量名找第一个能提供它的 provider。找不到返回 null，
+   * 由调用方降级；绝不回落到实现方的 key（audience 不同）。
+   */
+  credentialForVendor(credentialEnvVar: string): string | null {
+    for (const d of allProviders()) {
+      if (!d.env.includes(credentialEnvVar)) continue;
+      const key = resolveKey(d, this.appKeys.get(d.id));
+      if (key) return key;
+    }
+    // 应用内没配，但环境变量里可能直接有
+    return process.env[credentialEnvVar]?.trim() || null;
+  }
+
   private keyFor(providerId: ProviderId): string | null {
     return resolveKey(descriptorOf(providerId), this.appKeys.get(providerId));
   }

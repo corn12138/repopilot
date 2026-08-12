@@ -171,6 +171,7 @@ const ALLOWED_METHODS = new Set([
   'patch.get',
   'crossreview.get',
   'crossreview.continue',
+  'crossreview.reviewers',
   'patch.decide',
   'patch.export',
   'verification.list',
@@ -399,7 +400,13 @@ async function selfTest(): Promise<void> {
   console.log(`[selftest] Core 就绪，用时 ${Date.now() - started}ms`);
 
   let failures = 0;
-  for (const method of ['doctor.run', 'model.listProfiles', 'project.list', 'run.list']) {
+  for (const method of [
+    'doctor.run',
+    'model.listProfiles',
+    'crossreview.reviewers',
+    'project.list',
+    'run.list',
+  ]) {
     const result = await callCore(method, {});
     if (!result.ok) {
       console.error(`[selftest] FAIL ${method} → ${JSON.stringify(result.error)}`);
@@ -415,6 +422,17 @@ async function selfTest(): Promise<void> {
         console.log(
           `[selftest]   ${c.status === 'READY' ? '✓' : '✗'} ${c.checkId}(${c.status}) ${c.detail}` +
             `${c.remediation ? ` … ${c.remediation}` : ''}`,
+        );
+      }
+    } else if (method === 'crossreview.reviewers') {
+      const { reviewers } = result.data as {
+        reviewers: Array<{ id: string; kind: string; label: string; available: boolean; reason: string | null }>;
+      };
+      console.log(`[selftest] PASS crossreview.reviewers → ${reviewers.length} 个`);
+      for (const r of reviewers) {
+        console.log(
+          `[selftest]   ${r.available ? '✓' : '✗'} [${r.kind}] ${r.id} — ${r.label}` +
+            `${r.reason ? ` … ${r.reason}` : ''}`,
         );
       }
     } else {

@@ -546,7 +546,17 @@ function makeHooks(opts: { reverify?: 'pass' | 'fail' | 'disabled'; resealDigest
   return { hooks, calls, resealArgs, adopted };
 }
 
-const cycleInput = { reviewerResolution: RESOLUTION, patch: PATCH, finalVerification: VERIFICATION };
+/**
+ * 循环输入。审核方执行器由调用方注入 —— 这些用例验的是**模型 API 那条路**，
+ * 所以注入 runReviewPass；外部 CLI 那条路在 external/connector.test.ts 里验。
+ * 循环本身对"谁在审"是无知的，这正是它能同时服务两种选手的原因。
+ */
+const cycleInput = (deps: AgentDeps) => ({
+  review: (i: { patch: PatchArtifact; finalVerification: VerificationRun | null; round: number }) =>
+    runReviewPass(deps, { reviewerResolution: RESOLUTION, ...i }),
+  patch: PATCH,
+  finalVerification: VERIFICATION,
+});
 
 describe('runCrossReviewCycle：终止语义与 counter', () => {
   it('第 1 轮 PASS → REVIEWER_PASSED，零整改、零钩子调用', async () => {
@@ -554,7 +564,8 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     const duo = new ScriptedDuo(() => submitReview('PASS', []));
     const { hooks, calls } = makeHooks();
 
-    const out = await runCrossReviewCycle(makeDeps(duo, host, IMPLEMENTER), cycleInput, hooks);
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('REVIEWER_PASSED');
     expect(out.rounds).toHaveLength(1);
@@ -572,7 +583,8 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     );
     const { hooks, calls } = makeHooks();
 
-    const out = await runCrossReviewCycle(makeDeps(duo, host, IMPLEMENTER), cycleInput, hooks);
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('REVIEWER_PASSED');
     expect(out.remediations).toBe(0);
@@ -593,7 +605,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     ws = deps.workspace as unknown as ReviewWorkspace;
     const { hooks, calls, resealArgs, adopted } = makeHooks();
 
-    const out = await runCrossReviewCycle(deps, cycleInput, hooks);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('REVIEWER_PASSED');
     expect(out.rounds).toHaveLength(2);
@@ -617,7 +629,8 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     );
     const { hooks, calls } = makeHooks();
 
-    const out = await runCrossReviewCycle(makeDeps(duo, host, IMPLEMENTER), cycleInput, hooks);
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('NO_DELTA');
     expect(out.rounds).toHaveLength(1);
@@ -642,7 +655,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     ws = deps.workspace as unknown as ReviewWorkspace;
     const { hooks, calls } = makeHooks({ resealDigest: PATCH.digest });
 
-    const out = await runCrossReviewCycle(deps, cycleInput, hooks);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('NO_DELTA');
     expect(out.rounds).toHaveLength(1);
@@ -664,7 +677,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     ws = deps.workspace as unknown as ReviewWorkspace;
     const { hooks, calls } = makeHooks({ reverify: 'fail' });
 
-    const out = await runCrossReviewCycle(deps, cycleInput, hooks);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('NO_PROGRESS');
     expect(out.rounds).toHaveLength(1);
@@ -692,7 +705,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     ws = deps.workspace as unknown as ReviewWorkspace;
     const { hooks } = makeHooks();
 
-    const out = await runCrossReviewCycle(deps, cycleInput, hooks);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('NO_PROGRESS');
     expect(out.rounds).toHaveLength(2);
@@ -716,7 +729,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     ws = deps.workspace as unknown as ReviewWorkspace;
     const { hooks } = makeHooks();
 
-    const out = await runCrossReviewCycle(deps, cycleInput, hooks);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
     expect(out.stopReason).toBe('NO_PROGRESS');
   });
 
@@ -737,7 +750,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     ws = deps.workspace as unknown as ReviewWorkspace;
     const { hooks } = makeHooks();
 
-    const out = await runCrossReviewCycle(deps, cycleInput, hooks);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('COUNTER_EXHAUSTED');
     expect(out.rounds).toHaveLength(2);
@@ -750,7 +763,8 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     const duo = new ScriptedDuo(() => submitReview('CHANGES_REQUESTED', [FINDING_A]));
     const { hooks, calls } = makeHooks();
 
-    const out = await runCrossReviewCycle(makeDeps(duo, host, IMPLEMENTER), cycleInput, hooks);
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('BUDGET_EXHAUSTED');
     expect(out.rounds).toHaveLength(1);
@@ -766,7 +780,8 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     });
     const { hooks, calls } = makeHooks();
 
-    const out = await runCrossReviewCycle(makeDeps(duo, host, IMPLEMENTER), cycleInput, hooks);
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('REVIEWER_UNAVAILABLE');
     expect(out.rounds).toHaveLength(0);
@@ -788,7 +803,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     ws = deps.workspace as unknown as ReviewWorkspace;
     const { hooks, calls } = makeHooks();
 
-    const out = await runCrossReviewCycle(deps, cycleInput, hooks);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('CANCELLED');
     // 第 1 轮已经真实发生、token 已花掉 —— 不能因为取消把记录归零
@@ -812,7 +827,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     ws = deps.workspace as unknown as ReviewWorkspace;
     const { hooks, calls, resealArgs } = makeHooks({ reverify: 'disabled' });
 
-    const out = await runCrossReviewCycle(deps, cycleInput, hooks);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
 
     expect(out.stopReason).toBe('REVIEWER_PASSED');
     expect(out.rounds).toHaveLength(2);

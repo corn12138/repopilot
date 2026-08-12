@@ -712,7 +712,7 @@ function renderAllowedPaths(paths: readonly string[]): string {
   return paths.join(', ');
 }
 
-function renderReviewBrief(
+export function renderReviewBrief(
   task: TaskSpec,
   patch: PatchArtifact,
   verification: VerificationRun | null,
@@ -837,8 +837,20 @@ ${patch.unifiedDiff.length > 24_000 ? '（diff 过长已截断，可用 fs_read 
 - 修改文件前先 fs_read 拿 receipt。改完直接结束回合，无需汇报。`;
 }
 
+/**
+ * 跑一轮审核并交回结果。**审核方是谁由调用方决定** —— 模型 API profile
+ * 走 runReviewPass，外部 CLI 走连接器；循环本身不关心，它只管收敛语义。
+ * 这就是"只换选手不换规则"在编排层的形状。
+ */
+export type ReviewPassRunner = (input: {
+  readonly patch: PatchArtifact;
+  readonly finalVerification: VerificationRun | null;
+  readonly round: number;
+}) => Promise<CrossReviewRound>;
+
 export interface CrossReviewCycleInput {
-  readonly reviewerResolution: ModelRouteResolution;
+  /** 审核方执行器。默认实现（模型 API）见 authority.modelApiReviewer */
+  readonly review: ReviewPassRunner;
   readonly patch: PatchArtifact;
   readonly finalVerification: VerificationRun | null;
 }
@@ -900,8 +912,7 @@ export async function runCrossReviewCycle(
   // ---- 第 1 轮审核 ----
   let round1: CrossReviewRound;
   try {
-    round1 = await runReviewPass(deps, {
-      reviewerResolution: input.reviewerResolution,
+    round1 = await input.review({
       patch: input.patch,
       finalVerification: input.finalVerification,
       round: 1,
@@ -994,8 +1005,7 @@ export async function runCrossReviewCycle(
 
   let round2: CrossReviewRound;
   try {
-    round2 = await runReviewPass(deps, {
-      reviewerResolution: input.reviewerResolution,
+    round2 = await input.review({
       patch: resealed,
       finalVerification: nextVerification,
       round: 2,

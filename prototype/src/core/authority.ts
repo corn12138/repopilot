@@ -29,15 +29,25 @@ import type {
 } from '@shared/domain';
 import { CROSS_REVIEW_LIMITS, EMPTY_LEDGER, applyLedgerCharge, isTerminal } from '@shared/domain';
 import { sha256 } from '@shared/ids';
-import type { ImportOutcome, PatchExportResult, PlatformError, PushEvent } from '@shared/protocol';
+import type {
+  ImportOutcome,
+  PatchExportResult,
+  PlatformError,
+  PushEvent,
+  ReviewerOption,
+} from '@shared/protocol';
 import { digestOf, newId, nowIso } from '@shared/ids';
 import {
   AgentCancelled,
   PlanningFailed,
   composeUnverifiedItems,
+  parseExternalSubmission,
+  renderReviewBrief,
   runAgent,
   runCrossReviewCycle,
+  runReviewPass,
   type AgentDeps,
+  type ReviewPassRunner,
 } from './agent';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
@@ -51,7 +61,16 @@ import {
 } from './repo';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { buildChildEnv, resolveBinary } from './command';
-import { discoverConnectors } from './external/connector';
+import {
+  SameVendorReviewDenied,
+  assertHeterogeneousVendor,
+  descriptorOfConnector,
+  discoverConnectors,
+  probeConnector,
+  runExternalCliReview,
+  type ExternalConnectorProfile,
+  type ExternalVendor,
+} from './external/connector';
 import { EventStore, readJson, writeJsonAtomic } from './store';
 import {
   RUN_STATE_SCHEMA_VERSION,
@@ -152,6 +171,28 @@ export class PausableDeadline {
   }
 }
 
+/**
+ * 外部 CLI 单次审核超时。给得比模型 API 宽 —— CLI 有进程冷启动，
+ * 内部可能自己重试。防的是挂死，不是延迟 SLA。
+ */
+const EXTERNAL_REVIEW_TIMEOUT_MS = 300_000;
+
+/** 审核方绑定：模型 API 与外部 CLI 两种选手，规则完全相同 */
+export type ReviewerBinding =
+  | {
+      readonly kind: 'MODEL_API';
+      readonly resolution: ModelRouteResolution;
+      readonly heterogeneous: boolean;
+      readonly label: string;
+    }
+  | {
+      readonly kind: 'EXTERNAL_CLI';
+      readonly connector: ExternalConnectorProfile;
+      readonly apiKey: string;
+      readonly heterogeneous: boolean;
+      readonly label: string;
+    };
+
 interface RunRecord {
   view: RunView;
   readonly task: TaskSpec;
@@ -172,10 +213,13 @@ interface RunRecord {
   plan: PlanRevision | null;
   patch: PatchArtifact | null;
   /**
-   * 交叉审核方的冻结 route。null = 本任务不做交叉审核（未请求或凭据降级）。
-   * 与 implementer 的 resolution 严格分离 —— 绝不共用。
+   * 交叉审核方。null = 本任务不做交叉审核（未请求或降级）。
+   * 与 implementer 严格分离 —— 绝不共用。
+   *
+   * 两种选手共存：模型 API profile（冻结 route）与外部 CLI 连接器。
+   * 循环编排对此无知 —— 它只拿到一个 ReviewPassRunner。
    */
-  reviewer: { resolution: ModelRouteResolution; heterogeneous: boolean } | null;
+  reviewer: ReviewerBinding | null;
   /** 交叉审核聚合记录；跑过才有 */
   crossReview: CrossReviewRecord | null;
   /** 实现方冻结路由 + 执行起点。交叉审核续期（crossreview.continue）复用；恢复态没有 */
@@ -521,6 +565,9 @@ export class RunAuthority {
       case 'crossreview.get':
         return { crossReview: this.runs.get(String(payload.runId))?.crossReview ?? null };
 
+      case 'crossreview.reviewers':
+        return { reviewers: this.listReviewers() };
+
       case 'crossreview.continue':
         return this.continueCrossReview(String(payload.runId));
 
@@ -824,6 +871,7 @@ export class RunAuthority {
     verificationCommandIds: string[];
     customCommands?: Array<{ label: string; argv: string[] }>;
     reviewerModelProfileId?: string;
+    reviewerConnectorId?: string;
   }): { task: TaskSpec; run: RunView } {
     const project = this.projects.get(input.projectId);
     const snapshot = this.snapshots.get(input.snapshotId);
@@ -851,9 +899,19 @@ export class RunAuthority {
 
     // 交叉审核方 route：每任务显式勾选，凭据缺失时降级为不审核，
     // 绝不回落到 implementer 的 route（那就成了自审）。
-    let reviewer: { resolution: ModelRouteResolution; heterogeneous: boolean } | null = null;
+    let reviewer: ReviewerBinding | null = null;
     let reviewerDegradeNote: string | null = null;
-    if (input.reviewerModelProfileId) {
+    if (input.reviewerConnectorId) {
+      // ---- 外部 CLI 审核方 ----
+      try {
+        reviewer = this.bindCliReviewer(input.reviewerConnectorId, resolution);
+      } catch (err) {
+        reviewerDegradeNote =
+          err instanceof SameVendorReviewDenied
+            ? `已请求外部 CLI 审核，但${err.message} —— 本次降级为不审核`
+            : `已请求外部 CLI 审核，但连接器不可用（${(err as Error).message}）—— 本次降级为不审核`;
+      }
+    } else if (input.reviewerModelProfileId) {
       if (input.reviewerModelProfileId === input.modelProfileId) {
         // 同一个 profile 一写一审没有独立第二意见的价值，如实降级
         reviewerDegradeNote = '交叉审核方与实现方是同一个 profile —— 无法提供独立第二意见，已跳过交叉审核';
@@ -861,8 +919,10 @@ export class RunAuthority {
         try {
           const reviewerResolution = this.gateway.freezeRoute(input.reviewerModelProfileId);
           reviewer = {
+            kind: 'MODEL_API',
             resolution: reviewerResolution,
             heterogeneous: reviewerResolution.providerId !== resolution.providerId,
+            label: `${reviewerResolution.providerId}/${reviewerResolution.modelId}`,
           };
         } catch (err) {
           // 审核方没配凭据：降级，不阻断任务创建，也不偷偷改用 implementer 的 key
@@ -995,8 +1055,16 @@ export class RunAuthority {
       this.emit(
         record,
         'NOTE',
-        `已启用交叉审核：审核方 ${reviewer.resolution.providerId}/${reviewer.resolution.modelId}${reviewer.heterogeneous ? '（与实现方异构）' : '（与实现方同源，第二意见价值有限）'}`,
-        { reviewerRoute: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId }, heterogeneous: reviewer.heterogeneous },
+        `已启用交叉审核：审核方 ${reviewer.label}（${reviewer.kind === 'EXTERNAL_CLI' ? '外部 CLI' : '模型 API'}）` +
+          `${reviewer.heterogeneous ? '，与实现方异构' : '，与实现方同源，第二意见价值有限'}`,
+        {
+          reviewerKind: reviewer.kind,
+          reviewerLabel: reviewer.label,
+          heterogeneous: reviewer.heterogeneous,
+          ...(reviewer.kind === 'MODEL_API'
+            ? { reviewerRoute: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId } }
+            : { connectorId: reviewer.connector.connectorId, identityDigest: reviewer.connector.identityDigest }),
+        },
       );
     }
 
@@ -1165,6 +1233,148 @@ export class RunAuthority {
    *   - 出错 / 取消 / 审核方不可用都吞进 stopReason，不让交叉审核的失败拖垮主 Run
    *   - 整改后验证失败时工作区**恢复到整改前内容**：封存补丁和文件树必须指同一棵树
    */
+  /**
+   * 绑定外部 CLI 审核方。
+   *
+   * 三道门，缺一不可 —— 任何一道不过都抛错并降级为不审核，绝不"先跑起来再说"：
+   *   1. 连接器现场探测必须 READY（有可自动化的非交互入口）；
+   *   2. vendor 必须与实现方异构 —— 这是硬不变式，不是披露项；
+   *   3. 必须有该 vendor 的显式凭据。**不复用实现方的 key**（audience 不同），
+   *      也绝不让外部 CLI 用宿主登录态跑（那会静默消耗用户订阅）。
+   */
+  /**
+   * 列出所有可选审核方：模型 API profile + 本机检测到的外部 CLI。
+   * **不可用的也返回**，带上原因 —— 静默从清单里消失，用户只会以为"没这个功能"。
+   */
+  private listReviewers(): ReviewerOption[] {
+    const out: ReviewerOption[] = [];
+    for (const p of this.gateway.listProfiles()) {
+      out.push({
+        id: p.profileId,
+        kind: 'MODEL_API',
+        label: `${p.label} · ${p.modelId}`,
+        detail: p.enabled ? `已配置凭据（${p.credentialSource === 'APP' ? '应用内' : '环境变量'}）` : '未配置凭据',
+        available: p.enabled,
+        reason: p.enabled ? null : `在「设置 · API」里填 ${p.label} 的 Key，或设置 ${p.credentialEnvVar}`,
+      });
+    }
+    for (const c of discoverConnectors()) {
+      const hasKey = Boolean(this.gateway.credentialForVendor(c.credentialEnvVar));
+      const usable = c.state === 'READY' && hasKey;
+      out.push({
+        id: c.connectorId,
+        kind: 'EXTERNAL_CLI',
+        label: `${c.label}${c.version ? ` · ${c.version}` : ''}`,
+        detail: c.detail,
+        available: usable,
+        reason: usable
+          ? null
+          : c.state !== 'READY'
+            ? (c.remediation ?? c.detail)
+            : `缺少 ${c.credentialEnvVar}：外部 CLI 只用你显式配置的 Key，不借用宿主登录态`,
+      });
+    }
+    return out;
+  }
+
+  private bindCliReviewer(
+    connectorId: string,
+    implementer: ModelRouteResolution,
+  ): ReviewerBinding {
+    const d = descriptorOfConnector(connectorId);
+    if (!d) throw new Error(`未知的外部连接器：${connectorId}`);
+    const connector = probeConnector(d);
+    if (connector.state !== 'READY') throw new Error(connector.detail);
+
+    // 实现方的 vendor 由它的 providerId 推断；推不出来就当作与任何人都异构
+    const implementerVendor = vendorOfProvider(implementer.providerId);
+    if (implementerVendor) assertHeterogeneousVendor(implementerVendor, connector.vendor);
+
+    const apiKey = this.gateway.credentialForVendor(connector.credentialEnvVar);
+    if (!apiKey) {
+      throw new Error(
+        `缺少 ${connector.credentialEnvVar}：拒绝让外部 CLI 用宿主登录态运行，请先配置该供应商的 Key`,
+      );
+    }
+    return {
+      kind: 'EXTERNAL_CLI',
+      connector,
+      apiKey,
+      heterogeneous: true, // 上面已断言，同厂商到不了这里
+      label: `${connector.label} ${connector.version ?? ''}`.trim(),
+    };
+  }
+
+  /**
+   * 造一个审核执行器。**两种选手，同一套规则** ——
+   * 都产出 CrossReviewRound、都用平台算的指纹、都受同一个循环的收敛约束。
+   * 循环编排拿到的只是这个函数，它不知道背后是模型 API 还是本机的 CLI。
+   */
+  private reviewerRunnerFor(
+    record: RunRecord,
+    reviewer: ReviewerBinding,
+    deps: AgentDeps,
+  ): ReviewPassRunner {
+    if (reviewer.kind === 'MODEL_API') {
+      return (i) => runReviewPass(deps, { ...i, reviewerResolution: reviewer.resolution });
+    }
+    return async (i) => {
+      const startedAt = nowIso();
+      const result = await runExternalCliReview({
+        connector: reviewer.connector,
+        apiKey: reviewer.apiKey,
+        brief: renderReviewBrief(record.task, i.patch, i.finalVerification),
+        runId: record.view.runId,
+        attemptId: record.view.attemptId,
+        timeoutMs: EXTERNAL_REVIEW_TIMEOUT_MS,
+        signal: record.abort.signal,
+      });
+
+      // CLI 调用的凭证与模型出站清单平行落账 —— 合同要求两条路径不得互相伪装
+      this.emit(
+        record,
+        'MODEL_INVOCATION',
+        `CROSS_REVIEW 调用外部 CLI ${reviewer.label}（${result.manifest.state}${
+          result.manifest.exitCode !== null ? ` exit=${result.manifest.exitCode}` : ''
+        }）`,
+        { externalInvocation: result.manifest },
+      );
+
+      const round = {
+        round: i.round,
+        reviewedPatchDigest: i.patch.digest,
+        reviewerResolutionId: `external:${reviewer.connector.connectorId}`,
+        startedAt,
+        finishedAt: nowIso(),
+      };
+      if (!result.submission) {
+        // 拿不到结论就是拿不到 —— 记 INCONCLUSIVE，绝不当作"没有发现"
+        this.emit(
+          record,
+          'NOTE',
+          `外部审核方未产出可用结论（${result.manifest.failureDetail ?? result.manifest.state}）：本轮记为 INCONCLUSIVE`,
+        );
+        return { ...round, verdict: 'INCONCLUSIVE' as const, findings: [] };
+      }
+      const normalized = parseExternalSubmission(
+        result.submission.verdict,
+        result.submission.findings,
+      );
+      if (!normalized) {
+        this.emit(record, 'NOTE', '外部审核方的结论未通过 schema 校验：本轮记为 INCONCLUSIVE');
+        return { ...round, verdict: 'INCONCLUSIVE' as const, findings: [] };
+      }
+      this.emit(
+        record,
+        'CROSS_REVIEW_ROUND',
+        `第 ${i.round} 轮交叉审核（外部 CLI）：${normalized.verdict}，${normalized.findings.length} 条发现` +
+          `（阻断 ${normalized.findings.filter((f) => f.blocking).length}）`,
+        { round: i.round, verdict: normalized.verdict, findingCount: normalized.findings.length },
+      );
+      return { ...round, verdict: normalized.verdict, findings: normalized.findings };
+    };
+  }
+
   private async runCrossReview(
     record: RunRecord,
     workspace: MaterializedWorkspace,
@@ -1186,8 +1396,9 @@ export class RunAuthority {
       isContinuation ? '用户授权续期：第二个模型再次只读交叉审核' : '第二个模型正在只读交叉审核',
     );
     const crStart = nowIso();
-    this.emit(record, 'CROSS_REVIEW_STARTED', `交叉审核开始：${reviewer.resolution.modelId}`, {
-      reviewer: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId },
+    this.emit(record, 'CROSS_REVIEW_STARTED', `交叉审核开始：${reviewer.label}`, {
+      reviewerKind: reviewer.kind,
+      reviewerLabel: reviewer.label,
       heterogeneous: reviewer.heterogeneous,
       limits: CROSS_REVIEW_LIMITS,
       ...(isContinuation ? { continuation: (prior?.userContinuations ?? 0) + 1 } : {}),
@@ -1199,7 +1410,7 @@ export class RunAuthority {
       profile: record.profile,
       workspace,
       gateway: this.gateway,
-      // 整改要以实现方身份改文件；审核调用走 input.reviewerResolution，不经这里
+      // 整改要以实现方身份改文件；审核调用走注入的 review 执行器，不经这里
       resolution: implementerResolution,
       mutationPolicy: {
         ...DEFAULT_MUTATION_POLICY,
@@ -1222,7 +1433,7 @@ export class RunAuthority {
     try {
       const outcome = await runCrossReviewCycle(
         deps,
-        { reviewerResolution: reviewer.resolution, patch, finalVerification },
+        { review: this.reviewerRunnerFor(record, reviewer, deps), patch, finalVerification },
         {
           reverify: verificationEnabled
             ? async () => {
@@ -1299,7 +1510,11 @@ export class RunAuthority {
     const renumbered = rounds.map((r, i) => ({ ...r, round: priorRounds.length + i + 1 }));
     const cr: CrossReviewRecord = {
       enabled: true,
-      reviewerProfileId: reviewer.resolution.profileId,
+      // 外部 CLI 没有 profileId，用连接器 id 占同一个字段（前缀区分来源）
+      reviewerProfileId:
+        reviewer.kind === 'MODEL_API'
+          ? reviewer.resolution.profileId
+          : `external:${reviewer.connector.connectorId}`,
       heterogeneous: reviewer.heterogeneous,
       rounds: [...priorRounds, ...renumbered],
       reviewerInvocations: (prior?.reviewerInvocations ?? 0) + rounds.length,
@@ -2115,6 +2330,17 @@ export class CoreError extends Error {
   constructor(readonly payload: PlatformError) {
     super(payload.message);
   }
+}
+
+/**
+ * 从 providerId 推断厂商。只认得出官方那几个 —— 中转站和自定义 provider
+ * 背后是谁无法证明，返回 null 表示"无法证明同厂商"，此时不拦。
+ * 宁可放过一次同源审核（价值有限但无害），也不误拦一次合法的异构审核。
+ */
+function vendorOfProvider(providerId: string): ExternalVendor | null {
+  if (providerId === 'anthropic') return 'ANTHROPIC';
+  if (providerId === 'openai') return 'OPENAI';
+  return null;
 }
 
 export function platformError(
