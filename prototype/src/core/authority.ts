@@ -1985,6 +1985,7 @@ export class RunAuthority {
                   record.profile,
                   record.task.verificationCommandIds,
                   record.abort.signal,
+                  deps.host, // 整改后的重验也进 ToolCall 与账本
                 );
                 record.verifications.push(v);
                 this.emit(

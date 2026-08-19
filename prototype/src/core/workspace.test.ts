@@ -386,7 +386,7 @@ describe('generation：stage / commit / discard', () => {
 
   it('expectedActive 不匹配 → commit 失败，且 active 与 receipt 一个都不动', () => {
     const ws = newWorkspace();
-    const { receipt } = ws.issueReceipt('src/app.ts');
+    const { receipt } = ws.issueReceipt('src/app.ts', 'FULL_BLOB');
     const staged = ws.stage();
     writeRaw(staged.path, 'src/app.ts', 'const a = 99;\n');
     const before = fingerprint(ws);
@@ -489,7 +489,7 @@ describe('restoreGeneration：前进式恢复（revert，不是 reset）', () =>
   it('恢复也是切代：旧 receipt 一律作废', () => {
     const ws = newWorkspace();
     advance(ws, 'gen1\n');
-    const { receipt } = ws.issueReceipt('src/app.ts');
+    const { receipt } = ws.issueReceipt('src/app.ts', 'FULL_BLOB');
     ws.restoreGeneration(0);
     expect(ws.getReceipt(receipt.receiptId)).toBeUndefined();
   });
@@ -528,7 +528,7 @@ describe('restoreGeneration：前进式恢复（revert，不是 reset）', () =>
 describe('read receipt', () => {
   it('digest / byteLength 与磁盘内容一致，generation 是签发时的当前代', () => {
     const ws = newWorkspace();
-    const { content, receipt } = ws.issueReceipt('src/i18n.ts');
+    const { content, receipt } = ws.issueReceipt('src/i18n.ts', 'FULL_BLOB');
     const raw = readFileSync(join(ws.activePath, 'src/i18n.ts'));
 
     expect(content).toBe(FIXTURE['src/i18n.ts']);
@@ -541,7 +541,7 @@ describe('read receipt', () => {
 
   it('expiresAt 在未来，且比 readAt 晚 15 分钟', () => {
     const ws = newWorkspace();
-    const { receipt } = ws.issueReceipt('src/app.ts');
+    const { receipt } = ws.issueReceipt('src/app.ts', 'FULL_BLOB');
     const ttl = Date.parse(receipt.expiresAt) - Date.parse(receipt.readAt);
 
     expect(Date.parse(receipt.expiresAt)).toBeGreaterThan(Date.now());
@@ -551,7 +551,7 @@ describe('read receipt', () => {
 
   it('receipt 是读取瞬间的快照，文件后来被改也不会跟着变', () => {
     const ws = newWorkspace();
-    const { receipt } = ws.issueReceipt('src/app.ts');
+    const { receipt } = ws.issueReceipt('src/app.ts', 'FULL_BLOB');
     writeRaw(ws.activePath, 'src/app.ts', '别人改过了\n');
 
     // 若 fileDigest 是"活引用"，apply 时的二次校验就形同虚设
@@ -561,8 +561,8 @@ describe('read receipt', () => {
 
   it('同一文件连发两张凭据，id 不同且都可查', () => {
     const ws = newWorkspace();
-    const a = ws.issueReceipt('src/app.ts').receipt;
-    const b = ws.issueReceipt('src/app.ts').receipt;
+    const a = ws.issueReceipt('src/app.ts', 'FULL_BLOB').receipt;
+    const b = ws.issueReceipt('src/app.ts', 'FULL_BLOB').receipt;
     expect(a.receiptId).not.toBe(b.receiptId);
     expect(ws.getReceipt(a.receiptId)?.receiptId).toBe(a.receiptId);
     expect(ws.getReceipt(b.receiptId)?.receiptId).toBe(b.receiptId);
@@ -570,8 +570,8 @@ describe('read receipt', () => {
 
   it('切代之后所有旧凭据一律失效（它们绑定的是旧 generation）', () => {
     const ws = newWorkspace();
-    const a = ws.issueReceipt('src/app.ts').receipt;
-    const b = ws.issueReceipt('package.json').receipt;
+    const a = ws.issueReceipt('src/app.ts', 'FULL_BLOB').receipt;
+    const b = ws.issueReceipt('package.json', 'FULL_BLOB').receipt;
 
     const staged = ws.stage();
     expect(ws.commit(staged.generation, 0)).toBe(true);
@@ -579,12 +579,12 @@ describe('read receipt', () => {
     expect(ws.getReceipt(a.receiptId)).toBeUndefined();
     expect(ws.getReceipt(b.receiptId)).toBeUndefined();
     // 新代重新签发的凭据带的是新代号
-    expect(ws.issueReceipt('src/app.ts').receipt.generation).toBe(1);
+    expect(ws.issueReceipt('src/app.ts', 'FULL_BLOB').receipt.generation).toBe(1);
   });
 
   it('discard 不清凭据 —— active 没动，凭据就还有效', () => {
     const ws = newWorkspace();
-    const { receipt } = ws.issueReceipt('src/app.ts');
+    const { receipt } = ws.issueReceipt('src/app.ts', 'FULL_BLOB');
     const staged = ws.stage();
     ws.discard(staged.generation);
     expect(ws.getReceipt(receipt.receiptId)).toBeDefined();
@@ -592,7 +592,7 @@ describe('read receipt', () => {
 
   it('未知 receiptId 返回 undefined，不返回"看起来像"的那张', () => {
     const ws = newWorkspace();
-    ws.issueReceipt('src/app.ts');
+    ws.issueReceipt('src/app.ts', 'FULL_BLOB');
     expect(ws.getReceipt('rcpt_不存在')).toBeUndefined();
   });
 
@@ -600,12 +600,12 @@ describe('read receipt', () => {
     const ws = newWorkspace();
     const outside = newScratch({ 'secret.txt': 'TOP SECRET' });
     symlinkSync(join(outside, 'secret.txt'), join(ws.activePath, 'leak.ts'));
-    expect(violationOf(() => ws.issueReceipt('leak.ts')).reason).toBe('SYMLINK_REJECTED');
+    expect(violationOf(() => ws.issueReceipt('leak.ts', 'FULL_BLOB')).reason).toBe('SYMLINK_REJECTED');
   });
 
   it('逃逸路径不发凭据：抛 PATH_ESCAPE', () => {
     const ws = newWorkspace();
-    expect(violationOf(() => ws.issueReceipt('../outside.ts')).reason).toBe('PATH_ESCAPE');
+    expect(violationOf(() => ws.issueReceipt('../outside.ts', 'FULL_BLOB')).reason).toBe('PATH_ESCAPE');
   });
 });
 

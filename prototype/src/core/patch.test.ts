@@ -116,7 +116,7 @@ function mutate(
 ): void {
   const operations: MutationOperation[] = specs.map((s) => {
     if (s.kind === 'CREATE_FILE') return { kind: 'CREATE_FILE', path: s.path, newText: s.newText };
-    const { receipt } = ws.issueReceipt(s.path);
+    const { receipt } = ws.issueReceipt(s.path, 'FULL_BLOB');
     return {
       kind: s.kind,
       path: s.path,

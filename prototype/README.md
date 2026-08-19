@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 49 个文件、876 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 49 个文件、891 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -76,6 +76,10 @@
 | 任务输入区：披露常驻输入框上方；不勾同意不能发；选了作者/审核方后 digest 变、同意自动作废；披露取不到显示原因且不能发 | `TaskForm.externalAuthor.test.tsx` |
 | 运行页「数据出站」面板：同意摘要 + 每次模型/CLI 出站一行，NOT_SENT 带阻断原因并列展示，token 未知不填 0 | `RunDetail.test.tsx` |
 | **Slice I-1 用户命令分级**：按可执行名 + 子命令白名单分 R1–R4；`git push/merge/reset/commit`、`npm publish`、`sudo/ssh/env/aws/kubectl` → R4，`rm/chmod/mv/dd` → R3，`install/add/ci/curl/wget/docker/未知二进制` → R2（fail-closed），只有 R1 能登记为验证命令；e2e：`git push origin main`/`rm -rf dist`/`npm install x`/`sh -c` 在 task.create 被拒且不执行、不建 Run，`node check.mjs` 照常 | `commandRisk.test.ts` / `authority.coverage.e2e.test.ts` |
+| **Slice I-2 receipt 覆盖范围**：fs_read 未截断 → `FULL_BLOB`；被截断 → `BYTE_RANGE` + coveredBytes 按真正展示的行数算，并当场告诉模型不能整文件替换；BYTE_RANGE receipt 的 `REPLACE_WHOLE_FILE` → `RECEIPT_COVERAGE_INSUFFICIENT` 且逐字节不变，exact-span 仍可用，FULL_BLOB 照常通过 | `tools.test.ts` / `mutation.test.ts` |
+| **Slice I-2 尾部不再被静默删**：400 行文件 fs_read 只给前 120 行 → 模型据此整文件替换被拒，`line 399` 还在 | `tools.test.ts` |
+| **Slice I-2 同一账本**：平台发起的验证命令留 `verify_command` ToolCall（带 `BASELINE/VERIFICATION` role、commandId、argv）并计入预算；未登记命令与取消也留记录（取消不计账）；非 R1 的 profile 命令拒绝执行且验证不 passed；不传 recorder 行为不变 | `verify.test.ts` |
+| 时间线：`verify_command` 不重复成行，合并进"另有 N 条事件没有单独成行"并点名；模型发起的 `run_command` 仍单独成行 | `Transcript.test.tsx` |
 
 ## 尚未证明的
 

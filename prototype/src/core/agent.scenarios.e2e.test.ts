@@ -273,8 +273,11 @@ describe('端到端场景：拒绝 / 冲突 / 未验证 / 自修复', () => {
         expect(model.consumed).toBe(2);
 
         // ---- 零副作用：三个独立角度各查一遍 ----
-        // 1) 规划阶段被平台限制为只读，压根没有 R1 工具被派发
-        expect(host.toolCalls.filter((t) => t.risk !== 'R0')).toHaveLength(0);
+        // 1) 规划阶段被平台限制为只读，压根没有**模型发起的** R1 工具被派发
+        //    （基线验证是平台发起的 verify_command，它有自己的记录，不算模型副作用）
+        expect(
+          host.toolCalls.filter((t) => t.risk !== 'R0' && t.toolName !== 'verify_command'),
+        ).toHaveLength(0);
         // 2) generation 没推进，连 staged 目录都不存在
         expect(h.workspace.activeGeneration).toBe(0);
         expect(existsSync(h.workspace.generationPath(1))).toBe(false);

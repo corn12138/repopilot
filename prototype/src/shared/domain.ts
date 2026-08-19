@@ -132,6 +132,14 @@ export interface RepositoryHarnessProfile {
   readonly notes: readonly string[];
 }
 
+/**
+ * 一次命令执行的发起者与用途（TD §9.4「同一 Gateway、同一账本」）。
+ *
+ * 平台自己发起的验证不是"免账"的特权路径：它同样产生 ToolCall 记录、同样计入账本、
+ * 同样过风险闸门，只是审批来源是 VerificationPolicy 而不是模型。
+ */
+export type CommandRole = 'MODEL_PROPOSED' | 'BASELINE' | 'VERIFICATION';
+
 export interface CommandDefinition {
   readonly commandId: string;
   readonly label: string;
@@ -523,6 +531,16 @@ export interface MutationReadReceipt {
   readonly path: string;
   readonly fileDigest: Digest;
   readonly byteLength: number;
+  /**
+   * 这次读取**让读者看到了多少**（TD §9.12）。
+   *
+   * `FULL_BLOB` = 全文都给出去了；`BYTE_RANGE` = 只给了一段（例如 fs_read 的预览被上限截断）。
+   * 这是 `REPLACE_WHOLE_FILE` 的准入条件：只见过开头就整文件覆盖，等于把没看过的尾部
+   * 静默删掉。digest 相同只能证明"文件没变"，证明不了"读者看过全文"。
+   */
+  readonly coverage: 'FULL_BLOB' | 'BYTE_RANGE';
+  /** 实际给出去的原始内容字节数；FULL_BLOB 时等于 byteLength */
+  readonly coveredBytes: number;
   readonly readAt: Iso8601;
   readonly expiresAt: Iso8601;
 }
@@ -563,6 +581,8 @@ export type MutationBlockReason =
   | 'TARGET_ABSENT'
   | 'BUDGET_EXCEEDED'
   | 'SYMLINK_REJECTED'
+  /** receipt 的覆盖范围不足以支撑该 operation（只读了一段就要整文件替换） */
+  | 'RECEIPT_COVERAGE_INSUFFICIENT'
   /** 请求路径的拼写与磁盘上真实条目不一致（大小写/Unicode 归一绕过）：
    * 例如在 APFS 上用 'Package.json' 落到 'package.json'，绕过大小写敏感的受保护路径匹配 */
   | 'PATH_CASE_MISMATCH';

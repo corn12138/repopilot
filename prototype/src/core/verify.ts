@@ -1,12 +1,50 @@
 import type {
+  CommandDefinition,
   CommandOutcome,
+  CommandRole,
   RepositoryHarnessProfile,
+  ToolCallResolution,
   VerificationComparison,
   VerificationRun,
 } from '@shared/domain';
-import { newId, nowIso } from '@shared/ids';
+import { digestOf, newId, nowIso } from '@shared/ids';
 import { runCommand } from './command';
 import type { MaterializedWorkspace } from './workspace';
+
+/**
+ * 验证命令的记账口（TD §9.4 的「同一 Gateway、同一账本」）。
+ *
+ * 结构上是 `AgentHost` 的子集，所以 agent 与 authority 直接把各自的 host 传进来即可。
+ * 传 null 表示"这次不记账" —— 只允许在**没有 Run 语境**的单测里出现；产品路径上
+ * 三个调用点（baseline / post-mutation / 整改后重验）全部传 host。
+ *
+ * 08-17 审计：此前 runVerification 直接调 runCommand，绕过 dispatchTool ——
+ * 没有 ToolCall 记录、没有风险闸门、不计预算。用户在时间线上看不到平台跑了什么。
+ */
+export interface VerificationRecorder {
+  beginToolCall(input: {
+    toolName: string;
+    risk: CommandDefinition['risk'];
+    argsSummary: string;
+    argsDigest: string;
+  }): string;
+  endToolCall(
+    toolCallId: string,
+    resolution: ToolCallResolution,
+    reason: string | null,
+    preview: string,
+    previewTruncated: boolean,
+    artifactRef: string | null,
+  ): void;
+  chargeToolCall(): void;
+}
+
+/** 命令结果 → ToolCall resolution。判别联合不能在这里被压成布尔 */
+function resolutionOf(outcome: CommandOutcome['outcome']): ToolCallResolution {
+  if (outcome === 'EXIT_ZERO') return 'SUCCEEDED';
+  if (outcome === 'CANCELLED') return 'CANCELLED';
+  return 'FAILED';
+}
 
 /**
  * 在指定工作区跑一组验证命令。
@@ -24,9 +62,40 @@ export async function runVerification(
   profile: RepositoryHarnessProfile,
   commandIds: readonly string[],
   signal: AbortSignal,
+  recorder: VerificationRecorder | null = null,
 ): Promise<VerificationRun> {
   const startedAt = nowIso();
   const outcomes: CommandOutcome[] = [];
+  const role: CommandRole = phase === 'BASELINE' ? 'BASELINE' : 'VERIFICATION';
+
+  /** 每条命令都留一条 ToolCall 记录 —— 包括没跑成的那些 */
+  const record = (
+    def: Pick<CommandDefinition, 'commandId' | 'argv' | 'risk'>,
+    run: () => Promise<CommandOutcome>,
+  ): Promise<CommandOutcome> => {
+    if (!recorder) return run();
+    const toolCallId = recorder.beginToolCall({
+      toolName: 'verify_command',
+      risk: def.risk,
+      argsSummary: `${role} ${def.commandId}: ${def.argv.join(' ') || '(未登记)'}`,
+      argsDigest: digestOf({ role, commandId: def.commandId, argv: def.argv }),
+    });
+    return run().then((outcome) => {
+      // 计费在执行之后：DENIED / 未登记的命令不该占用户的预算
+      if (outcome.outcome !== 'CANCELLED') recorder.chargeToolCall();
+      recorder.endToolCall(
+        toolCallId,
+        resolutionOf(outcome.outcome),
+        outcome.outcome === 'EXIT_ZERO' ? null : outcome.outcome,
+        `${outcome.outcome}${outcome.exitCode !== null ? ` exit=${outcome.exitCode}` : ''}\n${
+          outcome.stderrPreview || outcome.stdoutPreview
+        }`.slice(0, 2_000),
+        outcome.outputTruncated,
+        null,
+      );
+      return outcome;
+    });
+  };
 
   for (const id of commandIds) {
     // hasOwnProperty 而不是直接取值：commandId 来自模型，'constructor' 之类的
@@ -36,34 +105,60 @@ export async function runVerification(
       ? profile.commands[id]
       : undefined;
     if (!def) {
-      outcomes.push({
-        commandId: id,
-        argv: [],
-        outcome: 'SPAWN_ERROR',
-        exitCode: null,
-        signal: null,
-        durationMs: 0,
-        stdoutPreview: '',
-        stderrPreview: `profile 中没有登记 command "${id}"`,
-        outputTruncated: false,
-      });
+      outcomes.push(
+        await record({ commandId: id, argv: [], risk: 'R1' }, async () => ({
+          commandId: id,
+          argv: [],
+          outcome: 'SPAWN_ERROR' as const,
+          exitCode: null,
+          signal: null,
+          durationMs: 0,
+          stdoutPreview: '',
+          stderrPreview: `profile 中没有登记 command "${id}"`,
+          outputTruncated: false,
+        })),
+      );
+      continue;
+    }
+    /*
+     * 风险闸门（纵深防御）：验证只跑 R1。用户手填的命令在登记时就只放 R1 进来
+     * （commandRisk.ts），这里再挡一次 —— 万一将来有别的路径往 profile 里塞命令，
+     * 它也不能借"验证"这个身份绕过分级。不跑 ≠ 通过：它记 SPAWN_ERROR，验证不会 passed。
+     */
+    if (def.risk !== 'R1') {
+      outcomes.push(
+        await record(def, async () => ({
+          commandId: def.commandId,
+          argv: def.argv,
+          outcome: 'SPAWN_ERROR' as const,
+          exitCode: null,
+          signal: null,
+          durationMs: 0,
+          stdoutPreview: '',
+          stderrPreview: `command "${def.commandId}" 的风险等级是 ${def.risk}，验证只执行 R1 —— 拒绝执行`,
+          outputTruncated: false,
+        })),
+      );
       continue;
     }
     if (signal.aborted) {
-      outcomes.push({
-        commandId: id,
-        argv: def.argv,
-        outcome: 'CANCELLED',
-        exitCode: null,
-        signal: null,
-        durationMs: 0,
-        stdoutPreview: '',
-        stderrPreview: '在执行前已被取消',
-        outputTruncated: false,
-      });
+      // 取消掉的命令同样留一条记录：用户要能看出"这一步没跑"，而不是它凭空消失。不计账。
+      outcomes.push(
+        await record(def, async () => ({
+          commandId: id,
+          argv: def.argv,
+          outcome: 'CANCELLED' as const,
+          exitCode: null,
+          signal: null,
+          durationMs: 0,
+          stdoutPreview: '',
+          stderrPreview: '在执行前已被取消',
+          outputTruncated: false,
+        })),
+      );
       continue;
     }
-    outcomes.push(await runCommand(def, workspace.activePath, signal));
+    outcomes.push(await record(def, () => runCommand(def, workspace.activePath, signal)));
   }
 
   return {

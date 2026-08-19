@@ -325,6 +325,48 @@ describe('fs_read', () => {
     }
   });
 
+  it('未截断 → receipt.coverage=FULL_BLOB，且 modelText 不加覆盖提示', async () => {
+    const res = await tool('fs_read').execute({ path: 'src/app.ts' }, makeCtx(ws));
+    const receipt = ws.getReceipt(res.meta?.receiptId as string)!;
+    expect(receipt.coverage).toBe('FULL_BLOB');
+    expect(receipt.coveredBytes).toBe(receipt.byteLength);
+    expect(res.meta?.coverage).toBe('FULL_BLOB');
+    expect(res.modelText).not.toContain('coverage=BYTE_RANGE');
+  });
+
+  it('被截断 → receipt.coverage=BYTE_RANGE，coveredBytes 按真正展示的行数算，并当场告诉模型不能整文件替换', async () => {
+    const lines = Array.from({ length: 400 }, (_, i) => `line ${i}`);
+    const local = makeWorkspace({ 'big.txt': lines.join('\n') });
+    try {
+      const res = await tool('fs_read').execute({ path: 'big.txt' }, makeCtx(local));
+      expect(res.previewTruncated).toBe(true);
+      const receipt = local.getReceipt(res.meta?.receiptId as string)!;
+      expect(receipt.coverage).toBe('BYTE_RANGE');
+      // 展示了前 PREVIEW_MAX_LINES 行的原文（不是带行号预览的字节数，也不是全文）
+      const shown = Buffer.byteLength(lines.slice(0, PREVIEW_MAX_LINES).join('\n'), 'utf8');
+      expect(receipt.coveredBytes).toBe(shown);
+      expect(receipt.coveredBytes).toBeLessThan(receipt.byteLength);
+      expect(res.modelText).toContain('coverage=BYTE_RANGE');
+      expect(res.modelText).toContain(`前 ${PREVIEW_MAX_LINES}/400 行`);
+      expect(res.modelText).toContain('REPLACE_EXACT_TEXT_SPAN');
+    } finally {
+      local.cleanup();
+    }
+  });
+
+  it('含高置信度凭据的文件：拒读且**不签发 receipt**（被拒的读取不留写入凭证）', async () => {
+    const local = makeWorkspace({ 'secrets.ts': 'export const k = "AKIAIOSFODNN7EXAMPLE";\n' });
+    try {
+      const res = await tool('fs_read').execute({ path: 'secrets.ts' }, makeCtx(local));
+      expect(res.ok).toBe(false);
+      expect(res.modelText).toContain('AWS_ACCESS_KEY_ID');
+      expect(res.modelText).not.toContain('AKIAIOSFODNN7EXAMPLE');
+      expect(res.meta).toBeUndefined();
+    } finally {
+      local.cleanup();
+    }
+  });
+
   it('读一个目录应当优雅失败，而不是抛 EISDIR', async () => {
     // exists('src') 对目录返回 true，随后 issueReceipt 里的 readFileSync 直接抛，
     // 绕过了本工具自己的 fail() 契约，模型只会收到一句 OS errno
@@ -585,6 +627,40 @@ describe('workspace_mutate — 执行', () => {
     expect(res.preview).toContain('修改 src/app.ts (+1 字节)');
     expect(res.meta?.generation).toBe(1);
     expect(ws.readText('src/app.ts')).toContain('const b = 42;');
+  });
+
+  it('大文件：fs_read 只给了开头 → 整文件替换被拒，尾部一个字节都没丢', async () => {
+    const lines = Array.from({ length: 400 }, (_, i) => `line ${i}`);
+    const local = makeWorkspace({ 'big.txt': `${lines.join('\n')}\n` });
+    try {
+      const read = await tool('fs_read').execute({ path: 'big.txt' }, makeCtx(local));
+      expect(read.previewTruncated).toBe(true);
+      const before = readFileSync(join(local.activePath, 'big.txt'), 'utf8');
+
+      const res = await tool('workspace_mutate').execute(
+        {
+          operations: [
+            {
+              kind: 'REPLACE_WHOLE_FILE',
+              path: 'big.txt',
+              receiptId: read.meta?.receiptId as string,
+              // 模型只看见前 120 行，于是"整理"成这么几行 —— 剩下 280 行会被静默删掉
+              newText: 'line 0\nline 1\n',
+            },
+          ],
+        },
+        makeCtx(local),
+      );
+
+      expect(res.ok).toBe(false);
+      expect(res.failureReason).toBe('RECEIPT_COVERAGE_INSUFFICIENT');
+      expect(res.modelText).toContain('REPLACE_EXACT_TEXT_SPAN');
+      expect(local.activeGeneration).toBe(0);
+      expect(readFileSync(join(local.activePath, 'big.txt'), 'utf8')).toBe(before);
+      expect(readFileSync(join(local.activePath, 'big.txt'), 'utf8')).toContain('line 399');
+    } finally {
+      local.cleanup();
+    }
   });
 
   it('ZERO_MATCH 时 failureReason 是具体阻断原因，且工作区逐字节不变', async () => {

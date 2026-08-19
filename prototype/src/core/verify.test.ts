@@ -1,4 +1,4 @@
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -746,5 +746,167 @@ describe('summarizeFailures', () => {
     // 这段文字是要发给模型和用户看的，说"通过"就是在没有证据的情况下声称成功。
     const text = summarizeFailures(runOf('BASELINE', []));
     expect(text).not.toContain('通过');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 同一 Gateway、同一账本：平台自己发起的验证命令也留 ToolCall、也计账、也过风险闸门
+// ---------------------------------------------------------------------------
+
+interface RecordedVerifyCall {
+  toolName: string;
+  risk: string;
+  argsSummary: string;
+  argsDigest: string;
+  resolution: string;
+  reason: string | null;
+  preview: string;
+}
+
+class RecordingHost {
+  readonly calls: RecordedVerifyCall[] = [];
+  charged = 0;
+  private seq = 0;
+
+  beginToolCall(input: { toolName: string; risk: string; argsSummary: string; argsDigest: string }): string {
+    this.seq += 1;
+    this.calls.push({ ...input, resolution: '(未终结)', reason: null, preview: '' });
+    return `tc_${this.seq}`;
+  }
+  endToolCall(id: string, resolution: string, reason: string | null, preview: string): void {
+    const idx = Number(id.replace('tc_', '')) - 1;
+    const c = this.calls[idx];
+    if (!c) throw new Error(`endToolCall 引用了不存在的 ToolCall: ${id}`);
+    c.resolution = resolution;
+    c.reason = reason;
+    c.preview = preview;
+  }
+  chargeToolCall(): void {
+    this.charged += 1;
+  }
+}
+
+describe('runVerification / ToolCall 记录与账本（TD §9.4）', () => {
+  it('每条验证命令都留一条 ToolCall：带 role、commandId、argv，成功记 SUCCEEDED 并计一次账', async () => {
+    const host = new RecordingHost();
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'BASELINE',
+      workspace,
+      profileOf([cmd('ok', nodeArgv('process.exit(0)')), cmd('red', nodeArgv('process.exit(3)'))]),
+      ['ok', 'red'],
+      freshSignal(),
+      host as never,
+    );
+
+    expect(run.passed).toBe(false);
+    expect(host.calls).toHaveLength(2);
+    expect(host.calls[0]!.toolName).toBe('verify_command');
+    expect(host.calls[0]!.risk).toBe('R1');
+    expect(host.calls[0]!.argsSummary).toContain('BASELINE ok:');
+    expect(host.calls[0]!.argsSummary).toContain('process.exit(0)');
+    expect(host.calls[0]!.resolution).toBe('SUCCEEDED');
+    expect(host.calls[0]!.reason).toBeNull();
+    // 失败那条要能从记录本身看出是怎么失败的，而不是只有一个 FAILED
+    expect(host.calls[1]!.resolution).toBe('FAILED');
+    expect(host.calls[1]!.reason).toBe('EXIT_NONZERO');
+    expect(host.calls[1]!.preview).toContain('exit=3');
+    expect(host.charged).toBe(2);
+    // 相同 role+命令的 digest 稳定，不同命令的不同
+    expect(host.calls[0]!.argsDigest).not.toBe(host.calls[1]!.argsDigest);
+  });
+
+  it('POST_MUTATION 阶段的 role 写的是 VERIFICATION，不是 BASELINE', async () => {
+    const host = new RecordingHost();
+    await runVerification(
+      'run_1',
+      'att_1',
+      'POST_MUTATION',
+      workspace,
+      profileOf([cmd('ok', nodeArgv('process.exit(0)'))]),
+      ['ok'],
+      freshSignal(),
+      host as never,
+    );
+    expect(host.calls[0]!.argsSummary).toContain('VERIFICATION ok:');
+  });
+
+  it('profile 里没登记的 commandId 同样留记录（FAILED），但不计账 —— 它没消耗任何资源', async () => {
+    const host = new RecordingHost();
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'BASELINE',
+      workspace,
+      profileOf([]),
+      ['nope'],
+      freshSignal(),
+      host as never,
+    );
+    expect(run.commands[0]!.outcome).toBe('SPAWN_ERROR');
+    expect(host.calls).toHaveLength(1);
+    expect(host.calls[0]!.resolution).toBe('FAILED');
+    expect(host.calls[0]!.argsSummary).toContain('(未登记)');
+    // 未登记的命令没起进程；计账是对"消耗"记账，不是对"尝试"记账
+    expect(host.charged).toBe(1);
+  });
+
+  it('非 R1 的命令拒绝执行：记 SPAWN_ERROR + 说明风险等级，进程一次都没起，验证也不会 passed', async () => {
+    const host = new RecordingHost();
+    const marker = join(ws, 'must-not-run.txt');
+    const dangerous: CommandDefinition = {
+      ...cmd('danger', nodeArgv(`require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`)),
+      risk: 'R2',
+    };
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'BASELINE',
+      workspace,
+      profileOf([dangerous]),
+      ['danger'],
+      freshSignal(),
+      host as never,
+    );
+
+    expect(run.commands[0]!.outcome).toBe('SPAWN_ERROR');
+    expect(run.commands[0]!.stderrPreview).toContain('风险等级是 R2');
+    expect(run.passed).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+    expect(host.calls[0]!.resolution).toBe('FAILED');
+    expect(host.calls[0]!.risk).toBe('R2');
+  });
+
+  it('取消：留记录但不计账（没跑完的东西不该收费）', async () => {
+    const host = new RecordingHost();
+    const controller = new AbortController();
+    controller.abort();
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'BASELINE',
+      workspace,
+      profileOf([cmd('ok', nodeArgv('process.exit(0)'))]),
+      ['ok'],
+      controller.signal,
+      host as never,
+    );
+    expect(run.commands[0]!.outcome).toBe('CANCELLED');
+    expect(host.calls[0]!.resolution).toBe('CANCELLED');
+    expect(host.charged).toBe(0);
+  });
+
+  it('不传 recorder 时行为不变（单测里的老调用点仍然可用）', async () => {
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'BASELINE',
+      workspace,
+      profileOf([cmd('ok', nodeArgv('process.exit(0)'))]),
+      ['ok'],
+      freshSignal(),
+    );
+    expect(run.passed).toBe(true);
   });
 });

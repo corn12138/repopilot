@@ -116,7 +116,22 @@ export class MaterializedWorkspace {
    * Receipt 只记录"在 generation N 读到了 digest D 的这个文件"。
    * 它**不是**写权限凭据 —— apply 时会重新计算 digest 再比对一次。
    */
-  issueReceipt(relPath: string): { content: string; receipt: MutationReadReceipt } {
+  /**
+   * 受治理读取 → 签发 receipt。
+   *
+   * `coverage` 由**调用方**声明：只有真的把全文交出去了才能是 `FULL_BLOB`。
+   * fs_read 的预览被上限截断时必须签 `BYTE_RANGE`，否则模型只见开头也能整文件覆盖，
+   * 尾部会被静默删掉（receipt 的 digest 只能证明文件没变，证明不了读者看过全文）。
+   *
+   * 这里自己再读一次文件来算 digest，而不是接受调用方给的字节 —— 受管根内 active
+   * generation 在一次工具调用期间不可能被改写（mutation 落在新的 generation 目录，
+   * 只在 CAS 提交那一刻切换），所以两次读到的是同一份内容，且 digest 的来源是磁盘而非调用方。
+   */
+  issueReceipt(
+    relPath: string,
+    coverage: MutationReadReceipt['coverage'],
+    coveredBytes?: number,
+  ): { content: string; receipt: MutationReadReceipt } {
     const abs = this.resolveInActive(relPath);
     const bytes = readFileSync(abs);
     const receipt: MutationReadReceipt = {
@@ -125,6 +140,9 @@ export class MaterializedWorkspace {
       path: relPath,
       fileDigest: sha256(bytes),
       byteLength: bytes.byteLength,
+      coverage,
+      coveredBytes:
+        coverage === 'FULL_BLOB' ? bytes.byteLength : Math.min(coveredBytes ?? 0, bytes.byteLength),
       readAt: nowIso(),
       expiresAt: new Date(Date.now() + RECEIPT_TTL_MS).toISOString(),
     };

@@ -234,6 +234,19 @@ function verifyReceipt(
   if (currentDigest !== receipt.fileDigest) {
     throw new Blocked('STALE_FILE_DIGEST', `${op.path} 内容自读取后已变化，需重新读取`);
   }
+  /*
+   * 覆盖范围（TD §9.12）：整文件替换必须引用 FULL_BLOB receipt。
+   * digest 一致只证明"文件没变"，不证明"提交者看过全文" —— 只读到开头就整文件覆盖，
+   * 会把没看过的尾部静默删掉。exact-span 不受此限：它的 oldText 由引擎在真实全文里
+   * 校验唯一命中，改哪一段是可证明的。
+   */
+  if (op.kind === 'REPLACE_WHOLE_FILE' && receipt.coverage !== 'FULL_BLOB') {
+    throw new Blocked(
+      'RECEIPT_COVERAGE_INSUFFICIENT',
+      `${op.path} 的 receipt 只覆盖 ${receipt.coveredBytes}/${receipt.byteLength} 字节（读取时被截断），` +
+        `不能据此整文件替换 —— 未读到的部分会被静默删除。请改用 REPLACE_EXACT_TEXT_SPAN 精确替换要改的片段`,
+    );
+  }
 }
 
 function applyToContent(op: MutationOperation, content: string): string {

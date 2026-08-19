@@ -204,9 +204,9 @@ describe('端到端：Vite + React + TS 构建失败修复', () => {
       expect(fixedBuild.outcome).toBe('EXIT_ZERO');
       expect(result.finalVerification!.passed).toBe(true);
 
-      // 规划阶段没有产生任何 R1 副作用
+      // 规划阶段没有产生任何**模型发起的** R1 副作用（平台自己的基线验证是 verify_command，另计）
       const planPhaseWrites = recorder.toolCalls.filter(
-        (t) => t.risk !== 'R0' && t.at < recorder.planApprovedAt!,
+        (t) => t.risk !== 'R0' && t.toolName !== 'verify_command' && t.at < recorder.planApprovedAt!,
       );
       expect(planPhaseWrites).toHaveLength(0);
 

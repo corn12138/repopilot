@@ -233,7 +233,7 @@ describe('applyCandidate：要么完整采用，要么主线逐字节不变', ()
     const c = workspace.exportCandidate();
     writeFileSync(join(c.path, 'src/app.ts'), 'export const total = 2;\n');
     // 平台自己（或另一条路径）先推进了一代
-    const { receipt } = workspace.issueReceipt('src/util.ts');
+    const { receipt } = workspace.issueReceipt('src/util.ts', 'FULL_BLOB');
     const advanced = applyCandidateLikeInternal(receipt.receiptId);
     expect(advanced).toBe(true);
     const before = fingerprint();

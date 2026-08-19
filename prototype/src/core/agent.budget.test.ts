@@ -120,7 +120,11 @@ class StubWorkspace {
     return resolveManaged(this.activePath, rel);
   }
 
-  issueReceipt(rel: string): { content: string; receipt: MutationReadReceipt } {
+  issueReceipt(
+    rel: string,
+    coverage: MutationReadReceipt['coverage'] = 'FULL_BLOB',
+    coveredBytes?: number,
+  ): { content: string; receipt: MutationReadReceipt } {
     this.issueReceiptCalls.push(rel);
     if (this.throwOnRead === rel) throw new Error(`模拟 IO 故障: ${rel}`);
     const bytes = readFileSync(this.resolveInActive(rel));
@@ -132,6 +136,8 @@ class StubWorkspace {
         path: rel,
         fileDigest: sha256(bytes),
         byteLength: bytes.byteLength,
+        coverage,
+        coveredBytes: coverage === 'FULL_BLOB' ? bytes.byteLength : (coveredBytes ?? 0),
         readAt: nowIso(),
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
       },
@@ -679,8 +685,18 @@ describe('基线决定这一趟要不要跑', () => {
     expect(result.finalVerification).toBeNull();
     // 拒绝后不能再有执行阶段的模型调用
     expect(gateway.callCount).toBe(1);
-    expect(host.toolCalls).toHaveLength(0);
-    expect(host.ledger.toolCalls).toBe(0);
+    /*
+     * "零工具副作用"指的是**模型发起的**工具：一个都没有。
+     * 基线验证本身是平台发起的命令，它现在照样留一条 ToolCall 记录并计入账本
+     * （TD §9.4 同一 Gateway、同一账本）—— 时间线上看得见平台跑了什么，不再是隐形的。
+     */
+    const modelCalls = host.toolCalls.filter((t) => t.toolName !== 'verify_command');
+    expect(modelCalls).toHaveLength(0);
+    const verifyCalls = host.toolCalls.filter((t) => t.toolName === 'verify_command');
+    expect(verifyCalls).toHaveLength(1);
+    expect(verifyCalls[0]!.argsSummary).toContain('BASELINE red');
+    expect(verifyCalls[0]!.resolution).toBe('FAILED');
+    expect(host.ledger.toolCalls).toBe(1);
     expect(ranCount()).toBe(0);
   });
 });

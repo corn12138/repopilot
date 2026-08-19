@@ -196,6 +196,7 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
       profile,
       task.verificationCommandIds,
       signal,
+      host, // 平台自己发起的命令同样留 ToolCall、同样计入账本
     );
     throwIfCancelled(signal);
     host.emit(
@@ -389,6 +390,7 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
       profile,
       task.verificationCommandIds,
       signal,
+      host,
     );
     host.emit(
       'VERIFICATION_FINISHED',

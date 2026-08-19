@@ -34,11 +34,15 @@
    补丁若触碰了验证输入（配置/测试/验证脚本，见 `coverage.ts`），那次"通过"不构成
    `SUCCEEDED` 的依据，只能 `ACCEPTED_UNVERIFIED`（`decidePatch`）。
 2. **不做模糊匹配。** exact-span 命中 0 次或多次一律整笔失败。见 `mutation.ts`。
+   `REPLACE_WHOLE_FILE` 必须引用 `coverage=FULL_BLOB` 的 receipt —— 只读到开头就整文件覆盖，
+   等于把没看过的尾部静默删掉。
 3. **失败时零写入。** 事务先在内存里完整模拟，通过了才落 staged generation，
    再 CAS 切换。任何失败路径下工作区必须逐字节不变。
 4. **宿主仓库只读。** 改动只发生在 `MaterializedWorkspace` 副本里。唯一的例外是
    用户显式点「应用到仓库」，那条路径走 `git apply --check` 且冲突整笔拒绝。
 5. **命令结果是判别联合，不是布尔。** 非零退出、信号、超时、spawn 失败必须可区分。
+   命令无论由谁发起（用户手填、模型提议、平台验证）都走同一套：先分级（`commandRisk.ts`）、
+   留 ToolCall 记录、计入同一账本；验证只执行 R1。
 6. **权限边界不上移。** Renderer 无 Node/FS/shell/密钥；Preload 不给通用 `invoke`；
    Main 不持有 Task/Run/Approval 权威；Core 不监听端口。
 7. **凭据不落明文。** API key 只进系统钥匙串，Core 只在内存持有，
@@ -72,7 +76,7 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 49 个文件 / 876 个测试，含真实 tsc + vite build 的端到端链路
+pnpm test       # 49 个文件 / 891 个测试，含真实 tsc + vite build 的端到端链路
 pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 ```

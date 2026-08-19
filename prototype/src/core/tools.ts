@@ -73,6 +73,15 @@ export function project(fullRaw: string, label: string): {
   };
 }
 
+/**
+ * 预览里真正展示了多少行原文。project() 在末尾追加一行"… [已截断：…]"，
+ * 数行数时要把它减掉 —— 少减一行会让 coveredBytes 报大，那是"省略要报数"的反面。
+ */
+function countShownLines(preview: string): number {
+  const lines = preview.split('\n');
+  return Math.max(0, lines.length - (lines[lines.length - 1]?.startsWith('… [已截断') ? 1 : 0));
+}
+
 /** 从头部按字节截断到最近的完整码点边界 */
 function headBytes(text: string, maxBytes: number): string {
   const buf = Buffer.from(text, 'utf8');
@@ -115,11 +124,12 @@ const fsRead: ToolDefinition<typeof readSchema> = {
     } catch (err) {
       return fail(`无法读取 ${args.path}: ${(err as Error).message}`);
     }
-    const { content, receipt } = ctx.workspace.issueReceipt(args.path);
+    const content = ctx.workspace.readText(args.path);
     /*
      * 文件里有高置信度凭据：**拒绝读入模型上下文**，而不是脱敏后给出去 ——
      * 脱敏后的内容一旦被模型用 REPLACE_WHOLE_FILE 写回，占位符就会覆盖真实值（工作区里），
      * 补丁 diff 还会把原值带进 `-` 行。读不到，就没有这条路。用户在界面上能看到原因。
+     * 这一步在签发 receipt **之前**：被拒的读取不该留下任何可用于写入的凭证。
      */
     const hits = scanText(content, args.path);
     if (hits.length > 0) {
@@ -128,18 +138,30 @@ const fsRead: ToolDefinition<typeof readSchema> = {
           `请把凭据移出仓库（或放进 .gitignore 的文件）后重新导入；不要在任务中要求修改该文件。`,
       );
     }
-    const numbered = content
-      .split('\n')
-      .map((line, i) => `${String(i + 1).padStart(5)}\t${line}`)
-      .join('\n');
+    const lines = content.split('\n');
+    const numbered = lines.map((line, i) => `${String(i + 1).padStart(5)}\t${line}`).join('\n');
     const p = project(numbered, 'fs_read');
+    /*
+     * receipt 的覆盖范围要与**实际给出去的内容**一致：预览被上限截断时只能签 BYTE_RANGE，
+     * 于是后续的 REPLACE_WHOLE_FILE 会被 mutation 引擎按 RECEIPT_COVERAGE_INSUFFICIENT 拒掉。
+     * coveredBytes 按"真正展示了前多少行的原文"算，不用带行号的预览字节数冒充。
+     */
+    const shownLines = p.truncated ? countShownLines(p.preview) : lines.length;
+    const { receipt } = ctx.workspace.issueReceipt(
+      args.path,
+      p.truncated ? 'BYTE_RANGE' : 'FULL_BLOB',
+      Buffer.byteLength(lines.slice(0, shownLines).join('\n'), 'utf8'),
+    );
+    const coverageNote = p.truncated
+      ? `\ncoverage=BYTE_RANGE（只展示了前 ${shownLines}/${lines.length} 行）—— 这个 receipt 不能用于 REPLACE_WHOLE_FILE，请用 REPLACE_EXACT_TEXT_SPAN`
+      : '';
     return {
       ok: true,
-      modelText: `receiptId=${receipt.receiptId}\ndigest=${receipt.fileDigest}\n\n${p.preview}`,
+      modelText: `receiptId=${receipt.receiptId}\ndigest=${receipt.fileDigest}${coverageNote}\n\n${p.preview}`,
       preview: p.preview,
       previewTruncated: p.truncated,
       artifactRef: p.artifactRef,
-      meta: { receiptId: receipt.receiptId, path: args.path },
+      meta: { receiptId: receipt.receiptId, path: args.path, coverage: receipt.coverage },
     };
   },
 };

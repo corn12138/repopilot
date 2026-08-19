@@ -184,6 +184,8 @@ function build(
   let routineStatus = 0;
   let unmatchedTool = 0;
   let duplicateTool = 0;
+  /** 平台自己发起的验证命令：有 ToolCall 记录，但正文由验证块呈现，这里只报数 */
+  let verifyCommandTool = 0;
   let malformedVerification = 0;
   const unprojectedKinds = new Map<string, number>();
   const mergedKinds = new Map<string, number>();
@@ -245,6 +247,15 @@ function build(
           break;
         }
         seenTool.add(id);
+        /*
+         * 平台发起的验证命令（verify_command）现在也有 ToolCall 记录（TD §9.4 同一账本）。
+         * 但它的结果已经由下面的 VERIFICATION_FINISHED 块逐条呈现 —— 再画一行等于同一件事说两遍。
+         * 所以这里合并、报数、在省略说明里点名，而不是静默丢掉，也不是重复展示。
+         */
+        if (call.toolName === 'verify_command') {
+          verifyCommandTool += 1;
+          break;
+        }
         const toolItem: Item =
           call.toolName === 'run_command'
             ? { kind: 'command', seq: e.seq, at: e.at, call, outcome: null }
@@ -361,6 +372,15 @@ function build(
       reason: '同一次工具调用的重复事件引用，只保留首次出现的位置',
       recoverable: false,
       level: 'omitted',
+    });
+  }
+  if (verifyCommandTool > 0) {
+    omissions.push({
+      key: 'verify-command-tool',
+      count: verifyCommandTool,
+      reason: '平台发起的验证命令调用（已计入预算账本），结果由下方验证块逐条呈现',
+      recoverable: false,
+      level: 'merged',
     });
   }
   if (malformedVerification > 0) {

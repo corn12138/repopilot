@@ -106,7 +106,9 @@ export function normalizeCandidate(
     }
     // MODIFIED：在 active 上签 receipt。签不出来（路径逃逸/symlink/大小写绕过）就是非法路径
     try {
-      const { receipt } = ws.issueReceipt(change.path);
+      // FULL_BLOB 是名副其实的：平台自己读了 active 的全文，也拿到了 candidate 的全文新内容 ——
+      // 与 fs_read 只给模型看开头的情形不同，这里没有"没看过的尾部"
+      const { receipt } = ws.issueReceipt(change.path, 'FULL_BLOB');
       ops.push({ kind: 'REPLACE_WHOLE_FILE', path: change.path, newText: text, receiptId: receipt.receiptId });
     } catch (err) {
       if (err instanceof PathViolation) {

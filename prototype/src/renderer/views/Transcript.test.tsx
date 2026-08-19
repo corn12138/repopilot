@@ -160,3 +160,60 @@ describe('Transcript 省略披露', () => {
     expect(screen.getByText('这次调用没有封存完整 artifact，被截掉的部分无法找回。')).toBeTruthy();
   });
 });
+
+describe('平台发起的验证命令：合并进省略说明，不重复展示', () => {
+  // 上一个 describe 的 cleanup 不覆盖这里；不清理会让上一条用例的 DOM 与本条叠加
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('verify_command 的 ToolCall 不单独成行，但被点名报数（结果由验证块呈现）', () => {
+    const events = [
+      event('TOOL_CALL_PROPOSED', '提议工具调用', { toolCallId: 'v-1' }),
+      event('TOOL_CALL_PROPOSED', '提议工具调用', { toolCallId: 'v-2' }),
+      event('VERIFICATION_FINISHED', '基线存在失败', {
+        verification: {
+          phase: 'BASELINE',
+          passed: false,
+          commands: [
+            { commandId: 'build', argv: ['pnpm', 'build'], outcome: 'EXIT_NONZERO', exitCode: 1, signal: null, durationMs: 5, stdoutPreview: '', stderrPreview: 'TS2345', outputTruncated: false },
+          ],
+        },
+      }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[
+          toolCall({ toolCallId: 'v-1', toolName: 'verify_command', risk: 'R1', argsSummary: 'BASELINE build: pnpm build' }),
+          toolCall({ toolCallId: 'v-2', toolName: 'verify_command', risk: 'R1', argsSummary: 'BASELINE typecheck: pnpm typecheck' }),
+        ]}
+      />,
+    );
+
+    // 不重复展示：命令行不出现在时间线里
+    expect(screen.queryByText('BASELINE build: pnpm build')).toBeNull();
+    // 但必须报数并说明去向 —— 静默丢弃与静默通过是同一类问题
+    // merged 与 omitted 分开计数：它不是"被省略"，是"并入了验证块"
+    expect(screen.getByText(/另有 2 条事件没有单独成行/)).toBeTruthy();
+    expect(screen.getByText(/平台发起的验证命令调用（已计入预算账本）/)).toBeTruthy();
+    // 验证块本身照常呈现结果
+    expect(screen.getByText(/TS2345/)).toBeTruthy();
+  });
+
+  it('对照：模型发起的 run_command 仍然单独成行', () => {
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTION 调用 claude'),
+      event('TOOL_CALL_PROPOSED', '提议工具调用', { toolCallId: 'c-1' }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[toolCall({ toolCallId: 'c-1', toolName: 'run_command', risk: 'R1', argsSummary: 'pnpm build' })]}
+      />,
+    );
+    // 模型发起的命令归在那一轮下面（turn 折叠块里），工具名与摘要都在
+    expect(screen.getByText('run_command')).toBeTruthy();
+    expect(screen.getByText(/pnpm build/)).toBeTruthy();
+  });
+});

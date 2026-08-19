@@ -100,7 +100,7 @@ afterEach(() => {
 
 describe('exact-span replace', () => {
   it('唯一命中时原子提交，并推进 generation', () => {
-    const { receipt } = workspace.issueReceipt('src/app.ts');
+    const { receipt } = workspace.issueReceipt('src/app.ts', 'FULL_BLOB');
     const before = workspace.activeGeneration;
 
     const result = applyMutationPlan(workspace, {
@@ -124,7 +124,7 @@ describe('exact-span replace', () => {
   });
 
   it('0 次命中 → ZERO_MATCH，且不做模糊匹配', () => {
-    const { receipt } = workspace.issueReceipt('src/app.ts');
+    const { receipt } = workspace.issueReceipt('src/app.ts', 'FULL_BLOB');
     const snapshotBefore = fingerprint();
 
     const result = applyMutationPlan(workspace, {
@@ -149,7 +149,7 @@ describe('exact-span replace', () => {
   });
 
   it('多次命中 → MULTIPLE_MATCH，绝不改第一个', () => {
-    const { receipt } = workspace.issueReceipt('src/dup.ts');
+    const { receipt } = workspace.issueReceipt('src/dup.ts', 'FULL_BLOB');
     const snapshotBefore = fingerprint();
 
     const result = applyMutationPlan(workspace, {
@@ -173,7 +173,7 @@ describe('exact-span replace', () => {
   });
 
   it('同一文件多次顺序编辑：后一次基于前一次的结果', () => {
-    const { receipt } = workspace.issueReceipt('src/app.ts');
+    const { receipt } = workspace.issueReceipt('src/app.ts', 'FULL_BLOB');
 
     const result = applyMutationPlan(workspace, {
       planId: 'p1',
@@ -218,10 +218,73 @@ describe('read receipt', () => {
     if (!result.ok) expect(result.reason).toBe('RECEIPT_MISSING');
   });
 
+  /*
+   * 08-17 审计 MUT-receipt-coverage-vs-truncated-read：fs_read 只把头部给模型，
+   * 却签发覆盖全文的 receipt —— 模型据此整文件替换，尾部被静默删除。
+   */
+  it('BYTE_RANGE receipt + REPLACE_WHOLE_FILE → RECEIPT_COVERAGE_INSUFFICIENT，工作区逐字节不变', () => {
+    const before = fingerprint();
+    const { receipt } = workspace.issueReceipt('src/app.ts', 'BYTE_RANGE', 12);
+    const result = applyMutationPlan(workspace, {
+      planId: 'p1',
+      runId,
+      inputGeneration: workspace.activeGeneration,
+      operations: [
+        {
+          kind: 'REPLACE_WHOLE_FILE',
+          path: 'src/app.ts',
+          newText: 'const a = 1;\n', // 只保留了开头那行 —— 正是"尾部被静默删掉"的形态
+          receiptId: receipt.receiptId,
+        },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('RECEIPT_COVERAGE_INSUFFICIENT');
+      expect(result.detail).toContain('12/');
+      expect(result.detail).toContain('REPLACE_EXACT_TEXT_SPAN');
+    }
+    expect(fingerprint()).toBe(before);
+    expect(workspace.activeGeneration).toBe(0);
+  });
+
+  it('BYTE_RANGE receipt 仍可用于 exact-span —— 命中唯一性由引擎在真实全文里校验', () => {
+    const { receipt } = workspace.issueReceipt('src/app.ts', 'BYTE_RANGE', 12);
+    const result = applyMutationPlan(workspace, {
+      planId: 'p1',
+      runId,
+      inputGeneration: workspace.activeGeneration,
+      operations: [
+        {
+          kind: 'REPLACE_EXACT_TEXT_SPAN',
+          path: 'src/app.ts',
+          oldText: 'const b = 2;',
+          newText: 'const b = 3;',
+          receiptId: receipt.receiptId,
+        },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    expect(readFileSync(join(workspace.activePath, 'src/app.ts'), 'utf8')).toContain('const b = 3;');
+  });
+
+  it('FULL_BLOB receipt 的整文件替换照常通过（规则没有误伤）', () => {
+    const { receipt } = workspace.issueReceipt('src/app.ts', 'FULL_BLOB');
+    const result = applyMutationPlan(workspace, {
+      planId: 'p1',
+      runId,
+      inputGeneration: workspace.activeGeneration,
+      operations: [
+        { kind: 'REPLACE_WHOLE_FILE', path: 'src/app.ts', newText: 'export const total = 9;\n', receiptId: receipt.receiptId },
+      ],
+    });
+    expect(result.ok).toBe(true);
+  });
+
   it('切代后旧 receipt 失效 → RECEIPT_MISSING', () => {
-    const first = workspace.issueReceipt('src/app.ts');
+    const first = workspace.issueReceipt('src/app.ts', 'FULL_BLOB');
     // 用另一个 receipt 推进一代
-    const second = workspace.issueReceipt('src/dup.ts');
+    const second = workspace.issueReceipt('src/dup.ts', 'FULL_BLOB');
     const advance = applyMutationPlan(workspace, {
       planId: 'p1',
       runId,
@@ -257,7 +320,7 @@ describe('read receipt', () => {
   });
 
   it('plan 基于旧 generation → STALE_GENERATION', () => {
-    const { receipt } = workspace.issueReceipt('src/app.ts');
+    const { receipt } = workspace.issueReceipt('src/app.ts', 'FULL_BLOB');
     const result = applyMutationPlan(workspace, {
       planId: 'p1',
       runId,
@@ -327,7 +390,7 @@ describe('路径策略', () => {
   });
 
   it('受保护路径 → PROTECTED_PATH', () => {
-    const { receipt } = workspace.issueReceipt('package.json');
+    const { receipt } = workspace.issueReceipt('package.json', 'FULL_BLOB');
     const result = applyMutationPlan(
       workspace,
       {
@@ -360,7 +423,7 @@ describe('路径策略', () => {
     // issueReceipt 会直接失败，这条攻击根本不成立 —— 跳过。
     let receiptId: string;
     try {
-      receiptId = workspace.issueReceipt('Package.json').receipt.receiptId;
+      receiptId = workspace.issueReceipt('Package.json', 'FULL_BLOB').receipt.receiptId;
     } catch {
       return;
     }
@@ -407,7 +470,7 @@ describe('路径策略', () => {
 
 describe('原子性', () => {
   it('批次中任一 operation 失败 → 整批零写入', () => {
-    const { receipt } = workspace.issueReceipt('src/app.ts');
+    const { receipt } = workspace.issueReceipt('src/app.ts', 'FULL_BLOB');
     const snapshotBefore = fingerprint();
 
     const result = applyMutationPlan(workspace, {

@@ -89,7 +89,7 @@ function makePatch(subPath = ''): ReturnType<typeof sealPatch> {
   const snapshot = importSnapshot('p', host, subPath ? { subPath } : {});
   const runId = newId('run');
   workspace = MaterializedWorkspace.create(runId, snapshot.snapshotId);
-  const { receipt } = workspace.issueReceipt('src/greet.ts');
+  const { receipt } = workspace.issueReceipt('src/greet.ts', 'FULL_BLOB');
 
   const result = applyMutationPlan(workspace, {
     planId: 'p1',
