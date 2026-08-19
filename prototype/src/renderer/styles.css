@@ -1153,6 +1153,36 @@ ul.plain li {
   font-size: 11px;
   color: var(--state-warning-fg);
 }
+/* 出站披露与同意：常驻在输入框上方，不进高级抽屉 */
+.composer-disclosure {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin: 6px 0 8px;
+  line-height: 1.55;
+}
+.composer-consent {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+.composer-consent input {
+  margin-top: 2px;
+  flex: none;
+}
+.composer-disclosure-detail {
+  margin: 4px 0 0 22px;
+}
+.composer-disclosure-detail summary {
+  cursor: pointer;
+  color: var(--text-tertiary);
+}
+.composer-disclosure-detail ul {
+  margin: 4px 0 0;
+}
+.composer-disclosure-error {
+  color: var(--state-warning-fg);
+}
 .composer-box textarea {
   width: 100%;
   min-height: 64px;
@@ -1584,4 +1614,34 @@ select:focus-visible {
   font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.6;
+}
+
+/* 数据出站面板：发出去的与被拦下的并列；拦下的一行带警示色边 */
+.egress-consent {
+  margin-bottom: 10px;
+}
+.egress-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.egress-row {
+  display: flex;
+  gap: 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  padding: 4px 8px;
+  border-left: 2px solid var(--border-hairline);
+}
+.egress-row[data-sent='no'] {
+  border-left-color: var(--state-warning-fg);
+}
+.egress-row .kind {
+  flex: none;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.egress-row .summary {
+  word-break: break-all;
 }

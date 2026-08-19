@@ -110,6 +110,29 @@ const reviewers = [
   },
 ];
 
+/** 披露由"目的地"决定 digest：加了作者/审核方就变 —— 与 Core 同形的最小替身 */
+function disclosureFor(payload: Record<string, unknown>) {
+  const destinations = [
+    { role: 'IMPLEMENTER', channel: 'MODEL_API', label: 'DeepSeek · deepseek-chat', providerId: 'deepseek', origin: 'https://api.deepseek.com', isRelay: false, modelId: 'deepseek-chat', resolutionDigest: 'sha256:r1', dataClasses: ['TASK_TEXT', 'REPOSITORY_SNAPSHOT_EXCERPTS'] },
+    ...(payload.reviewerConnectorId ? [{ role: 'REVIEWER', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: ['PATCH_DIFF'] }] : []),
+    ...(payload.authorConnectorId ? [{ role: 'AUTHOR', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: ['REPOSITORY_FULL_COPY_VIA_CLI'] }] : []),
+  ];
+  return {
+    disclosureVersion: 1,
+    snapshotId: 'snapshot-1',
+    snapshotFileCount: 12,
+    destinations,
+    policy: { retention: 'UNKNOWN', training: 'UNKNOWN', region: 'UNKNOWN' },
+    digest: `sha256:disclosure-${destinations.map((d) => d.role).join('+')}`,
+  };
+}
+
+async function consent() {
+  const box = (await screen.findByRole('checkbox', { name: /我确认：本任务会把数据发往/ })) as HTMLInputElement;
+  if (!box.checked) fireEvent.click(box);
+  await waitFor(() => expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(false));
+}
+
 function composer(onCreated = vi.fn()) {
   return (
     <Composer
@@ -134,8 +157,9 @@ async function openOptions() {
 
 beforeEach(() => {
   callMock.mockReset();
-  callMock.mockImplementation(async (method: string) => {
+  callMock.mockImplementation(async (method: string, payload: Record<string, unknown>) => {
     if (method === 'crossreview.reviewers') return { reviewers };
+    if (method === 'egress.disclosure') return { disclosure: disclosureFor(payload) };
     if (method === 'task.create') return { run: { runId: 'run-1' } };
     throw new Error(`unexpected ${method}`);
   });
@@ -158,12 +182,15 @@ describe('外部作者与外部 CLI 审核方：可达且传对字段', () => {
     fireEvent.click(screen.getByRole('button', { name: /Codex · 0\.1$/ }));
     fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
     fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
+    // 披露里此时应出现"作者"目的地；同意后才能发
+    await waitFor(() => expect(screen.getByTestId('egress-disclosure').textContent).toContain('Codex · 0.1（本机 CLI）'));
+    await consent();
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: '开始' }));
     });
     const create = callMock.mock.calls.find((c) => c[0] === 'task.create');
     expect(create).toBeDefined();
-    expect(create![1]).toMatchObject({ authorConnectorId: 'codex-cli' });
+    expect(create![1]).toMatchObject({ authorConnectorId: 'codex-cli', egressConsentDigest: 'sha256:disclosure-IMPLEMENTER+AUTHOR' });
     expect(create![1]).not.toHaveProperty('reviewerConnectorId');
   });
 
@@ -173,11 +200,12 @@ describe('外部作者与外部 CLI 审核方：可达且传对字段', () => {
     fireEvent.click(screen.getByRole('button', { name: /Codex · 0\.1（CLI）/ }));
     fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
     fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
+    await consent();
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: '开始' }));
     });
     const create = callMock.mock.calls.find((c) => c[0] === 'task.create');
-    expect(create![1]).toMatchObject({ reviewerConnectorId: 'codex-cli' });
+    expect(create![1]).toMatchObject({ reviewerConnectorId: 'codex-cli', egressConsentDigest: 'sha256:disclosure-IMPLEMENTER+REVIEWER' });
     expect(create![1]).not.toHaveProperty('reviewerModelProfileId');
     expect(create![1]).not.toHaveProperty('authorConnectorId');
   });
@@ -190,5 +218,50 @@ describe('外部作者与外部 CLI 审核方：可达且传对字段', () => {
     expect(screen.queryByRole('button', { name: /Codex · 0\.1（CLI）/ })).toBeNull();
     const reviewerBox = screen.getAllByRole('textbox').find((t) => (t as HTMLTextAreaElement).placeholder.includes('审核方'));
     expect((reviewerBox as HTMLTextAreaElement).value).toBe('');
+  });
+});
+
+describe('出站披露与同意：不点头不能发；目的地一变同意作废', () => {
+  it('填了目标但没勾同意 → 开始按钮禁用；勾了才能发；载荷带 egressConsentDigest', async () => {
+    render(composer());
+    fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
+    await screen.findByRole('checkbox', { name: /我确认：本任务会把数据发往/ });
+    expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(true);
+    const block = screen.getByTestId('egress-disclosure');
+    expect(block.textContent).toContain('DeepSeek · deepseek-chat');
+    expect(block.textContent).toContain('官方 · https://api.deepseek.com');
+    expect(block.textContent).toContain('保留/训练/地域政策：未知');
+    await consent();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始' }));
+    });
+    const create = callMock.mock.calls.find((c) => c[0] === 'task.create');
+    expect(create![1]).toMatchObject({ egressConsentDigest: 'sha256:disclosure-IMPLEMENTER' });
+  });
+
+  it('同意后再选外部作者 → 披露 digest 变化，同意自动作废，按钮重新禁用', async () => {
+    render(composer());
+    fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
+    await consent();
+    await openOptions();
+    fireEvent.click(screen.getByRole('button', { name: /Codex · 0\.1$/ }));
+    await waitFor(() => expect(screen.getByTestId('egress-disclosure').textContent).toContain('Codex · 0.1（本机 CLI）'));
+    const box = screen.getByRole('checkbox', { name: /我确认：本任务会把数据发往/ }) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
+    expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('披露取不到 → 显示原因且不能发（fail-closed）', async () => {
+    callMock.mockImplementation(async (method: string) => {
+      if (method === 'crossreview.reviewers') return { reviewers };
+      if (method === 'egress.disclosure') throw new Error('Core 不可用');
+      throw new Error(`unexpected ${method}`);
+    });
+    render(composer());
+    fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
+    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('无法取得出站披露：Core 不可用'));
+    expect(screen.queryByRole('checkbox', { name: /我确认/ })).toBeNull();
+    expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

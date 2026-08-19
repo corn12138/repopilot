@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 45 个文件、790 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 48 个文件、834 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -68,6 +68,13 @@
 | **Slice G 验证覆盖**：配置/测试/setup 按模式判为验证输入，普通源码不误判；`node check.mjs` 推出 check.mjs、`pnpm build` 推不出任何文件；flag/绝对路径/`..`/不存在的 token 不算 | `coverage.test.ts` |
 | **Slice G e2e（false-green 封口）**：外部作者把验证脚本改成恒通过、源码仍 broken → 验证"通过" → 补丁 `verificationInputsTouched=['check.mjs']` + `COVERAGE_WEAKENED` → 接受只能 `ACCEPTED_UNVERIFIED`、`terminalFacts.verificationRunId=null`、导出头 `verified: NO`；内部模型走同一条路同样降级；只改源码的对照组仍 `SUCCEEDED` | `authority.coverage.e2e.test.ts` |
 | 审查页：动了验证输入时"已修复"徽章旁出现横幅点名文件并说明终态；旧快照缺字段不出横幅。审批卡显示允许改动范围/受保护路径/实现方 | `RunDetail.test.tsx` |
+| **Slice H 出站披露/同意**：披露确定性、对路由/审核方/作者/快照敏感、政策三项显式 UNKNOWN；外部 CLI 目的地 origin=null 且含整仓副本类别；同意覆盖的路由 = 披露里的 MODEL_API 路由 | `egress.test.ts` |
+| **Slice H 网关**：无 consent → `CONSENT_MISSING`、不覆盖该冻结路由 → `CONSENT_STALE`，fetch 一次都没被调用；只有 `CONNECTIVITY_TEST` 免 consent；对话里出现 AWS key/私钥/Bearer → DLP 阻断，原因只含种类与位置、manifest 不含原文；"password" 字样与短占位符不误报 | `model/gateway.test.ts` |
+| **Slice H DLP**：高置信度模式命中/不误报各一组；`redactText` 保留前缀、私钥块整段（含无 END 围栏）拿掉、脱敏后再扫不再命中 | `dlp.test.ts` |
+| **Slice H 权威层 e2e**：不带同意 → `CONSENT_REQUIRED` 不建 Run；错的 digest / 加了审核方+作者后的旧 digest → `CONSENT_STALE`；RUN_CREATED 带 egressConsent（目的地/通道/中转/数据类别/UNKNOWN）；基线 stderr 里的 AWS key 在**命令层**就被脱敏 —— 事件、请求体、外部作者简报都只见 `[REDACTED:…]`；任务描述里粘 key → task.create 直接拒绝且拒绝信息不含原文 | `authority.egress.e2e.test.ts` |
+| 外部 CLI 作者/审核方的 prompt 同样经 DLP：命中即 BLOCKED、子进程不起、原因不含原文 | `external/author.test.ts` |
+| 任务输入区：披露常驻输入框上方；不勾同意不能发；选了作者/审核方后 digest 变、同意自动作废；披露取不到显示原因且不能发 | `TaskForm.externalAuthor.test.tsx` |
+| 运行页「数据出站」面板：同意摘要 + 每次模型/CLI 出站一行，NOT_SENT 带阻断原因并列展示，token 未知不填 0 | `RunDetail.test.tsx` |
 
 ## 尚未证明的
 
@@ -108,6 +115,10 @@
   **可丢弃 spike 子集，不是那份合同的实现**：没有 connector 评审流程、
   没有 terms/版本准入、没有 network manifest、没有 resource/thermal 治理。
   合同状态仍是 `P1_DEFERRED / FEATURE_DISABLED`，不因为原型跑通了就改。
+- 出站治理（Slice H）做到的是：披露 + 精确同意 + 高置信度 DLP（命令输出脱敏、含凭据文件拒读、
+  网关与外部 CLI prompt 最后一道拦截）+ 运行页逐笔出站视图。**没做的**：供应商保留/训练/地域政策
+  （披露里显式 UNKNOWN，不编）、低置信度/高熵启发式 DLP、`contextFileRefs` 的真实填充
+  （manifest 里仍是 `[]`，文件片段走的是 tool_result 文本）、持久化 artifact 的加密。
 - 一切 P1：Skill、多表面、Continuation、资源/热治理都没做。
 - 打包只做到「能双击运行的未签名 dmg」：没有签名、没有公证、没有自动更新，
   也没有 Intel 机器上的实机验证。见下面「打包」。

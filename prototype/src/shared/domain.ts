@@ -905,6 +905,75 @@ export interface ModelEgressManifest {
 }
 
 // ---------------------------------------------------------------------------
+// 数据出站披露与同意（PRD-DATA-001 的原型子集）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一次任务会把哪些类别的数据送出本机。
+ * 只分类别，不列具体内容 —— 具体内容在每次出站的 ModelEgressManifest 里逐笔可查。
+ */
+export type EgressDataClass =
+  /** 任务描述、验收条件、用户填写的命令与路径 */
+  | 'TASK_TEXT'
+  /** 仓库快照里被模型读取的文件片段（fs_read / fs_grep 结果回填进对话） */
+  | 'REPOSITORY_SNAPSHOT_EXCERPTS'
+  /** 构建/测试/自定义命令的输出（stdout/stderr 预览） */
+  | 'COMMAND_OUTPUT'
+  /** 封存后的补丁 diff（交叉审核方会收到） */
+  | 'PATCH_DIFF'
+  /** 审核方的发现（整改时回给实现方） */
+  | 'REVIEW_FINDINGS'
+  /** 外部 CLI 当作者时，它在一次性副本里可读取**整个仓库**并自行决定送什么给其供应商 */
+  | 'REPOSITORY_FULL_COPY_VIA_CLI';
+
+export interface EgressDestination {
+  readonly role: 'IMPLEMENTER' | 'REVIEWER' | 'AUTHOR';
+  /** MODEL_API：RepoPilot 自己经 ModelGateway 出站；EXTERNAL_CLI：本机外部 CLI 自行出站 */
+  readonly channel: 'MODEL_API' | 'EXTERNAL_CLI';
+  readonly label: string;
+  readonly providerId: string;
+  /** MODEL_API 有精确 origin；EXTERNAL_CLI 的实际端点由该 CLI 决定，这里写 null 并在 UI 说明 */
+  readonly origin: string | null;
+  readonly isRelay: boolean;
+  readonly modelId: string | null;
+  /** 为 MODEL_API 记录冻结路由 digest，preflight 时对得上才放行 */
+  readonly resolutionDigest: string | null;
+  readonly dataClasses: readonly EgressDataClass[];
+}
+
+/**
+ * 原型**不知道**各供应商的保留/训练/地域政策 —— 所以不编一个，显式写 UNKNOWN。
+ * 这比"默认对方不训练"诚实；PRD 要求 unknown 字段必须出现在披露里而不是被省略。
+ */
+export interface EgressPolicyKnowledge {
+  readonly retention: 'UNKNOWN';
+  readonly training: 'UNKNOWN';
+  readonly region: 'UNKNOWN';
+}
+
+/**
+ * 第一笔模型出站前给用户看的披露。digest 覆盖全部字段；task.create 必须带回
+ * 同一个 digest，Core 重算比对 —— 用户同意的是**这一份**，不是"同意出站"这个动作。
+ */
+export interface DataEgressDisclosure {
+  readonly disclosureVersion: 1;
+  readonly snapshotId: string;
+  readonly snapshotFileCount: number;
+  readonly destinations: readonly EgressDestination[];
+  readonly policy: EgressPolicyKnowledge;
+  readonly digest: Digest;
+}
+
+/** 用户在 task.create 时给出的同意；只记 digest，不记 actor 可识别信息 */
+export interface DataEgressConsent {
+  readonly consentId: string;
+  readonly disclosureDigest: Digest;
+  /** 允许出站的冻结路由 digest（实现方 + 审核方）；外部 CLI 不经 ModelGateway，不在此列 */
+  readonly resolutionDigests: readonly string[];
+  readonly acceptedAt: Iso8601;
+}
+
+// ---------------------------------------------------------------------------
 // 环境自检
 // ---------------------------------------------------------------------------
 

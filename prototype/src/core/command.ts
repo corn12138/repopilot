@@ -3,6 +3,7 @@ import { accessSync, constants, statSync } from 'node:fs';
 import { delimiter, isAbsolute, join } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import type { CommandDefinition, CommandOutcome } from '@shared/domain';
+import { redactText } from './dlp';
 import { PREVIEW_MAX_BYTES } from './tools';
 
 /** 每条流最多留这么多字节。**留尾巴**，因为构建错误的结论在最后。 */
@@ -344,6 +345,10 @@ function outcome(
 ): CommandOutcome {
   const o = truncateTailToBytes(stdout.trimEnd(), PREVIEW_MAX_BYTES);
   const e = truncateTailToBytes(stderr.trimEnd(), PREVIEW_MAX_BYTES);
+  // 预览会进事件（落盘）、进模型上下文、进界面：高置信度凭据在这里就换成占位符，
+  // 不等到出站网关那一道才拦（那一道仍在，是最后防线，不是唯一防线）
+  const so = redactText(o.truncated ? `…[前段已省略]\n${o.text}` : o.text);
+  const se = redactText(e.truncated ? `…[前段已省略]\n${e.text}` : e.text);
   return {
     commandId: def.commandId,
     argv: def.argv,
@@ -351,8 +356,8 @@ function outcome(
     exitCode,
     signal,
     durationMs: Date.now() - started,
-    stdoutPreview: o.truncated ? `…[前段已省略]\n${o.text}` : o.text,
-    stderrPreview: e.truncated ? `…[前段已省略]\n${e.text}` : e.text,
+    stdoutPreview: so.text,
+    stderrPreview: se.text,
     // 由各层自己回报，不在外面用另一套阈值猜 —— 之前单条 6000 字节的输出
     // 明明已被腰斩，这里却报 false，下游据此把残缺日志当成完整证据
     outputTruncated: captureTruncated || o.truncated || e.truncated,

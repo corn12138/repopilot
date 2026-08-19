@@ -8,8 +8,18 @@ import type {
   TaskClass,
 } from '@shared/domain';
 import { COMMON_TASK_CLASSES } from '@shared/domain';
+import type { DataEgressDisclosure } from '@shared/domain';
 import type { ReviewerOption } from '@shared/protocol';
 import { RequestError, call } from '../bridge';
+
+const DATA_CLASS_LABEL: Record<string, string> = {
+  TASK_TEXT: '任务描述与验收条件',
+  REPOSITORY_SNAPSHOT_EXCERPTS: '被读取的仓库文件片段',
+  COMMAND_OUTPUT: '构建/测试命令输出',
+  PATCH_DIFF: '补丁 diff',
+  REVIEW_FINDINGS: '审核发现',
+  REPOSITORY_FULL_COPY_VIA_CLI: '整个仓库的一次性副本（CLI 可读取其中任何文件）',
+};
 
 /** 常见值的中文说明，仅用于 datalist 的提示文案 —— 不是可选项清单 */
 const TASK_CLASS_HINT: Record<string, string> = {
@@ -79,6 +89,15 @@ export function Composer({
   const [externalOptions, setExternalOptions] = useState<readonly ReviewerOption[]>([]);
   /** 作者：'' = RepoPilot 内部 Agent（默认）；否则是外部 CLI 的 connectorId */
   const [authorConnectorId, setAuthorConnectorId] = useState('');
+  /**
+   * 数据出站披露（PRD-DATA-001）：第一笔模型出站之前，用户要看见"送什么、送给谁、我们不知道对方政策"
+   * 并对**这一份**点头。披露由 Core 算（与 task.create 重算的是同一个函数），界面只展示与收集同意；
+   * 路由/审核方/作者/快照任一变化 → digest 变 → 同意自动作废（checkbox 归零）。
+   * 取不到披露 = 不能建任务（fail-closed），原因显示出来。
+   */
+  const [disclosure, setDisclosure] = useState<DataEgressDisclosure | null>(null);
+  const [disclosureError, setDisclosureError] = useState<string | null>(null);
+  const [consentedDigest, setConsentedDigest] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -131,6 +150,44 @@ export function Composer({
   const reviewerResolved = reviewerCandidates.some((m) => m.profileId === reviewerProfileId) || reviewerIsCli;
   const authorOption = externalOptions.find((o) => o.id === authorConnectorId) ?? null;
 
+  const reviewerModelForDisclosure = reviewerProfileId && reviewerResolved && !reviewerIsCli ? reviewerProfileId : '';
+  const reviewerCliForDisclosure = reviewerProfileId && reviewerIsCli ? reviewerProfileId : '';
+  useEffect(() => {
+    if (!effectiveModelId) {
+      setDisclosure(null);
+      setDisclosureError('没有可用的模型路由');
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await call('egress.disclosure', {
+          snapshotId: snapshot.snapshotId,
+          modelProfileId: effectiveModelId,
+          ...(reviewerModelForDisclosure ? { reviewerModelProfileId: reviewerModelForDisclosure } : {}),
+          ...(reviewerCliForDisclosure ? { reviewerConnectorId: reviewerCliForDisclosure } : {}),
+          ...(authorConnectorId ? { authorConnectorId } : {}),
+        });
+        if (cancelled) return;
+        if (!res?.disclosure) {
+          setDisclosure(null);
+          setDisclosureError('未取得出站披露');
+          return;
+        }
+        setDisclosure(res.disclosure);
+        setDisclosureError(null);
+      } catch (err) {
+        if (cancelled) return;
+        setDisclosure(null);
+        setDisclosureError(err instanceof Error ? err.message : String(err));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [snapshot.snapshotId, effectiveModelId, reviewerModelForDisclosure, reviewerCliForDisclosure, authorConnectorId]);
+  const consented = disclosure !== null && consentedDigest === disclosure.digest;
+
   /**
    * 任务选项里**真正被设置过**的条目。用于让弹层关掉之后仍然看得见 ——
    * 填完就消失等于没有反馈，用户无从判断自己填的东西有没有生效。
@@ -155,6 +212,8 @@ export function Composer({
     effectiveModelId.length > 0 &&
     // 填了但填错 / 填了多个都不放行：静默忽略等于"我以为开了交叉审核，其实没开"
     (reviewerLines.length === 0 || (reviewerLines.length === 1 && reviewerResolved)) &&
+    // 出站同意：没看到披露或没点头，就不能发 —— 这是 P0 契约，不是可选项
+    consented &&
     !submitting;
 
   const submit = async () => {
@@ -186,6 +245,7 @@ export function Composer({
             : { reviewerModelProfileId: reviewerProfileId }
           : {}),
         ...(authorConnectorId ? { authorConnectorId } : {}),
+        egressConsentDigest: disclosure!.digest,
       });
       setGoal('');
       setStaleSnapshot(false);
@@ -297,6 +357,52 @@ export function Composer({
         {unverifiedMode && (
           <span className="composer-unverified" title="没有验证命令时，终态最多是 ACCEPTED_UNVERIFIED，不会是 SUCCEEDED">
             未验证模式：无法证明"修好了"
+          </span>
+        )}
+      </div>
+
+      {/* 出站披露与同意：必须在明面上，不进高级抽屉 —— 它决定的是"什么会离开这台机器" */}
+      <div className="composer-disclosure" data-testid="egress-disclosure">
+        {disclosure ? (
+          <>
+            <label className="composer-consent">
+              <input
+                type="checkbox"
+                checked={consented}
+                onChange={(e) => setConsentedDigest(e.target.checked ? disclosure.digest : null)}
+                aria-describedby="egress-disclosure-detail"
+              />
+              <span>
+                我确认：本任务会把数据发往{' '}
+                {disclosure.destinations.map((d, i) => (
+                  <span key={`${d.role}-${i}`}>
+                    {i > 0 ? '、' : ''}
+                    <b>{d.label}</b>
+                    {d.channel === 'MODEL_API'
+                      ? `（${d.isRelay ? '第三方中转' : '官方'} · ${d.origin}）`
+                      : '（本机 CLI 自行出站，端点由它决定）'}
+                  </span>
+                ))}
+                ；保留/训练/地域政策：<b>未知</b>
+              </span>
+            </label>
+            <details id="egress-disclosure-detail" className="composer-disclosure-detail">
+              <summary>会送出哪些数据 · 披露 {disclosure.digest.slice(0, 16)}</summary>
+              <ul className="plain">
+                {disclosure.destinations.map((d, i) => (
+                  <li key={`${d.role}-${i}`}>
+                    <b>{d.role === 'IMPLEMENTER' ? '实现方' : d.role === 'REVIEWER' ? '审核方' : '作者'}</b> {d.label}：
+                    {d.dataClasses.map((c) => DATA_CLASS_LABEL[c] ?? c).join('、')}
+                  </li>
+                ))}
+                <li>快照 {disclosure.snapshotId.slice(0, 12)} 共 {disclosure.snapshotFileCount} 个文件；只有被读取的片段会离开本机，每次出站在运行页"数据出站"里逐笔可查</li>
+                <li>高置信度凭据（AWS key / 私钥 / token）在命令输出里会被脱敏，在文件里会拒绝读入，出站前再扫一遍</li>
+              </ul>
+            </details>
+          </>
+        ) : (
+          <span className="composer-disclosure-error" role="status">
+            {disclosureError ? `无法取得出站披露：${disclosureError} —— 未确认披露不能创建任务` : '正在计算出站披露…'}
           </span>
         )}
       </div>

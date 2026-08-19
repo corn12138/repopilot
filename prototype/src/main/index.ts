@@ -766,11 +766,20 @@ async function selfTest(): Promise<void> {
       if (d?.outcome === 'IMPORTED' && d.snapshot && d.profile) {
         const snap = d.snapshot;
         const prof = d.profile;
+        // 出站同意：自检也走真实合同 —— 先披露再同意，不给自检开后门
+        const disclosed = await callCore('egress.disclosure', {
+          snapshotId: snap.snapshotId,
+          modelProfileId: 'profile_anthropic',
+        });
+        const consentDigest = disclosed.ok
+          ? (disclosed.data as { disclosure: { digest: string } }).disclosure.digest
+          : '';
         const created = await callCore('task.create', {
           projectId,
           snapshotId: snap.snapshotId,
           profileId: prof.profileId,
           modelProfileId: 'profile_anthropic',
+          egressConsentDigest: consentDigest,
           goal: '[selftest] 重启恢复用例',
           taskClass: 'BUILD_FAILURE_FIX',
           allowedPaths: ['src/**'],

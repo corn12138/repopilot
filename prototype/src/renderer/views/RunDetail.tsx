@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
   ApprovalRequest,
   CrossReviewRecord,
@@ -272,6 +272,8 @@ export function RunDetail({
       )}
 
       {verifications.length > 0 && <VerificationPanel verifications={verifications} />}
+
+      <EgressPanel events={events} />
 
       <Card
         title="对话"
@@ -855,6 +857,124 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
             )}
           </div>
         ))
+      )}
+    </Card>
+  );
+}
+
+/**
+ * 数据出站（PRD-DATA-001/002 的"对等可见"那一半）：用户随时能看到 Agent 把什么送给了谁。
+ * 事实只来自持久化事件：RUN_CREATED 里的同意摘要、每次 MODEL_INVOCATION 的 egress manifest、
+ * 每次外部 CLI 调用的 invocation manifest。被拦下的（NOT_SENT）与发出去的并列展示，
+ * 拦下的原因写在那一行 —— 不存在"只显示成功出站"的过滤。
+ */
+interface EgressRow {
+  readonly key: string;
+  readonly at: string;
+  readonly who: string;
+  readonly where: string;
+  readonly sent: boolean | null;
+  readonly detail: string;
+  readonly tokens: string;
+}
+
+function EgressPanel({ events }: { events: RunEvent[] }) {
+  const consent = useMemo(() => {
+    const created = events.find((e) => e.kind === 'RUN_CREATED');
+    return (created?.payload as { egressConsent?: {
+      disclosureDigest: string;
+      destinations: { role: string; channel: string; label: string; origin: string | null; isRelay: boolean; dataClasses: string[] }[];
+      policy: { retention: string; training: string; region: string };
+    } } | undefined)?.egressConsent ?? null;
+  }, [events]);
+
+  const rows = useMemo<EgressRow[]>(() => {
+    const out: EgressRow[] = [];
+    for (const e of events) {
+      if (e.kind !== 'MODEL_INVOCATION') continue;
+      const m = (e.payload as { manifest?: Record<string, unknown> }).manifest;
+      if (m) {
+        const sent = m.sent === true;
+        const attempt = typeof m.sendAttempt === 'number' && m.sendAttempt > 1 ? `（第 ${m.sendAttempt} 次尝试）` : '';
+        out.push({
+          key: `m-${e.seq}`,
+          at: e.at,
+          who: `${String(m.purpose)} · 模型 API`,
+          where: `${String(m.providerId)} / ${String(m.modelId)} @ ${String(m.origin)}`,
+          sent,
+          detail: sent
+            ? `已发送${attempt}${typeof m.errorKind === 'string' && m.errorKind ? ` · ${m.errorKind}` : ''}`
+            : m.blockReason
+              ? `未发送 · 出站前阻断：${String(m.blockReason)}`
+              : `未发送 · ${String(m.errorKind ?? '连接未建立')}${attempt}`,
+          tokens:
+            m.inputTokens === null && m.outputTokens === null
+              ? sent
+                ? 'token 未知（供应商未回报）'
+                : '—'
+              : `in=${m.inputTokens ?? '?'} out=${m.outputTokens ?? '?'}`,
+        });
+        continue;
+      }
+      const x = (e.payload as { externalInvocation?: Record<string, unknown> }).externalInvocation;
+      if (x) {
+        const state = String(x.state);
+        out.push({
+          key: `x-${e.seq}`,
+          at: e.at,
+          who: `${String(x.role) === 'CANDIDATE_AUTHOR' ? `作者 ${String(x.phase ?? '')}`.trim() : '只读审核'} · 本机 CLI`,
+          where: `${String(x.connectorId)}（${String(x.vendor)}；端点由 CLI 决定）`,
+          sent: state === 'SEALED' || state === 'FAILED' || state === 'TIMED_OUT',
+          detail:
+            state === 'SEALED'
+              ? `已调用并封存${typeof x.changedCount === 'number' ? ` · ${x.changedCount} 处变更` : ''}`
+              : state === 'BLOCKED'
+                ? `未调用 · 出站前阻断：${String(x.failureDetail ?? '')}`
+                : `${state}${x.failureDetail ? ` · ${String(x.failureDetail)}` : ''}`,
+          tokens: 'token 未知（CLI 自行计费）',
+        });
+      }
+    }
+    return out;
+  }, [events]);
+
+  const sentCount = rows.filter((r) => r.sent).length;
+  const blockedCount = rows.filter((r) => r.sent === false).length;
+
+  return (
+    <Card title="数据出站" hint={`${sentCount} 次已发出 · ${blockedCount} 次未发出`}>
+      {consent ? (
+        <div className="egress-consent" data-testid="egress-consent">
+          <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+            你确认的披露 <code>{consent.disclosureDigest.slice(0, 16)}</code> · 保留/训练/地域政策：
+            {[consent.policy.retention, consent.policy.training, consent.policy.region].every((v) => v === 'UNKNOWN') ? '未知' : '见披露'}
+          </div>
+          <ul className="plain">
+            {consent.destinations.map((d, i) => (
+              <li key={i}>
+                {d.role === 'IMPLEMENTER' ? '实现方' : d.role === 'REVIEWER' ? '审核方' : '作者'} {d.label}
+                {d.channel === 'MODEL_API' ? `（${d.isRelay ? '第三方中转' : '官方'} · ${d.origin}）` : '（本机 CLI 自行出站）'} —— {d.dataClasses.join('、')}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <div className="help">这个 Run 没有记录出站同意（早于该合同的历史 Run）。</div>
+      )}
+      {rows.length === 0 ? (
+        <div className="empty">还没有任何出站。</div>
+      ) : (
+        <div className="egress-rows" data-testid="egress-rows">
+          {rows.map((r) => (
+            <div key={r.key} className="egress-row" data-sent={r.sent === null ? 'unknown' : r.sent ? 'yes' : 'no'}>
+              <span className="time">{timeOf(r.at)}</span>
+              <span className="kind">{r.who}</span>
+              <span className="summary">
+                {r.where} · {r.detail} · {r.tokens}
+              </span>
+            </div>
+          ))}
+        </div>
       )}
     </Card>
   );

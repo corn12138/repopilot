@@ -34,7 +34,7 @@ vi.mock('../paths', async () => {
 });
 
 import type { ModelEgressManifest } from '@shared/domain';
-import { InvocationFailed, ModelGateway, profileIdOf } from './gateway';
+import { EgressBlocked, InvocationFailed, ModelGateway, profileIdOf } from './gateway';
 import { isRetryable, retryDelayMs } from './retry';
 import { ModelCallError } from './types';
 import { PATHS } from '../paths';
@@ -187,11 +187,14 @@ describe('invoke: 有界同 route 重试 + 单次尝试超时', () => {
   }
 
   function makeInput(gw: ModelGateway, signal?: AbortSignal) {
+    const resolution = gw.freezeRoute(profileIdOf('deepseek'));
     return {
       runId: 'run-retry',
       attemptId: 'attempt-retry',
       purpose: 'EXECUTION' as const,
-      resolution: gw.freezeRoute(profileIdOf('deepseek')),
+      resolution,
+      // 出站同意覆盖这条冻结路由（PRD-DATA-001）；缺失/不覆盖的负向用例见下面的 describe
+      consent: { disclosureDigest: 'sha256:test-disclosure', resolutionDigests: [resolution.digest] },
       request: {
         system: 's',
         messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }] }],
@@ -356,5 +359,130 @@ describe('retry 策略纯函数：什么能重试、等多久', () => {
     // random=0 → 半额下界
     expect(retryDelayMs(err('SERVER'), 1, policy, () => 0)).toBe(250);
     expect(retryDelayMs(err('SERVER'), 1, policy, () => 1)).toBe(500);
+  });
+});
+
+
+describe('invoke: 出站同意与最小 DLP 在发送前阻断（PRD-DATA-001/003）', () => {
+  function gatewayWithKey(): ModelGateway {
+    process.env.DEEPSEEK_API_KEY = 'sk-deepseek-test-key-for-consent';
+    return new ModelGateway();
+  }
+  function input(gw: ModelGateway, overrides: Record<string, unknown> = {}) {
+    const resolution = gw.freezeRoute(profileIdOf('deepseek'));
+    return {
+      runId: 'run-consent',
+      attemptId: 'attempt-consent',
+      purpose: 'PLANNING' as const,
+      resolution,
+      consent: { disclosureDigest: 'sha256:d', resolutionDigests: [resolution.digest] },
+      request: {
+        system: 's',
+        messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }] }],
+        tools: [],
+        maxOutputTokens: 16,
+        temperature: 0,
+      },
+      contextFileRefs: [],
+      signal: new AbortController().signal,
+      ...overrides,
+    };
+  }
+  afterEach(() => {
+    delete process.env.DEEPSEEK_API_KEY;
+    vi.unstubAllGlobals();
+  });
+
+  it('没有 consent → CONSENT_MISSING，NOT_SENT，fetch 一次都没被调用', async () => {
+    const gw = gatewayWithKey();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const err = await gw.invoke(input(gw, { consent: null })).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EgressBlocked);
+    expect((err as EgressBlocked).reason).toBe('CONSENT_MISSING');
+    expect((err as EgressBlocked).manifest.sent).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('consent 不覆盖这条冻结路由 → CONSENT_STALE（同意过别的路由不算）', async () => {
+    const gw = gatewayWithKey();
+    vi.stubGlobal('fetch', vi.fn());
+    const err = await gw
+      .invoke(input(gw, { consent: { disclosureDigest: 'sha256:d', resolutionDigests: ['sha256:some-other-route'] } }))
+      .catch((e: unknown) => e);
+    expect((err as EgressBlocked).reason).toBe('CONSENT_STALE');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('CONNECTIVITY_TEST 不要求 consent（披露在设置页本身），其他 purpose 都要求', async () => {
+    const gw = gatewayWithKey();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }), { status: 200, headers: { 'content-type': 'application/json' } })),
+    );
+    const out = await gw.invoke(input(gw, { purpose: 'CONNECTIVITY_TEST', consent: null }));
+    expect(out.manifest.sent).toBe(true);
+    for (const purpose of ['EXECUTION', 'SELF_FIX', 'CROSS_REVIEW', 'COMPACTION', 'TITLE_SUMMARY'] as const) {
+      const err = await gw.invoke(input(gw, { purpose, consent: null })).catch((e: unknown) => e);
+      expect((err as EgressBlocked).reason).toBe('CONSENT_MISSING');
+    }
+  });
+
+  it('对话里出现高置信度凭据（AWS key / 私钥头 / Bearer）→ DLP 阻断，原因只含种类与位置、不含原文', async () => {
+    const gw = gatewayWithKey();
+    vi.stubGlobal('fetch', vi.fn());
+    const secret = 'AKIAABCDEFGHIJKLMNOP';
+    const err = await gw
+      .invoke(
+        input(gw, {
+          request: {
+            system: 's',
+            messages: [
+              { role: 'user' as const, content: [{ type: 'text' as const, text: 'please read config' }] },
+              { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: 'tu1', name: 'fs_read', input: { path: 'config.ts' } }] },
+              {
+                role: 'user' as const,
+                content: [{ type: 'tool_result' as const, toolUseId: 'tu1', content: `AWS_ACCESS_KEY_ID=${secret}\n-----BEGIN RSA PRIVATE KEY-----\nabc`, isError: false }],
+              },
+            ],
+            tools: [],
+            maxOutputTokens: 16,
+            temperature: 0,
+          },
+        }),
+      )
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(EgressBlocked);
+    const reason = (err as EgressBlocked).reason;
+    expect(reason).toContain('DLP: AWS_ACCESS_KEY_ID, PRIVATE_KEY_BLOCK');
+    expect(reason).toContain('message[2].tool_result');
+    expect(reason).not.toContain(secret);
+    expect(JSON.stringify((err as EgressBlocked).manifest)).not.toContain(secret);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('普通代码文本（含 "password" 字样、短 token 占位符）不触发 DLP —— 只做高置信度', async () => {
+    const gw = gatewayWithKey();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }), { status: 200, headers: { 'content-type': 'application/json' } })),
+    );
+    const out = await gw.invoke(
+      input(gw, {
+        request: {
+          system: 's',
+          messages: [
+            {
+              role: 'user' as const,
+              content: [{ type: 'text' as const, text: 'const password = process.env.PASSWORD; const token = "sk-test"; // AKIA placeholder: AKIA...' }],
+            },
+          ],
+          tools: [],
+          maxOutputTokens: 16,
+          temperature: 0,
+        },
+      }),
+    );
+    expect(out.manifest.sent).toBe(true);
   });
 });

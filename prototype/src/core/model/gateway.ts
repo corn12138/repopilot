@@ -8,6 +8,7 @@ import type {
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { digestOf, newId, nowIso } from '@shared/ids';
+import { describeDlpHits, scanSegments } from '../dlp';
 import { PATHS } from '../paths';
 import { readJson, writeJsonAtomic } from '../store';
 import { anthropicAdapter } from './anthropic';
@@ -82,6 +83,12 @@ export interface InvocationInput {
   /** 被送进上下文的仓库文件引用，写入 egress manifest 供用户查询 */
   readonly contextFileRefs: readonly string[];
   readonly signal: AbortSignal;
+  /**
+   * 用户在 task.create 时对 DataEgressDisclosure 的同意（PRD-DATA-001）。
+   * 除 CONNECTIVITY_TEST 外所有 purpose 都必须带；缺失 → CONSENT_MISSING，
+   * 冻结路由不在同意覆盖范围内 → CONSENT_STALE。两者都在发送前阻断，P0 无"仍然发送"。
+   */
+  readonly consent?: { readonly disclosureDigest: string; readonly resolutionDigests: readonly string[] } | null;
 }
 
 export interface InvocationOutput {
@@ -427,7 +434,7 @@ export class ModelGateway {
     };
 
     // ---- 出站前置检查：不满足就是 NOT_SENT，不会先发再说 ----
-    const blockReason = this.preflight(profile, resolution, input.request.messages);
+    const blockReason = this.preflight(profile, resolution, input);
     if (blockReason) {
       const manifest: ModelEgressManifest = {
         ...base,
@@ -526,11 +533,22 @@ export class ModelGateway {
   private preflight(
     profile: ModelConnectionProfile | undefined,
     resolution: ModelRouteResolution,
-    messages: readonly ModelMessage[],
+    input: InvocationInput,
   ): string | null {
+    const messages = input.request.messages;
     if (!profile) return 'PROFILE_NOT_FOUND';
     if (!profile.enabled) return 'PROFILE_DISABLED';
     if (!this.keyFor(profile.providerId)) return 'CREDENTIAL_MISSING';
+    /*
+     * 出站同意（PRD-DATA-001）：Run 绑定的每一次模型调用都必须在用户同意的披露覆盖范围内。
+     * 同意是对一份精确的 DataEgressDisclosure（含冻结路由 digest）作出的，路由不在其中
+     * 就是 stale —— 不存在"同意过出站所以都行"。连通性探针不属于任何 Run，它的披露
+     * 在设置页本身（用户手动点"测试连接"），不走这条。
+     */
+    if (input.purpose !== 'CONNECTIVITY_TEST') {
+      if (!input.consent) return 'CONSENT_MISSING';
+      if (!input.consent.resolutionDigests.includes(resolution.digest)) return 'CONSENT_STALE';
+    }
     // route 漂移检测：profile 在冻结之后被改动过就必须阻断，而不是静默改走新配置
     const current = digestOf({
       profileId: profile.profileId,
@@ -544,6 +562,20 @@ export class ModelGateway {
     // 详见 findOrphanToolUse 的注释：孤儿会污染此后每一次请求，不只是这一次。
     const violation = findWireViolation(messages);
     if (violation) return `MALFORMED_CONVERSATION: ${violation}`;
+    /*
+     * 最小 DLP（PRD-DATA-003）：整个即将出站的对话（含 system、工具结果回填）做高置信度
+     * 凭据扫描，命中即 NOT_SENT；结论只带种类与位置，不带原文。P0 无 override（DEC-008）。
+     */
+    const segments: { text: string; where: string }[] = [{ text: input.request.system, where: 'system' }];
+    messages.forEach((m, i) => {
+      m.content.forEach((b, j) => {
+        if (b.type === 'text') segments.push({ text: b.text, where: `message[${i}].${j}` });
+        else if (b.type === 'tool_result') segments.push({ text: b.content, where: `message[${i}].tool_result` });
+        else if (b.type === 'tool_use') segments.push({ text: JSON.stringify(b.input ?? {}), where: `message[${i}].tool_use` });
+      });
+    });
+    const hits = scanSegments(segments);
+    if (hits.length > 0) return describeDlpHits(hits);
     return null;
   }
 }

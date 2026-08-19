@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { CommandDefinition } from '@shared/domain';
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { buildChildEnv, runCommand } from '../command';
+import { describeDlpHits, scanSegments } from '../dlp';
 import { listTree, type TreeEntry } from '../workspace';
 import {
   descriptorOfConnector,
@@ -221,6 +222,11 @@ export async function runExternalCliAuthor(input: {
       manifest: seal('BLOCKED', null, `缺少 ${d.credentialEnvVar}：拒绝以宿主登录态运行外部 CLI`, null),
       seal: null,
     };
+  }
+  // 简报（含失败摘要 / 审核发现 / diff）是出站内容：与 ModelGateway 同一道 DLP
+  const dlp = scanSegments([{ text: prompt, where: `author-brief:${input.phase}` }]);
+  if (dlp.length > 0) {
+    return { manifest: seal('BLOCKED', null, describeDlpHits(dlp), null), seal: null };
   }
 
   const home = mkdtempSync(join(tmpdir(), 'repopilot-xauthor-'));

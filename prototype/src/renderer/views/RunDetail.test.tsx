@@ -351,3 +351,95 @@ describe('Slice G：批准计划时必须看得见"能写到哪"', () => {
     expect(scope.textContent).not.toContain('把 STATUS 改成 fixed');
   });
 });
+
+describe('数据出站面板：发出去的与被拦下的并列，同意摘要可见', () => {
+  beforeEach(() => {
+    requestMock.mockReset();
+    requestMock.mockImplementation(async () => ({ crossReview: null }));
+  });
+  afterEach(() => cleanup());
+
+  it('从事件投影：RUN_CREATED 的同意摘要 + 每次模型/CLI 出站一行；NOT_SENT 带阻断原因；token 未知不填 0', async () => {
+    const run = makeRun('run-egress', 'AWAITING_PATCH_REVIEW');
+    const base = { runId: run.runId, attemptId: run.attemptId, at: '2026-08-19T00:00:00.000Z' };
+    const events = [
+      {
+        ...base,
+        seq: 1,
+        kind: 'RUN_CREATED' as const,
+        summary: '任务已创建',
+        payload: {
+          egressConsent: {
+            disclosureDigest: 'sha256:abcdef0123456789abcdef',
+            destinations: [
+              { role: 'IMPLEMENTER', channel: 'MODEL_API', label: 'DeepSeek · deepseek-chat', origin: 'https://api.deepseek.com/v1', isRelay: false, dataClasses: ['TASK_TEXT', 'COMMAND_OUTPUT'] },
+              { role: 'AUTHOR', channel: 'EXTERNAL_CLI', label: 'Codex（本机 CLI）', origin: null, isRelay: false, dataClasses: ['REPOSITORY_FULL_COPY_VIA_CLI'] },
+            ],
+            policy: { retention: 'UNKNOWN', training: 'UNKNOWN', region: 'UNKNOWN' },
+          },
+        },
+      },
+      {
+        ...base,
+        seq: 2,
+        kind: 'MODEL_INVOCATION' as const,
+        summary: 'PLANNING 调用',
+        payload: { manifest: { purpose: 'PLANNING', providerId: 'deepseek', modelId: 'deepseek-chat', origin: 'https://api.deepseek.com/v1', sent: true, blockReason: null, inputTokens: 120, outputTokens: 45, errorKind: null } },
+      },
+      {
+        ...base,
+        seq: 3,
+        kind: 'MODEL_INVOCATION' as const,
+        summary: '模型出站被阻断',
+        payload: { manifest: { purpose: 'EXECUTION', providerId: 'deepseek', modelId: 'deepseek-chat', origin: 'https://api.deepseek.com/v1', sent: false, blockReason: 'DLP: AWS_ACCESS_KEY_ID @ message[2]', inputTokens: null, outputTokens: null, errorKind: null } },
+      },
+      {
+        ...base,
+        seq: 4,
+        kind: 'MODEL_INVOCATION' as const,
+        summary: 'SELF_FIX 调用',
+        payload: { manifest: { purpose: 'SELF_FIX', providerId: 'deepseek', modelId: 'deepseek-chat', origin: 'https://api.deepseek.com/v1', sent: true, blockReason: null, inputTokens: null, outputTokens: null, errorKind: null } },
+      },
+      {
+        ...base,
+        seq: 5,
+        kind: 'MODEL_INVOCATION' as const,
+        summary: 'IMPLEMENT 调用外部 CLI 作者',
+        payload: { externalInvocation: { role: 'CANDIDATE_AUTHOR', phase: 'IMPLEMENT', connectorId: 'codex-cli', vendor: 'OPENAI', state: 'SEALED', changedCount: 2, failureDetail: null } },
+      },
+    ];
+    render(
+      <RunDetail
+        run={run}
+        events={events as never}
+        toolCalls={[]}
+        approvals={[]}
+        plan={null}
+        patch={null}
+        verifications={[]}
+        approvalAction={{ ownerRunId: run.runId, pending: [], error: null, isPending: () => false, decide: vi.fn(async () => false), retry: vi.fn(async () => false), clearError: vi.fn() } satisfies ApprovalActionController}
+        onError={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+    const consent = await screen.findByTestId('egress-consent');
+    expect(consent.textContent).toContain('sha256:abcdef012');
+    expect(consent.textContent).toContain('实现方 DeepSeek · deepseek-chat（官方 · https://api.deepseek.com/v1）');
+    expect(consent.textContent).toContain('作者 Codex（本机 CLI）（本机 CLI 自行出站）');
+    expect(consent.textContent).toContain('未知');
+
+    const rows = screen.getByTestId('egress-rows');
+    const lines = Array.from(rows.querySelectorAll('.egress-row'));
+    expect(lines).toHaveLength(4);
+    expect(lines[0]!.textContent).toContain('已发送');
+    expect(lines[0]!.textContent).toContain('in=120 out=45');
+    expect(lines[1]!.getAttribute('data-sent')).toBe('no');
+    expect(lines[1]!.textContent).toContain('出站前阻断：DLP: AWS_ACCESS_KEY_ID');
+    expect(lines[2]!.textContent).toContain('token 未知（供应商未回报）');
+    expect(lines[2]!.textContent).not.toContain('in=0');
+    expect(lines[3]!.textContent).toContain('作者 IMPLEMENT · 本机 CLI');
+    expect(lines[3]!.textContent).toContain('2 处变更');
+    // 卡片标题给出计数：3 次发出（2 模型 + 1 CLI）· 1 次未发出
+    expect(screen.getByText(/3 次已发出 · 1 次未发出/)).toBeTruthy();
+  });
+});

@@ -4,7 +4,10 @@ import type {
   ApprovalDecisionKind,
   ApprovalRequest,
   CommandDefinition,
+  DataEgressConsent,
+  DataEgressDisclosure,
   FailureClass,
+  ModelConnectionProfile,
   LedgerCharge,
   CrossReviewRecord,
   CrossReviewRound,
@@ -50,6 +53,7 @@ import {
   type AgentDeps,
   type ReviewPassRunner,
   type ExternalAuthorRunner,
+  type ModelInvoker,
 } from './agent';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
 import { DEFAULT_MUTATION_POLICY, type MutationPolicy } from './mutation';
@@ -75,6 +79,8 @@ import {
 } from './external/connector';
 import { runExternalCliAuthor } from './external/author';
 import { verificationInputsFromCommands } from './coverage';
+import { describeDlpHits, scanSegments } from './dlp';
+import { buildDisclosure, consentedResolutionDigests, type DisclosureInput } from './egress';
 import { applyCandidate } from './external/normalize';
 import { EventStore, readJson, writeJsonAtomic } from './store';
 import {
@@ -266,6 +272,8 @@ interface RunRecord {
   reviewer: ReviewerBinding | null;
   /** 外部作者。null = 由 RepoPilot 自己的 Agent Loop 实现（默认） */
   author: AuthorBinding | null;
+  /** 用户对本任务 DataEgressDisclosure 的同意；恢复态的旧 Run 可能没有（null） */
+  consent: DataEgressConsent | null;
   /** 交叉审核聚合记录；跑过才有 */
   crossReview: CrossReviewRecord | null;
   /** 实现方冻结路由 + 执行起点。交叉审核续期（crossreview.continue）复用；恢复态没有 */
@@ -482,6 +490,7 @@ export class RunAuthority {
         // 恢复态不再续跑，reviewer route 不重建；但已完成的审核记录要留着展示
         reviewer: null,
         author: null,
+        consent: null,
         crossReview: s.crossReview ?? null,
       };
 
@@ -587,6 +596,7 @@ export class RunAuthority {
       patch: null,
       reviewer: null,
       author: null,
+      consent: null,
       crossReview: null,
     };
   }
@@ -704,6 +714,9 @@ export class RunAuthority {
 
       case 'crossreview.reviewers':
         return { reviewers: this.listReviewers() };
+
+      case 'egress.disclosure':
+        return { disclosure: this.disclosureFor(payload as never) };
 
       case 'crossreview.continue':
         return this.continueCrossReview(String(payload.runId));
@@ -1033,6 +1046,11 @@ export class RunAuthority {
     reviewerConnectorId?: string;
     /** 可选：用本机外部 CLI 当作者（Codex 写 / Claude 审，或反过来）。与审核方必须异构 */
     authorConnectorId?: string;
+    /**
+     * 用户同意的 DataEgressDisclosure digest（PRD-DATA-001）。Core 用同一输入重算披露并比对：
+     * 缺失 → CONSENT_REQUIRED；对不上（路由/审核方/作者/快照任一不同）→ CONSENT_STALE。
+     */
+    egressConsentDigest?: string;
   }): { task: TaskSpec; run: RunView } {
     const project = this.projects.get(input.projectId);
     const snapshot = this.snapshots.get(input.snapshotId);
@@ -1066,6 +1084,23 @@ export class RunAuthority {
      * 没有验证命令时 Run 仍然照常执行、照常产出补丁，只是终态只能是
      * `ACCEPTED_UNVERIFIED` 而不是 `SUCCEEDED`。约束在终态处强制，不在入口处拦人。
      */
+    /*
+     * 任务文本是第一类出站数据，也会原样进 RUN_CREATED 事件落盘。用户把一把 key 粘进任务描述
+     * 时，拒绝创建并说清楚 —— 而不是先落盘再靠网关那一道去拦（那时事件日志里已经有它了）。
+     */
+    const taskTextHits = scanSegments([
+      { text: input.goal, where: '任务描述' },
+      ...input.acceptance.map((a, i) => ({ text: a, where: `验收条件 ${i + 1}` })),
+      ...(input.customCommands ?? []).map((c, i) => ({ text: `${c.label} ${c.argv.join(' ')}`, where: `自定义命令 ${i + 1}` })),
+    ]);
+    if (taskTextHits.length > 0) {
+      throw platformError(
+        'BAD_REQUEST',
+        `任务文本含高置信度凭据（${describeDlpHits(taskTextHits)}），已拒绝创建`,
+        '请把凭据从任务描述/验收条件/自定义命令里移除后再试；平台不会把它存进事件日志或发给模型',
+      );
+    }
+
     const effectiveProfile = this.withUserCommands(profile, input.customCommands ?? []);
     const unknownCommands = input.verificationCommandIds.filter(
       // hasOwnProperty：否则 'constructor' 这类 id 能通过这道校验，一路走到运行时崩溃
@@ -1117,6 +1152,44 @@ export class RunAuthority {
     if (input.authorConnectorId) {
       author = this.bindCliAuthor(input.authorConnectorId, reviewer);
     }
+
+    /*
+     * 出站同意（PRD-DATA-001 / DEC-008）：第一笔模型出站之前，用户必须对"送什么、送给谁"
+     * 的精确披露点过头。披露由 Core 以同一输入重算 —— 路由、审核方、作者、快照任一与界面
+     * 展示时不同，digest 就对不上，旧同意自动作废。这里不做"缺了就当同意"的兜底。
+     */
+    const disclosure = buildDisclosure({
+      snapshotId: snapshot.snapshotId,
+      snapshotFileCount: snapshot.fileCount,
+      implementer: { profile: this.requireProfile(input.modelProfileId), resolution },
+      reviewer:
+        reviewer === null
+          ? null
+          : reviewer.kind === 'MODEL_API'
+            ? { kind: 'MODEL_API', profile: this.requireProfile(reviewer.resolution.profileId), resolution: reviewer.resolution }
+            : { kind: 'EXTERNAL_CLI', connector: reviewer.connector },
+      author: author ? { connector: author.connector } : null,
+    });
+    if (!input.egressConsentDigest) {
+      throw platformError(
+        'BAD_REQUEST',
+        'CONSENT_REQUIRED：创建任务前必须确认数据出站披露',
+        `本任务会向 ${disclosure.destinations.map((d) => d.label).join('、')} 发送数据；请先在任务选项里查看披露并确认`,
+      );
+    }
+    if (input.egressConsentDigest !== disclosure.digest) {
+      throw platformError(
+        'BAD_REQUEST',
+        'CONSENT_STALE：你确认的披露与本次任务的实际出站目的地不一致',
+        '路由、审核方、作者或快照在确认之后变了；请重新查看披露并确认',
+      );
+    }
+    const consent: DataEgressConsent = {
+      consentId: newId('consent'),
+      disclosureDigest: disclosure.digest,
+      resolutionDigests: consentedResolutionDigests(disclosure),
+      acceptedAt: nowIso(),
+    };
 
     const task: TaskSpec = {
       taskId: newId('task'),
@@ -1202,6 +1275,7 @@ export class RunAuthority {
       patch: null,
       reviewer,
       author,
+      consent,
       crossReview: null,
     };
     this.runs.set(runId, record);
@@ -1219,7 +1293,29 @@ export class RunAuthority {
       profileSupportStatus: effectiveProfile.supportStatus,
       verificationCommands: input.verificationCommandIds,
       userDefinedCommands: (input.customCommands ?? []).length,
+      // 用户同意了什么：披露 digest + 目的地清单（标签/通道/是否中转/数据类别）。不含 actor 身份
+      egressConsent: {
+        consentId: consent.consentId,
+        disclosureDigest: consent.disclosureDigest,
+        destinations: disclosure.destinations.map((d) => ({
+          role: d.role,
+          channel: d.channel,
+          label: d.label,
+          origin: d.origin,
+          isRelay: d.isRelay,
+          dataClasses: d.dataClasses,
+        })),
+        policy: disclosure.policy,
+      },
     });
+    this.emit(
+      record,
+      'NOTE',
+      `数据出站披露已确认（${consent.disclosureDigest.slice(0, 16)}）：${disclosure.destinations
+        .map((d) => `${d.role === 'IMPLEMENTER' ? '实现方' : d.role === 'REVIEWER' ? '审核方' : '作者'} ${d.label}${d.isRelay ? '（中转）' : ''}`)
+        .join('；')}；保留/训练/地域政策：未知`,
+      { egressConsent: { disclosureDigest: consent.disclosureDigest } },
+    );
 
     // 这些不是拦截，是**如实标注**：任何影响"成功意味着什么"的事实都进事件
     if (snapshot.baseKind === 'DIRTY_WORKTREE') {
@@ -1337,7 +1433,7 @@ export class RunAuthority {
         snapshot: record.snapshot,
         profile: record.profile,
         workspace,
-        gateway: this.gateway,
+        gateway: this.consentBoundGateway(record),
         resolution,
         mutationPolicy,
         runId: record.view.runId,
@@ -1536,6 +1632,66 @@ export class RunAuthority {
       heterogeneous: true, // 上面已断言，同厂商到不了这里
       label: `${connector.label} ${connector.version ?? ''}`.trim(),
     };
+  }
+
+  private requireProfile(profileId: string): ModelConnectionProfile {
+    const p = this.gateway.getProfile(profileId);
+    if (!p) throw platformError('NOT_FOUND', `模型 profile 不存在：${profileId}`);
+    return p;
+  }
+
+  /**
+   * 给 Renderer 的披露：与 createTask 里重算的那份**同一个函数、同一套输入**。
+   * 这里不绑定任何东西（不 freezeRoute 到 record、不签发 consent）—— 只是算给人看。
+   */
+  private disclosureFor(input: {
+    snapshotId: string;
+    modelProfileId: string;
+    reviewerModelProfileId?: string;
+    reviewerConnectorId?: string;
+    authorConnectorId?: string;
+  }): DataEgressDisclosure {
+    const snapshot = this.snapshots.get(input.snapshotId);
+    if (!snapshot) throw platformError('NOT_FOUND', `快照不存在：${input.snapshotId}`);
+    const implementer = { profile: this.requireProfile(input.modelProfileId), resolution: this.gateway.freezeRoute(input.modelProfileId) };
+    let reviewer: DisclosureInput['reviewer'] = null;
+    if (input.reviewerConnectorId) {
+      const d = descriptorOfConnector(input.reviewerConnectorId);
+      if (!d) throw platformError('BAD_REQUEST', `未知的外部连接器：${input.reviewerConnectorId}`);
+      reviewer = { kind: 'EXTERNAL_CLI', connector: probeConnector(d) };
+    } else if (input.reviewerModelProfileId && input.reviewerModelProfileId !== input.modelProfileId) {
+      try {
+        reviewer = {
+          kind: 'MODEL_API',
+          profile: this.requireProfile(input.reviewerModelProfileId),
+          resolution: this.gateway.freezeRoute(input.reviewerModelProfileId),
+        };
+      } catch {
+        // 审核方 route 不可用时 createTask 会降级为不审核 —— 披露也按"不审核"算，两边一致
+        reviewer = null;
+      }
+    }
+    let author: DisclosureInput['author'] = null;
+    if (input.authorConnectorId) {
+      const d = descriptorOfConnector(input.authorConnectorId);
+      if (!d) throw platformError('BAD_REQUEST', `未知的外部连接器：${input.authorConnectorId}`);
+      author = { connector: probeConnector(d) };
+    }
+    return buildDisclosure({
+      snapshotId: snapshot.snapshotId,
+      snapshotFileCount: snapshot.fileCount,
+      implementer,
+      reviewer,
+      author,
+    });
+  }
+
+  /** Loop 拿到的 gateway 只多一件事：每次 invoke 自动带上本 Run 的同意 —— 忘带就是 CONSENT_MISSING */
+  private consentBoundGateway(record: RunRecord): ModelInvoker {
+    const consent = record.consent
+      ? { disclosureDigest: record.consent.disclosureDigest, resolutionDigests: record.consent.resolutionDigests }
+      : null;
+    return { invoke: (i) => this.gateway.invoke({ ...i, consent }) };
   }
 
   private bindCliAuthor(connectorId: string, reviewer: ReviewerBinding | null): AuthorBinding {
@@ -1779,7 +1935,7 @@ export class RunAuthority {
       snapshot: record.snapshot,
       profile: record.profile,
       workspace,
-      gateway: this.gateway,
+      gateway: this.consentBoundGateway(record),
       // 整改要以实现方身份改文件；审核调用走注入的 review 执行器，不经这里
       resolution: implementerResolution,
       mutationPolicy: crossReviewPolicy,

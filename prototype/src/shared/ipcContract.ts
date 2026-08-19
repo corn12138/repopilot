@@ -136,8 +136,20 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
       reviewerModelProfileId: OPTIONAL_ID,
       reviewerConnectorId: OPTIONAL_ID,
       authorConnectorId: OPTIONAL_ID,
+      // 合同层可选、Core 必填：缺了由 Core 以 CONSENT_REQUIRED 拒绝（带可读的修复建议），不在 IPC 层吞成"字段缺失"
+      egressConsentDigest: { kind: 'string', optional: true, maxLength: 200 },
     },
     timeoutMs: SLOW,
+  },
+  'egress.disclosure': {
+    fields: {
+      snapshotId: ID,
+      modelProfileId: ID,
+      reviewerModelProfileId: OPTIONAL_ID,
+      reviewerConnectorId: OPTIONAL_ID,
+      authorConnectorId: OPTIONAL_ID,
+    },
+    timeoutMs: QUICK,
   },
 
   'run.get': { fields: { runId: ID }, timeoutMs: QUICK },

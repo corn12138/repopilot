@@ -226,11 +226,18 @@ class Harness {
     }>('project.import', { projectId });
     expect(imported.outcome).toBe('IMPORTED');
 
+    // 出站同意：先取披露再带 digest 回去 —— 与真实 UI 同一条路
+    const { disclosure } = await this.call<{ disclosure: { digest: string } }>('egress.disclosure', {
+      snapshotId: imported.snapshot.snapshotId,
+      modelProfileId: 'profile_deepseek',
+      ...(input.reviewerModelProfileId ? { reviewerModelProfileId: input.reviewerModelProfileId } : {}),
+    });
     const { run } = await this.call<{ run: RunView }>('task.create', {
       projectId,
       snapshotId: imported.snapshot.snapshotId,
       profileId: imported.profile.profileId,
       modelProfileId: 'profile_deepseek',
+      egressConsentDigest: disclosure.digest,
       goal: '修复 node check.mjs 失败：src/app.js 的 STATUS 仍是 broken',
       taskClass: imported.profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX',
       allowedPaths: input.allowedPaths ?? [],
@@ -501,9 +508,14 @@ describe('authority e2e：project → snapshot → profile 归属门禁', () => 
 
 async function createBrowsingRun(imported: ImportedFixture): Promise<RunView> {
   harness.script(IMPL, [() => planCall()]);
+  const { disclosure } = await harness.call<{ disclosure: { digest: string } }>('egress.disclosure', {
+    snapshotId: imported.snapshotId,
+    modelProfileId: 'profile_deepseek',
+  });
   const { run } = await harness.call<{ run: RunView }>('task.create', {
     ...imported,
     modelProfileId: 'profile_deepseek',
+    egressConsentDigest: disclosure.digest,
     goal: '读取处于待审批状态的 gen-0 工作区',
     taskClass: 'BUILD_FAILURE_FIX',
     allowedPaths: [],

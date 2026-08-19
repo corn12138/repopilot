@@ -11,6 +11,7 @@
  */
 
 import type {
+  DataEgressDisclosure,
   ApprovalDecisionKind,
   ApprovalRequest,
   CrossReviewRecord,
@@ -187,6 +188,11 @@ export interface RequestMap {
        * 直接拒绝创建任务，不降级成内部模型去写（那等于换了作者）。
        */
       authorConnectorId?: string;
+      /**
+       * 用户同意的 DataEgressDisclosure digest（PRD-DATA-001）。先用 `egress.disclosure`
+       * 取披露、给用户看、用户确认后把 digest 带回；Core 重算比对，缺失/过期一律拒绝创建。
+       */
+      egressConsentDigest?: string;
     };
     res: { task: TaskSpec; run: RunView };
   };
@@ -227,6 +233,21 @@ export interface RequestMap {
   'crossreview.reviewers': {
     req: Record<string, never>;
     res: { reviewers: readonly ReviewerOption[] };
+  };
+  /**
+   * 数据出站披露：这次任务会把哪些类别的数据送给谁（官方/中转、精确 origin、模型、
+   * 经 ModelGateway 还是本机外部 CLI 自行出站），以及政策 UNKNOWN 字段。
+   * 与 task.create 的重算是同一个函数、同一套输入；用户确认的是返回的 digest。
+   */
+  'egress.disclosure': {
+    req: {
+      snapshotId: string;
+      modelProfileId: string;
+      reviewerModelProfileId?: string;
+      reviewerConnectorId?: string;
+      authorConnectorId?: string;
+    };
+    res: { disclosure: DataEgressDisclosure };
   };
   'crossreview.continue': {
     req: { runId: string };

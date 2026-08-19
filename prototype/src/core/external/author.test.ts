@@ -218,3 +218,29 @@ describe('runExternalCliAuthor：状态 = 退出 + tree diff', () => {
     expect(r.seal!.changes.map((c) => c.path)).toEqual(['cwd.txt', 'env.txt', 'home.txt']);
   });
 });
+
+describe('runExternalCliAuthor：简报 DLP（与 ModelGateway 同一道）', () => {
+  it('简报里有高置信度凭据 → BLOCKED(DLP)，子进程根本没起；原因不含原文', async () => {
+    const candidate = makeCandidate({ 'src/app.ts': 'x\n' });
+    const marker = join(candidate.path, 'ran');
+    const fake = makeFakeCli(`touch "${marker}"`);
+    const secret = 'AKIAIOSFODNN7EXAMPLE';
+    const r = await runExternalCliAuthor({
+      connector: fake,
+      apiKey: 'sk-scoped',
+      brief: `任务目标：把 key ${secret} 换掉`,
+      phase: 'IMPLEMENT',
+      runId: 'run_x',
+      attemptId: 'att_x',
+      timeoutMs: 5_000,
+      signal: new AbortController().signal,
+      candidate,
+    });
+    expect(r.manifest.state).toBe('BLOCKED');
+    expect(r.manifest.failureDetail).toContain('DLP: AWS_ACCESS_KEY_ID');
+    expect(r.manifest.failureDetail).toContain('author-brief:IMPLEMENT');
+    expect(r.manifest.failureDetail).not.toContain(secret);
+    expect(existsSync(marker)).toBe(false);
+    expect(r.seal).toBeNull();
+  });
+});

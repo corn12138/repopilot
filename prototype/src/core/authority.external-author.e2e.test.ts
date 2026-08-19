@@ -184,11 +184,19 @@ class Harness {
       profile: { profileId: string; supportedTaskClasses: string[] };
     }>('project.import', { projectId: reg.project.projectId });
     expect(imported.outcome).toBe('IMPORTED');
+    const { disclosure } = await this.call<{ disclosure: { digest: string } }>('egress.disclosure', {
+      snapshotId: imported.snapshot.snapshotId,
+      modelProfileId: 'profile_deepseek',
+      ...(input.authorConnectorId ? { authorConnectorId: input.authorConnectorId } : {}),
+      ...(input.reviewerModelProfileId ? { reviewerModelProfileId: input.reviewerModelProfileId } : {}),
+      ...(input.reviewerConnectorId ? { reviewerConnectorId: input.reviewerConnectorId } : {}),
+    });
     const { run } = await this.call<{ run: RunView }>('task.create', {
       projectId: reg.project.projectId,
       snapshotId: imported.snapshot.snapshotId,
       profileId: imported.profile.profileId,
       modelProfileId: 'profile_deepseek',
+      egressConsentDigest: disclosure.digest,
       goal: '修复 node check.mjs 失败：src/app.js 的 STATUS 仍是 broken',
       taskClass: imported.profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX',
       allowedPaths: input.allowedPaths ?? [],

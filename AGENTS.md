@@ -45,6 +45,10 @@
    Renderer 只看得到来源和末四位。
 8. **省略要报数。** 任何截断、过滤、排除都必须显示数量和原因 ——
    静默过滤和静默通过是同一类问题。
+9. **先披露、后同意、再出站。** `task.create` 必须带用户确认过的 `DataEgressDisclosure` digest
+   （Core 重算比对），每次模型调用由 `ModelGateway.preflight` 校验 consent 覆盖该冻结路由；
+   高置信度凭据在命令输出层脱敏（`dlp.ts`）、含凭据的文件 `fs_read` 拒读、网关与外部 CLI prompt
+   最后一道拦截。P0 没有"仍然发送"。
 
 ## 工程诚实规则
 
@@ -68,7 +72,7 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 45 个文件 / 790 个测试，含真实 tsc + vite build 的端到端链路
+pnpm test       # 48 个文件 / 834 个测试，含真实 tsc + vite build 的端到端链路
 pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 ```

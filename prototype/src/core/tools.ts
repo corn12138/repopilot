@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { CommandOutcome, MutationOperation, RepositoryHarnessProfile, ToolRisk } from '@shared/domain';
 import { newId } from '@shared/ids';
 import { PATHS } from './paths';
+import { redactText, scanText } from './dlp';
 import { applyMutationPlan, globMatch, type MutationPolicy } from './mutation';
 import { MaterializedWorkspace, listTree } from './workspace';
 import { runCommand } from './command';
@@ -48,11 +49,13 @@ export interface ToolDefinition<S extends z.ZodTypeAny = z.ZodTypeAny> {
 // 输出投影：Gateway 自己计量，不信任工具自报 truncated
 // ---------------------------------------------------------------------------
 
-export function project(full: string, label: string): {
+export function project(fullRaw: string, label: string): {
   preview: string;
   truncated: boolean;
   artifactRef: string | null;
 } {
+  // 先脱敏再投影：预览进模型、artifact 落盘，两处都不该出现高置信度凭据原文
+  const full = redactText(fullRaw).text;
   const lines = full.split('\n');
   const byBytes = Buffer.byteLength(full, 'utf8') > PREVIEW_MAX_BYTES;
   const byLines = lines.length > PREVIEW_MAX_LINES;
@@ -113,6 +116,18 @@ const fsRead: ToolDefinition<typeof readSchema> = {
       return fail(`无法读取 ${args.path}: ${(err as Error).message}`);
     }
     const { content, receipt } = ctx.workspace.issueReceipt(args.path);
+    /*
+     * 文件里有高置信度凭据：**拒绝读入模型上下文**，而不是脱敏后给出去 ——
+     * 脱敏后的内容一旦被模型用 REPLACE_WHOLE_FILE 写回，占位符就会覆盖真实值（工作区里），
+     * 补丁 diff 还会把原值带进 `-` 行。读不到，就没有这条路。用户在界面上能看到原因。
+     */
+    const hits = scanText(content, args.path);
+    if (hits.length > 0) {
+      return fail(
+        `${args.path} 含高置信度凭据（${[...new Set(hits.map((h) => h.kind))].join(', ')}），拒绝读入模型上下文。` +
+          `请把凭据移出仓库（或放进 .gitignore 的文件）后重新导入；不要在任务中要求修改该文件。`,
+      );
+    }
     const numbered = content
       .split('\n')
       .map((line, i) => `${String(i + 1).padStart(5)}\t${line}`)

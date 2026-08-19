@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { CommandDefinition, CrossReviewVerdict } from '@shared/domain';
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { buildChildEnv, resolveBinary, runCommand } from '../command';
+import { describeDlpHits, scanSegments } from '../dlp';
 
 /**
  * 外部编码代理 CLI 连接器（本机装好的 Claude Code / Codex 当交叉审核选手）。
@@ -560,6 +561,11 @@ export async function runExternalCliReview(input: {
       manifest: seal('BLOCKED', null, `缺少 ${d.credentialEnvVar}：拒绝以宿主登录态运行外部 CLI`),
       submission: null,
     };
+  }
+  // 与 ModelGateway 同一道 DLP：外部 CLI 拿到的 prompt 也是出站内容，不因"不经网关"而少扫一次
+  const dlp = scanSegments([{ text: prompt, where: 'review-brief' }]);
+  if (dlp.length > 0) {
+    return { manifest: seal('BLOCKED', null, describeDlpHits(dlp)), submission: null };
   }
 
   const home = mkdtempSync(join(tmpdir(), 'repopilot-xagent-'));
