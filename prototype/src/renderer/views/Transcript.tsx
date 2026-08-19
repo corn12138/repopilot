@@ -202,6 +202,19 @@ function build(
         });
         break;
 
+      case 'ATTEMPT_STARTED': {
+        // Attempt 边界是用户能理解的分隔：从这里往下是"带着你的反馈重做的那一次"
+        items.push({
+          kind: 'text',
+          seq: e.seq,
+          at: e.at,
+          role: 'platform',
+          text: e.summary,
+        });
+        currentTurn = null; // 新 Attempt 的工具调用不该挂到上一次的模型轮次下
+        break;
+      }
+
       case 'PLAN_GENERATED': {
         const plan = e.payload.plan as
           | { summary: string; steps: Array<{ index: number; intent: string }>; risks: string[] }

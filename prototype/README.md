@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 49 个文件、891 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 50 个文件、901 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -80,6 +80,10 @@
 | **Slice I-2 尾部不再被静默删**：400 行文件 fs_read 只给前 120 行 → 模型据此整文件替换被拒，`line 399` 还在 | `tools.test.ts` |
 | **Slice I-2 同一账本**：平台发起的验证命令留 `verify_command` ToolCall（带 `BASELINE/VERIFICATION` role、commandId、argv）并计入预算；未登记命令与取消也留记录（取消不计账）；非 R1 的 profile 命令拒绝执行且验证不 passed；不传 recorder 行为不变 | `verify.test.ts` |
 | 时间线：`verify_command` 不重复成行，合并进"另有 N 条事件没有单独成行"并点名；模型发起的 `run_command` 仍单独成行 | `Transcript.test.tsx` |
+| **REQUEST_CHANGES 开新 Attempt**（不是终态）：attemptNo 递增、attemptId 换新、工作区从快照重建（gen-0）、旧补丁进 `priorPatches`（带完整 diff）、用户反馈与上一版 diff 进第二次规划的简报、预算接着用不重置、`ATTEMPT_STARTED` 事件带起始账本；第二版可被接受为 `SUCCEEDED` | `authority.attempt.e2e.test.ts` |
+| REQUEST_CHANGES 的三条拒绝路径：旧补丁 digest 在新 Attempt 里不再可决定（CONFLICT）；预算已耗尽 → `BLOCKED/CHANGES_REQUESTED` 且点名是哪一项预算；恢复态 Run 可接受/拒绝但开不了新尝试 | `authority.attempt.e2e.test.ts` |
+| 持久化 v3：`priorPatches` 原样往返（diff 正文必须在，事件里没有它）；v2 旧快照缺字段读回 undefined，v4 仍 fail-closed | `persistence.test.ts` |
+| 审查页：历史补丁默认折叠可展开、没有时不给空壳；恢复态 Run 的"要求修改"禁用并说明原因；时间线里 `ATTEMPT_STARTED` 单独成行且切断上一轮 | `RunDetail.test.tsx` / `Transcript.test.tsx` |
 
 ## 尚未证明的
 

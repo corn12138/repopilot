@@ -273,8 +273,8 @@ describe('损坏的状态快照不能让 Run 凭空消失', () => {
 });
 
 describe('schema v2：交叉审核记录', () => {
-  it('当前版本是 2', () => {
-    expect(RUN_STATE_SCHEMA_VERSION).toBe(2);
+  it('当前版本是 3', () => {
+    expect(RUN_STATE_SCHEMA_VERSION).toBe(3);
   });
 
   it('crossReview 原样往返', () => {
@@ -341,12 +341,49 @@ describe('schema v2：交叉审核记录', () => {
     }
   });
 
-  it('v3（未来版本）仍然拒绝 —— 未知结构 fail-closed', () => {
+  it('v4（未来版本）仍然拒绝 —— 未知结构 fail-closed', () => {
     const view = makeView('SUCCEEDED');
     track(view.runId);
-    writeRunState({ ...makeState(view), schemaVersion: 3 });
+    writeRunState({ ...makeState(view), schemaVersion: 4 });
     const loaded = readRunState(view.runId);
     expect(loaded.ok).toBe(false);
+  });
+});
+
+describe('schema v3：REQUEST_CHANGES 的历史补丁', () => {
+  it('priorPatches 原样往返，且 v2 旧快照（无该字段）读回来是 undefined，按"没有历史补丁"处理', () => {
+    const view = makeView('AWAITING_PATCH_REVIEW');
+    track(view.runId);
+    const prior = {
+      patchId: 'patch_prior',
+      runId: view.runId,
+      attemptId: 'att_1',
+      baseSha: 'a'.repeat(40),
+      generation: 1,
+      files: [],
+      unifiedDiff: '--- a/x\n+++ b/x\n-old\n+new',
+      digest: 'sha256:prior',
+      sealedAt: '2026-08-20T00:00:00.000Z',
+      verificationRunId: null,
+      comparison: null,
+      unverifiedItems: [],
+      excludedGeneratedFiles: [],
+    };
+    writeRunState({ ...makeState(view), priorPatches: [prior] });
+    const loaded = readRunState(view.runId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) return;
+    expect(loaded.state.priorPatches).toHaveLength(1);
+    // 正文必须原样在：PATCH_SEALED 事件里没有 unifiedDiff，丢了就再也拿不回来
+    expect(loaded.state.priorPatches![0]!.unifiedDiff).toBe(prior.unifiedDiff);
+
+    // v2 老快照：字段缺失不是错误
+    const older = makeView('SUCCEEDED');
+    track(older.runId);
+    writeRunState({ ...makeState(older), schemaVersion: 2 });
+    const oldLoaded = readRunState(older.runId);
+    expect(oldLoaded.ok).toBe(true);
+    if (oldLoaded.ok) expect(oldLoaded.state.priorPatches).toBeUndefined();
   });
 });
 

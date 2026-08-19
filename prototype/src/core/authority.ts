@@ -147,11 +147,18 @@ export class PausableDeadline {
   /** 已经"真正在跑"的毫秒数：暂停期间不计入。是墙钟预算的唯一口径来源。 */
   private consumed = 0;
 
+  /**
+   * `priorConsumedMs`：本 Run 之前的 Attempt 已经用掉的净运行时长。
+   * 墙钟预算是 **Task 级聚合**的（PRD-DIFF-003：新 Attempt 继续消耗同一份预算），
+   * 所以新 Attempt 不能拿到一整份新的时间 —— 否则"要求修改"就成了无限续杯。
+   */
   constructor(
     totalMs: number,
     private readonly onFire: () => void,
+    priorConsumedMs = 0,
   ) {
-    this.remaining = totalMs;
+    this.consumed = priorConsumedMs;
+    this.remaining = Math.max(0, totalMs - priorConsumedMs);
     this.arm();
   }
 
@@ -252,10 +259,16 @@ interface RunRecord {
   /**
    * 从磁盘恢复的 Run 没有活工作区（目录可能还在，也可能已被清理），
    * 所以这里可空。所有摸它的地方都必须显式处理 null，不能让它抛未分类异常。
+   *
+   * 非 readonly 的唯一理由：REQUEST_CHANGES 开新 Attempt 时要从同一快照重新物化一份
+   * （TD §11.1「不能续用旧 workspace/lease」）。除那一处外没有别的赋值点。
    */
-  readonly workspace: MaterializedWorkspace | null;
+  workspace: MaterializedWorkspace | null;
+  /** 依赖复用根（子包导入时是子包目录）。新 Attempt 重建工作区要用同一个 */
+  readonly depsRoot: string | null;
   readonly events: EventStore;
-  readonly abort: AbortController;
+  /** 同上：每个 Attempt 一个独立的取消信号，旧的不复用 */
+  abort: AbortController;
   /** 运行期墙钟 deadline；审批等待时暂停。恢复态与非执行期为 null */
   deadline: PausableDeadline | null;
   readonly toolCalls: Map<string, ToolCallView>;
@@ -263,6 +276,10 @@ interface RunRecord {
   readonly approvals: Map<string, PendingApproval>;
   plan: PlanRevision | null;
   patch: PatchArtifact | null;
+  /** 被 REQUEST_CHANGES 掉的历史补丁，按发生顺序；当前那份在 patch 里 */
+  priorPatches: PatchArtifact[];
+  /** 用户对上一版补丁的修改要求；下一次 runAgent 会把它写进任务简报，用完即清 */
+  changeRequest: { note: string; previousPatchDigest: string; previousAttemptNo: number } | null;
   /**
    * 交叉审核方。null = 本任务不做交叉审核（未请求或降级）。
    * 与 implementer 严格分离 —— 绝不共用。
@@ -416,6 +433,7 @@ export class RunAuthority {
         verifications: record.verifications,
         plan: record.plan,
         patch: record.patch,
+        priorPatches: record.priorPatches,
         crossReview: record.crossReview,
         eventHighWatermark: record.events.lastSeq(),
         persistedAt: nowIso(),
@@ -488,6 +506,9 @@ export class RunAuthority {
         approvals: new Map(),
         plan: s.plan,
         patch: s.patch,
+        priorPatches: [...(s.priorPatches ?? [])],
+        changeRequest: null,
+        depsRoot: null, // 恢复态不续跑，也就不会再建工作区
         // 恢复态不再续跑，reviewer route 不重建；但已完成的审核记录要留着展示
         reviewer: null,
         author: null,
@@ -595,6 +616,9 @@ export class RunAuthority {
       approvals: new Map(),
       plan: null,
       patch: null,
+      priorPatches: [],
+      changeRequest: null,
+      depsRoot: null,
       reviewer: null,
       author: null,
       consent: null,
@@ -708,7 +732,10 @@ export class RunAuthority {
         return this.decideApproval(payload as never);
 
       case 'patch.get':
-        return { patch: this.runs.get(String(payload.runId))?.patch ?? null };
+      {
+        const rec = this.runs.get(String(payload.runId));
+        return { patch: rec?.patch ?? null, priorPatches: rec?.priorPatches ?? [] };
+      }
 
       case 'crossreview.get':
         return { crossReview: this.runs.get(String(payload.runId))?.crossReview ?? null };
@@ -1283,6 +1310,9 @@ export class RunAuthority {
       approvals: new Map(),
       plan: null,
       patch: null,
+      priorPatches: [],
+      changeRequest: null,
+      depsRoot,
       reviewer,
       author,
       consent,
@@ -1420,16 +1450,39 @@ export class RunAuthority {
 
     record.implementerResolution = resolution;
     record.executionStartedAt = startedAt;
+    /*
+     * 用户的修改要求只服务于**这一次** Attempt 的简报：取出来就清掉，
+     * 免得下一次（例如交叉审核整改后再来一轮）把一份过期的反馈又讲一遍。
+     * 上一版 diff 从 priorPatches 的最后一份取 —— 它就是被要求修改的那一版。
+     */
+    const cr = record.changeRequest;
+    record.changeRequest = null;
+    const changeRequest = cr
+      ? {
+          note: cr.note,
+          previousAttemptNo: cr.previousAttemptNo,
+          previousPatchDiff:
+            record.priorPatches.find((p) => p.digest === cr.previousPatchDigest)?.unifiedDiff ?? '',
+        }
+      : null;
 
-    const deadline = new PausableDeadline(record.task.budget.maxWallClockMs, () => {
-      if (!isTerminal(record.view.status)) {
-        record.abort.abort();
-        // 防御性：正常情况下审批期间 deadline 是暂停的，不会在这里撞上待审批；
-        // 但万一撞上，也要兑现 Promise 让 runAgent 解开、finally 得以执行。
-        this.cleanupPendingApprovals(record);
-        this.setStatus(record, 'TIMED_OUT', '超过任务时间预算', 'TIMEOUT');
-      }
-    });
+    /*
+     * 墙钟带着**本 Run 已用掉的时间**起算：新 Attempt（REQUEST_CHANGES）与旧的共用
+     * 同一份 Task 预算，不是每次要求修改就白送一份完整时长。
+     */
+    const deadline = new PausableDeadline(
+      record.task.budget.maxWallClockMs,
+      () => {
+        if (!isTerminal(record.view.status)) {
+          record.abort.abort();
+          // 防御性：正常情况下审批期间 deadline 是暂停的，不会在这里撞上待审批；
+          // 但万一撞上，也要兑现 Promise 让 runAgent 解开、finally 得以执行。
+          this.cleanupPendingApprovals(record);
+          this.setStatus(record, 'TIMED_OUT', '超过任务时间预算', 'TIMEOUT');
+        }
+      },
+      record.view.ledger.elapsedMs,
+    );
     record.deadline = deadline;
 
     const mutationPolicy = {
@@ -1453,6 +1506,7 @@ export class RunAuthority {
         ...(record.author
           ? { externalAuthor: this.authorRunnerFor(record, record.author, workspace, mutationPolicy, deadline) }
           : {}),
+        ...(changeRequest ? { changeRequest } : {}),
       });
 
       for (const v of [result.baseline, result.finalVerification]) {
@@ -2566,8 +2620,11 @@ export class RunAuthority {
       );
     } else if (input.decision === 'REJECT') {
       this.setStatus(record, 'BLOCKED', `用户拒绝了补丁：${input.note || '未填写原因'}`, 'PATCH_REJECTED');
+    } else if (input.decision === 'REQUEST_CHANGES') {
+      return { run: this.startChangeRequestAttempt(record, input.note), reason: null };
     } else {
-      this.setStatus(record, 'BLOCKED', `用户要求修改：${input.note || '未填写反馈'}（原型暂未实现新 Attempt）`, 'CHANGES_REQUESTED');
+      // PatchDecisionKind 是封闭枚举，走到这里说明有人加了新值却没接线 —— 明确停住，不静默接受
+      this.setStatus(record, 'BLOCKED', `未知的补丁决定：${String(input.decision)}`, 'INVARIANT_VIOLATION');
     }
 
     return { run: record.view, reason: null };
@@ -2931,6 +2988,111 @@ export class RunAuthority {
     record.abort.abort();
     this.cleanupPendingApprovals(record);
     this.setStatus(record, 'CANCELLED', reason, 'USER_CANCELLED');
+    return record.view;
+  }
+
+  /**
+   * REQUEST_CHANGES：**开新 Attempt，不是终态**（PRD-DIFF-003 / PRD §9）。
+   *
+   * 语义（TD §11.1）：
+   *   - 旧 Attempt 的全部事实原样保留（事件、工具调用、验证、补丁进 priorPatches）；
+   *   - 旧的 Plan/Tool/Patch 审批一律失效 —— 新 Attempt 重新规划、重新批准；
+   *   - **不续用旧 workspace/lease**：从同一个 immutable snapshot 重新物化一份；
+   *   - 预算是 Task 级聚合的：账本继续累加，墙钟带着已用时间起算。余额不够就不开，
+   *     而不是开一个必然立刻超预算的 Attempt。
+   *   - 用户的反馈进下一次任务简报（连同上一版 diff），否则模型只会把同样的改法再写一遍。
+   *
+   * 开不了新 Attempt 时（预算耗尽 / 恢复态没有执行器 / 路由丢失）落 BLOCKED 并说清楚是哪一种，
+   * 而不是笼统一句"暂未实现"。
+   */
+  private startChangeRequestAttempt(record: RunRecord, note: string): RunView {
+    const previous = record.patch!;
+    const previousAttemptNo = record.view.attemptNo;
+
+    const stop = (reason: string): RunView => {
+      this.setStatus(record, 'BLOCKED', `用户要求修改，但无法创建新 Attempt：${reason}`, 'CHANGES_REQUESTED');
+      return record.view;
+    };
+
+    // 恢复态的 Run 没有活的执行器与工作区：它能接受/拒绝补丁，但开不了新 Attempt
+    if (record.view.restored || !record.workspace) {
+      return stop('这个 Run 是从磁盘恢复的，没有活的执行器（可以接受或拒绝，但不能续跑）');
+    }
+    const resolution = record.implementerResolution;
+    if (!resolution) {
+      return stop('缺少本 Run 冻结的模型路由');
+    }
+    // 预算是 Task 级聚合：先看余额，再决定开不开
+    const l = record.view.ledger;
+    const lim = record.task.budget;
+    const exhausted =
+      l.modelTurns >= lim.maxModelTurns
+        ? `模型轮次已达上限 ${lim.maxModelTurns}`
+        : l.toolCalls >= lim.maxToolCalls
+          ? `工具调用已达上限 ${lim.maxToolCalls}`
+          : l.inputTokens + l.outputTokens >= lim.maxTotalTokens
+            ? `token 已达上限 ${lim.maxTotalTokens}`
+            : l.elapsedMs >= lim.maxWallClockMs
+              ? `时间预算已用尽（${Math.round(l.elapsedMs / 1000)}s / ${Math.round(lim.maxWallClockMs / 1000)}s）`
+              : null;
+    if (exhausted) return stop(`${exhausted} —— 新 Attempt 与旧的共用同一份任务预算`);
+
+    // ---- 旧 Attempt 收尾：事实保留，授权作废 ----
+    record.priorPatches.push(previous);
+    record.patch = null;
+    record.plan = null;
+    this.cleanupPendingApprovals(record); // 旧审批一律失效（正常此时已无 pending）
+    record.approvals.clear();
+    record.deadline?.clear();
+
+    // ---- 新 Attempt ----
+    const attemptId = newId('att');
+    const attemptNo = previousAttemptNo + 1;
+    record.abort = new AbortController();
+    record.changeRequest = { note, previousPatchDigest: previous.digest, previousAttemptNo };
+    /*
+     * 新工作区：MaterializedWorkspace.create 以 runId 为目录键，会先删掉旧目录再从快照重建 ——
+     * 于是"不续用旧 workspace"是结构上的，不靠调用方自觉。旧 Attempt 的改动就此消失，
+     * 但它已经封存在 priorPatches 里（补丁自带完整 diff），证据不丢。
+     */
+    try {
+      record.workspace = MaterializedWorkspace.create(
+        record.view.runId,
+        record.snapshot.snapshotId,
+        record.depsRoot,
+      );
+    } catch (err) {
+      record.changeRequest = null;
+      return stop(`重新物化工作区失败：${(err as Error).message}`);
+    }
+
+    record.view = {
+      ...record.view,
+      attemptId,
+      attemptNo,
+      status: 'CREATED',
+      statusReason: null,
+      failureClass: null,
+      workspaceGeneration: record.workspace.activeGeneration,
+      updatedAt: nowIso(),
+    };
+    this.emit(
+      record,
+      'ATTEMPT_STARTED',
+      `用户要求修改 → 开始第 ${attemptNo} 次尝试（上一版补丁 ${previous.digest.slice(0, 16)} 已封存为历史）`,
+      {
+        attemptNo,
+        previousAttemptNo,
+        previousPatchDigest: previous.digest,
+        note,
+        // 预算是接着用的，不是重置 —— 把起点如实写进事件
+        ledgerAtStart: { ...l },
+      },
+    );
+    this.persist(record);
+    this.push({ type: 'run.updated', run: record.view });
+
+    void this.execute(record, resolution);
     return record.view;
   }
 

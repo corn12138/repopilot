@@ -38,6 +38,7 @@ export function RunDetail({
   approvals,
   plan,
   patch,
+  priorPatches = [],
   verifications,
   approvalAction,
   onError,
@@ -49,6 +50,8 @@ export function RunDetail({
   approvals: ApprovalRequest[];
   plan: PlanRevision | null;
   patch: PatchArtifact | null;
+  /** 被 REQUEST_CHANGES 掉的历史补丁；用户否掉的那一版仍要能翻出来看 */
+  priorPatches?: readonly PatchArtifact[];
   verifications: VerificationRun[];
   approvalAction: ApprovalActionController;
   onError: (err: unknown) => void;
@@ -263,6 +266,7 @@ export function RunDetail({
             patch={patch}
             canDecide={run.status === 'AWAITING_PATCH_REVIEW'}
             accepted={run.status === 'SUCCEEDED' || run.status === 'ACCEPTED_UNVERIFIED'}
+            restored={run.restored}
             salvage={
               run.status === 'FAILED' || run.status === 'BLOCKED' || run.status === 'CANCELLED'
             }
@@ -270,6 +274,8 @@ export function RunDetail({
           />
         </div>
       )}
+
+      {priorPatches.length > 0 && <PriorPatchesPanel patches={priorPatches} />}
 
       {verifications.length > 0 && <VerificationPanel verifications={verifications} />}
 
@@ -434,11 +440,14 @@ function PatchReview({
   canDecide,
   accepted,
   salvage,
+  restored = false,
   onError,
 }: {
   patch: PatchArtifact;
   canDecide: boolean;
   accepted: boolean;
+  /** 恢复态的 Run 没有活的执行器：能接受/拒绝，但开不了新的尝试 */
+  restored?: boolean;
   /** 失败/中止现场的挽救补丁：只能检视与导出，永远不能被接受 */
   salvage?: boolean;
   onError: (err: unknown) => void;
@@ -605,7 +614,15 @@ function PatchReview({
             <button className="danger" disabled={busy} onClick={() => void decide('REJECT')}>
               拒绝
             </button>
-            <button disabled={busy} onClick={() => void decide('REQUEST_CHANGES')}>
+            <button
+              disabled={busy || restored}
+              title={
+                restored
+                  ? '这个 Run 是从磁盘恢复的，没有活的执行器 —— 可以接受或拒绝，但开不了新的尝试'
+                  : '开一次新的尝试：带上你的反馈重做，预算与本次共用'
+              }
+              onClick={() => void decide('REQUEST_CHANGES')}
+            >
               要求修改
             </button>
             <button className="primary" disabled={busy} onClick={() => void decide('ACCEPT')}>
@@ -976,6 +993,35 @@ function EgressPanel({ events }: { events: RunEvent[] }) {
           ))}
         </div>
       )}
+    </Card>
+  );
+}
+
+/**
+ * 被"要求修改"掉的历史补丁。
+ *
+ * 它们不再可决定（当前那份才是），但必须能翻出来 —— 用户否掉的那一版是"为什么不接受"的证据，
+ * 而 PATCH_SEALED 事件里没有 diff 正文。默认折叠：它是历史，不该跟当前待决定的补丁抢注意力。
+ */
+function PriorPatchesPanel({ patches }: { patches: readonly PatchArtifact[] }) {
+  return (
+    <Card title="历史补丁" hint={`${patches.length} 版被要求修改`}>
+      {patches.map((p, i) => (
+        <details key={p.patchId} className="toolcall" data-testid="prior-patch">
+          <summary>
+            第 {i + 1} 版 · {p.files.length} 个文件 · {p.digest.slice(0, 16)} · {timeOf(p.sealedAt)}
+            {p.verificationRunId ? '' : ' · 未经机器验证'}
+          </summary>
+          <div className="diff">
+            {p.files.map((f) => (
+              <div key={f.path}>
+                <div className="diff-path">{f.path}</div>
+                <pre className="output">{f.diff}</pre>
+              </div>
+            ))}
+          </div>
+        </details>
+      ))}
     </Card>
   );
 }

@@ -217,7 +217,14 @@ export interface RequestMap {
     res: { accepted: boolean; reason: string | null };
   };
 
-  'patch.get': { req: { runId: string }; res: { patch: PatchArtifact | null } };
+  /**
+   * 当前待决定的补丁；`priorPatches` 是被 REQUEST_CHANGES 掉的历史版本（按发生顺序）。
+   * 历史版本自带完整 diff —— 用户否掉的那一版是"为什么不接受"的证据，不能只剩事件里的一行 digest。
+   */
+  'patch.get': {
+    req: { runId: string };
+    res: { patch: PatchArtifact | null; priorPatches: readonly PatchArtifact[] };
+  };
   /** 交叉审核记录（第二个模型的只读发现）；没启用或没跑过为 null */
   'crossreview.get': { req: { runId: string }; res: { crossReview: CrossReviewRecord | null } };
   /**

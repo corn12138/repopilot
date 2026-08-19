@@ -412,6 +412,8 @@ export type RunEventKind =
   | 'VERIFICATION_FINISHED'
   | 'PATCH_SEALED'
   | 'PATCH_DECISION'
+  /** 用户 REQUEST_CHANGES 之后开始的新一次 Attempt（PRD-DIFF-003） */
+  | 'ATTEMPT_STARTED'
   | 'SELF_FIX_ROUND'
   | 'BUDGET_EXHAUSTED'
   | 'CLEANUP_SUMMARY'

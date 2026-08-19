@@ -106,6 +106,15 @@ export interface AgentDeps {
    * executionTurns，而是调它；规划、审批、验证、封存、交叉审核全部不变。
    */
   readonly externalAuthor?: ExternalAuthorRunner;
+  /**
+   * 可选：用户对上一版补丁的修改要求（PRD-DIFF-003 的新 Attempt）。
+   * 它进任务简报 —— 不带上这个，模型会把同样的改法原样再写一遍。
+   */
+  readonly changeRequest?: {
+    readonly note: string;
+    readonly previousAttemptNo: number;
+    readonly previousPatchDiff: string;
+  };
 }
 
 export interface AgentResult {
@@ -1514,6 +1523,7 @@ function buildTaskBrief(deps: AgentDeps, baseline: VerificationRun | null): stri
     return `请完成以下任务。
 
 ${header}
+${renderChangeRequest(deps)}
 
 注意：本次任务**没有配置任何验证命令**，你无法用运行结果证明改动是对的。
 因此请只做任务明确要求的改动，读够上下文再动手，并在最后说明哪些地方你没有把握。
@@ -1527,8 +1537,33 @@ ${header}
 
 基线验证结果（修改前的真实状态）：
 ${summarizeFailures(baseline)}
-
+${renderChangeRequest(deps)}
 请先定位根因，再提交计划。`;
+}
+
+/**
+ * 用户要求修改时的追加简报。
+ *
+ * 工作区已经从快照重新物化，上一版改动**不在**里面 —— 所以要把上一版 diff 附上，
+ * 否则模型既不知道自己上次做了什么，也无从判断哪里要改。同时明说"这是同一个任务的第 N 次尝试、
+ * 预算是接着用的"，避免它以为可以从头挥霍。
+ */
+function renderChangeRequest(deps: AgentDeps): string {
+  const cr = deps.changeRequest;
+  if (!cr) return '';
+  const diff = cr.previousPatchDiff.slice(0, 24_000);
+  return `
+用户审查了第 ${cr.previousAttemptNo} 次尝试的补丁，**要求修改**：
+${cr.note.trim() || '（用户没有填写具体反馈）'}
+
+上一版补丁（工作区已回到修改前的状态，下面的改动**不在**当前工作区里）：
+\`\`\`diff
+${diff}
+\`\`\`${cr.previousPatchDiff.length > 24_000 ? '\n（diff 过长已截断）' : ''}
+
+请针对用户的反馈重做：不要原样重复上一版的改法，也不要为了"显得不同"而扩大范围。
+这是同一个任务的第 ${cr.previousAttemptNo + 1} 次尝试，预算与上一次共用同一份，没有重置。
+`;
 }
 
 function renderPlan(plan: PlanRevision): string {
@@ -1558,6 +1593,7 @@ function renderExternalAuthorBrief(
     `验收标准：\n${acceptance}`,
     `用户已批准的计划（按此执行，不要扩大范围）：\n${renderPlan(plan)}`,
     baseline ? `基线验证结果（修改前的真实状态）：\n${summarizeFailures(baseline)}` : '本次任务没有配置验证命令，请格外保守。',
+    renderChangeRequest(deps).trim(),
     failureSummary ? `上一版改动之后的验证结果（仍未通过）：\n${failureSummary}\n请先判断是否与之前相同的失败；是同一个错误就换一种思路。` : '',
   ]
     .filter(Boolean)

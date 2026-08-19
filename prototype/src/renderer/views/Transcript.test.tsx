@@ -217,3 +217,35 @@ describe('平台发起的验证命令：合并进省略说明，不重复展示'
     expect(screen.getByText(/pnpm build/)).toBeTruthy();
   });
 });
+
+describe('ATTEMPT_STARTED：新一次尝试是看得见的分隔', () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it('单独成行（平台口吻），并且新尝试的工具调用不挂到上一次的模型轮次下', () => {
+    const events = [
+      event('MODEL_INVOCATION', 'PLANNING 调用 deepseek'),
+      event('TOOL_CALL_PROPOSED', '提议工具调用', { toolCallId: 'a-1' }),
+      event('ATTEMPT_STARTED', '用户要求修改 → 开始第 2 次尝试（上一版补丁 sha256:abc 已封存为历史）', {
+        attemptNo: 2,
+      }),
+      event('TOOL_CALL_PROPOSED', '提议工具调用', { toolCallId: 'a-2' }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[
+          toolCall({ toolCallId: 'a-1', toolName: 'fs_read', argsSummary: 'src/one.ts' }),
+          toolCall({ toolCallId: 'a-2', toolName: 'fs_read', argsSummary: 'src/two.ts' }),
+        ]}
+      />,
+    );
+    expect(screen.getByText(/开始第 2 次尝试/)).toBeTruthy();
+    // 第一次尝试的调用在那一轮的折叠块里；第二次的不在里面（currentTurn 被切断）
+    const turn = screen.getByText('PLANNING').closest('details')!;
+    expect(turn.textContent).toContain('src/one.ts');
+    expect(turn.textContent).not.toContain('src/two.ts');
+    expect(screen.getByText('src/two.ts')).toBeTruthy();
+  });
+});

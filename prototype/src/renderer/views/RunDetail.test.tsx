@@ -443,3 +443,82 @@ describe('数据出站面板：发出去的与被拦下的并列，同意摘要�
     expect(screen.getByText(/3 次已发出 · 1 次未发出/)).toBeTruthy();
   });
 });
+
+describe('REQUEST_CHANGES 的界面：历史补丁看得见，恢复态开不了新尝试', () => {
+  beforeEach(() => {
+    requestMock.mockReset();
+    requestMock.mockImplementation(async () => ({ crossReview: null }));
+  });
+  afterEach(() => cleanup());
+
+  function detailWith(run: RunView, patch: PatchArtifact | null, priorPatches: PatchArtifact[]) {
+    return (
+      <RunDetail
+        run={run}
+        events={[]}
+        toolCalls={[]}
+        approvals={[]}
+        plan={null}
+        patch={patch}
+        priorPatches={priorPatches}
+        verifications={[]}
+        approvalAction={{
+          ownerRunId: run.runId,
+          pending: [],
+          error: null,
+          isPending: () => false,
+          decide: vi.fn(async () => false),
+          retry: vi.fn(async () => false),
+          clearError: vi.fn(),
+        } satisfies ApprovalActionController}
+        onError={vi.fn()}
+        onRefresh={vi.fn()}
+      />
+    );
+  }
+
+  it('被要求修改的历史补丁默认折叠但可展开，diff 正文还在', async () => {
+    const prior: PatchArtifact = {
+      ...makePatch('p-old', 'run-h'),
+      files: [
+        {
+          path: 'src/app.js',
+          changeKind: 'MODIFIED',
+          addedLines: 1,
+          removedLines: 1,
+          diff: '--- a/src/app.js\n+++ b/src/app.js\n-old\n+v1 先凑合',
+          diffTruncated: false,
+        },
+      ],
+    };
+    render(detailWith(makeRun('run-h', 'PLANNING'), null, [prior]));
+    expect(await screen.findByText(/1 版被要求修改/)).toBeTruthy();
+    const item = screen.getByTestId('prior-patch');
+    expect(item.textContent).toContain('第 1 版');
+    // 正文在 details 里：内容存在（默认折叠只是不展示）
+    expect(item.textContent).toContain('v1 先凑合');
+  });
+
+  it('没有历史补丁时不出现这张卡（不给空壳）', async () => {
+    render(detailWith(makeRun('run-h2', 'AWAITING_PATCH_REVIEW'), makePatch('p-cur', 'run-h2'), []));
+    await screen.findByText(/已修复 typecheck/);
+    expect(screen.queryByText(/版被要求修改/)).toBeNull();
+  });
+
+  it('恢复态的 Run：接受/拒绝可用，"要求修改"禁用并说明原因', async () => {
+    const run = { ...makeRun('run-r', 'AWAITING_PATCH_REVIEW'), restored: true };
+    render(detailWith(run, makePatch('p-r', 'run-r'), []));
+    const request = (await screen.findByRole('button', { name: '要求修改' })) as HTMLButtonElement;
+    expect(request.disabled).toBe(true);
+    expect(request.title).toContain('没有活的执行器');
+    expect((screen.getByRole('button', { name: '接受补丁' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: '拒绝' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('非恢复态：三个按钮都可用，且"要求修改"说明预算是共用的', async () => {
+    render(detailWith(makeRun('run-n', 'AWAITING_PATCH_REVIEW'), makePatch('p-n', 'run-n'), []));
+    const request = (await screen.findByRole('button', { name: '要求修改' })) as HTMLButtonElement;
+    expect(request.disabled).toBe(false);
+    expect(request.title).toContain('预算与本次共用');
+  });
+});

@@ -464,6 +464,7 @@ export function App() {
                     approvals={selectedRunDetail.approvals}
                     plan={selectedRunDetail.plan}
                     patch={selectedRunDetail.patch}
+                    priorPatches={selectedRunDetail.priorPatches}
                     verifications={selectedRunDetail.verifications}
                     approvalAction={approvalAction}
                     onError={report}

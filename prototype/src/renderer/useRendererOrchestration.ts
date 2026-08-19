@@ -93,6 +93,8 @@ export interface RunDetailData {
   readonly plan: PlanRevision | null;
   readonly patch: PatchArtifact | null;
   readonly verifications: VerificationRun[];
+  /** 被 REQUEST_CHANGES 掉的历史补丁（PRD-DIFF-003）：用户否掉的那一版仍要看得见 */
+  readonly priorPatches: PatchArtifact[];
 }
 
 export type RunDetailState = OwnedAsyncState<string, RunDetailData, RendererFailure>;
@@ -114,6 +116,7 @@ const defaultRunDetailLoader: RunDetailLoader = async (runId) => {
     approvals: approvalResult.approvals,
     plan: planResult.plan,
     patch: patchResult.patch,
+    priorPatches: [...patchResult.priorPatches],
     verifications: verificationResult.verifications,
   };
 };

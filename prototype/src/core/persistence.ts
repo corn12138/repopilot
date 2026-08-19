@@ -29,8 +29,13 @@ import { writeJsonAtomic } from './store';
  * v2：新增可选 crossReview。旧的 v1 快照缺这个字段，读回来是 undefined，
  * 按"没做过交叉审核"处理即可 —— 所以 v2 能读 v1，不需要迁移代码，
  * 但仍拒绝**高于**当前版本的快照（未知结构 fail-closed）。
+ *
+ * v3：新增可选 priorPatches —— 用户 REQUEST_CHANGES 之后会开新 Attempt，
+ * 被要求修改的那一版补丁必须留下来（它是"用户为什么不接受"的证据，
+ * 而 PATCH_SEALED 事件里没有 unifiedDiff 正文）。旧快照缺这个字段读回来是 undefined，
+ * 按"没有历史补丁"处理。
  */
-export const RUN_STATE_SCHEMA_VERSION = 2;
+export const RUN_STATE_SCHEMA_VERSION = 3;
 
 export interface PersistedRunState {
   readonly schemaVersion: number;
@@ -42,6 +47,11 @@ export interface PersistedRunState {
   readonly verifications: readonly VerificationRun[];
   readonly plan: PlanRevision | null;
   readonly patch: PatchArtifact | null;
+  /**
+   * 被 REQUEST_CHANGES 掉的历史补丁（v3 新增），按发生顺序。
+   * 当前补丁在 `patch`；这里存的是每一次"用户要求修改"时封存下来的那一版。
+   */
+  readonly priorPatches?: readonly PatchArtifact[];
   /** 交叉审核聚合记录（v2 新增）；没做过为 null，旧 v1 快照读回来是 undefined */
   readonly crossReview?: CrossReviewRecord | null;
   /** 写这份快照时事件流的最高 seq，用于 rehydrate 时判断两者是否同步 */

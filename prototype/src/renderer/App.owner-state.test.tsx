@@ -404,7 +404,7 @@ describe('App owner-bound async rendering', () => {
       if (method === 'plan.get') {
         return ok({ plan: plan(runId, runId === runA.runId ? 'A secret plan' : 'B owned plan') });
       }
-      if (method === 'patch.get') return ok({ patch: null });
+      if (method === 'patch.get') return ok({ patch: null, priorPatches: [] });
       if (method === 'verification.list') return ok({ verifications: [] });
       throw new Error(`Unexpected request: ${method}`);
     });
@@ -463,7 +463,7 @@ describe('App owner-bound async rendering', () => {
       if (method === 'plan.get') {
         return ok({ plan: plan(runId, '历史快照计划', 'snapshot-from-plan-should-be-ignored') });
       }
-      if (method === 'patch.get') return ok({ patch: null });
+      if (method === 'patch.get') return ok({ patch: null, priorPatches: [] });
       if (method === 'verification.list') return ok({ verifications: [] });
       if (method === 'crossreview.get') return ok({ crossReview: null });
       if (method === 'files.tree') {
@@ -502,7 +502,7 @@ describe('App owner-bound async rendering', () => {
       if (method === 'run.toolCalls') return ok({ toolCalls: [] });
       if (method === 'approval.pending') return ok({ approvals: [approval(runId)] });
       if (method === 'plan.get') return ok({ plan: plan(runId, '共享审批计划') });
-      if (method === 'patch.get') return ok({ patch: null });
+      if (method === 'patch.get') return ok({ patch: null, priorPatches: [] });
       if (method === 'verification.list') return ok({ verifications: [] });
       if (method === 'crossreview.get') return ok({ crossReview: null });
       if (method === 'approval.decide') {
@@ -576,7 +576,7 @@ describe('App 时间线跟随', () => {
       if (method === 'run.toolCalls') return ok({ toolCalls: [] });
       if (method === 'approval.pending') return ok({ approvals: [] });
       if (method === 'plan.get') return ok({ plan: null });
-      if (method === 'patch.get') return ok({ patch: null });
+      if (method === 'patch.get') return ok({ patch: null, priorPatches: [] });
       if (method === 'verification.list') return ok({ verifications: [] });
       if (method === 'crossreview.get') return ok({ crossReview: null });
       throw new Error(`Unexpected request: ${method}`);
