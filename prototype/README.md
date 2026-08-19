@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 48 个文件、834 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 49 个文件、876 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -75,6 +75,7 @@
 | 外部 CLI 作者/审核方的 prompt 同样经 DLP：命中即 BLOCKED、子进程不起、原因不含原文 | `external/author.test.ts` |
 | 任务输入区：披露常驻输入框上方；不勾同意不能发；选了作者/审核方后 digest 变、同意自动作废；披露取不到显示原因且不能发 | `TaskForm.externalAuthor.test.tsx` |
 | 运行页「数据出站」面板：同意摘要 + 每次模型/CLI 出站一行，NOT_SENT 带阻断原因并列展示，token 未知不填 0 | `RunDetail.test.tsx` |
+| **Slice I-1 用户命令分级**：按可执行名 + 子命令白名单分 R1–R4；`git push/merge/reset/commit`、`npm publish`、`sudo/ssh/env/aws/kubectl` → R4，`rm/chmod/mv/dd` → R3，`install/add/ci/curl/wget/docker/未知二进制` → R2（fail-closed），只有 R1 能登记为验证命令；e2e：`git push origin main`/`rm -rf dist`/`npm install x`/`sh -c` 在 task.create 被拒且不执行、不建 Run，`node check.mjs` 照常 | `commandRisk.test.ts` / `authority.coverage.e2e.test.ts` |
 
 ## 尚未证明的
 

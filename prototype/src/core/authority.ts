@@ -80,6 +80,7 @@ import {
 import { runExternalCliAuthor } from './external/author';
 import { verificationInputsFromCommands } from './coverage';
 import { describeDlpHits, scanSegments } from './dlp';
+import { userCommandAdmission } from './commandRisk';
 import { buildDisclosure, consentedResolutionDigests, type DisclosureInput } from './egress';
 import { applyCandidate } from './external/normalize';
 import { EventStore, readJson, writeJsonAtomic } from './store';
@@ -978,6 +979,15 @@ export class RunAuthority {
     custom.forEach((c, i) => {
       const argv = c.argv.map((a) => a.trim()).filter(Boolean);
       if (argv.length === 0) return;
+      /*
+       * 风险分级发生在登记之前（Slice I-1）。登记即意味着：计划批准前作为基线跑一次、
+       * 之后模型可在预算内用 run_command 重复调用 —— 所以只有 R1 能进来；
+       * R2（网络/依赖）原型没有一次性精确审批，R3/R4 本就 deny。硬编码 'R1' 等于"填一次即永久授权"。
+       */
+      const admission = userCommandAdmission(argv);
+      if (!admission.ok) {
+        throw platformError('BAD_REQUEST', admission.message, '验证命令只接受构建/测试/类型检查/lint/本地脚本（node、tsc、vitest、pnpm build…）');
+      }
       const commandId = `user${i + 1}`;
       commands[commandId] = {
         commandId,
@@ -985,7 +995,7 @@ export class RunAuthority {
         argv,
         cwdRelative: '.',
         timeoutMs: 600_000,
-        risk: 'R1',
+        risk: admission.verdict.risk,
         source: 'USER',
       };
     });

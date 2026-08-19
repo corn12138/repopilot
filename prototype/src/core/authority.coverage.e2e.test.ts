@@ -370,3 +370,52 @@ describe('Slice G：补丁动了验证输入，"验证通过"就不能再证明�
     expect(decided.run.status).toBe('SUCCEEDED');
   }, 30_000);
 });
+
+describe('Slice I-1：用户手填的验证命令先分级再登记', () => {
+  it('`git push origin main` / `rm -rf dist` / `npm install x` 作为验证命令 → task.create 拒绝（R4/R3/R2），不建 Run、不执行', async () => {
+    const hostPath = makeFixtureRepo();
+    const marker = join(hostPath, '.never-ran');
+    const reg = await harness.call<{ project: { projectId: string } }>('__project.register', { hostPath });
+    const imported = await harness.call<{ snapshot: { snapshotId: string }; profile: { profileId: string } }>('project.import', { projectId: reg.project.projectId });
+    const { disclosure } = await harness.call<{ disclosure: { digest: string } }>('egress.disclosure', {
+      snapshotId: imported.snapshot.snapshotId,
+      modelProfileId: 'profile_deepseek',
+    });
+    const before = (await harness.call<{ runs: RunView[] }>('run.list', {})).runs.length;
+    const attempt = (argv: string[]) =>
+      harness.call('task.create', {
+        projectId: reg.project.projectId,
+        snapshotId: imported.snapshot.snapshotId,
+        profileId: imported.profile.profileId,
+        modelProfileId: 'profile_deepseek',
+        egressConsentDigest: disclosure.digest,
+        goal: 'x',
+        taskClass: 'BUILD_FAILURE_FIX',
+        allowedPaths: [],
+        acceptance: [],
+        verificationCommandIds: ['user1'],
+        customCommands: [{ label: argv.join(' '), argv }],
+      });
+    await expect(attempt(['git', 'push', 'origin', 'main'])).rejects.toMatchObject({ payload: { code: 'BAD_REQUEST', message: expect.stringContaining('（R4）') } });
+    await expect(attempt(['rm', '-rf', 'dist'])).rejects.toMatchObject({ payload: { message: expect.stringContaining('（R3）') } });
+    await expect(attempt(['npm', 'install', 'some-pkg'])).rejects.toMatchObject({ payload: { message: expect.stringContaining('（R2）') } });
+    await expect(attempt(['sh', '-c', `touch ${marker}`])).rejects.toMatchObject({ payload: { message: expect.stringContaining('（R2）') } });
+    expect((await harness.call<{ runs: RunView[] }>('run.list', {})).runs.length).toBe(before);
+    expect(existsSync(marker)).toBe(false);
+    // 对照：R1 的本地脚本照常登记
+    const ok = await harness.call<{ run: RunView }>('task.create', {
+      projectId: reg.project.projectId,
+      snapshotId: imported.snapshot.snapshotId,
+      profileId: imported.profile.profileId,
+      modelProfileId: 'profile_deepseek',
+      egressConsentDigest: disclosure.digest,
+      goal: 'x',
+      taskClass: 'BUILD_FAILURE_FIX',
+      allowedPaths: [],
+      acceptance: [],
+      verificationCommandIds: ['user1'],
+      customCommands: [{ label: 'node check.mjs', argv: ['node', 'check.mjs'] }],
+    });
+    expect(ok.run.runId).toBeTruthy();
+  });
+});
