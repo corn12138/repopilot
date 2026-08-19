@@ -3,6 +3,7 @@ import { basename, join } from 'node:path';
 import type {
   ApprovalDecisionKind,
   ApprovalRequest,
+  CommandDefinition,
   FailureClass,
   LedgerCharge,
   CrossReviewRecord,
@@ -73,6 +74,7 @@ import {
   type ExternalVendor,
 } from './external/connector';
 import { runExternalCliAuthor } from './external/author';
+import { verificationInputsFromCommands } from './coverage';
 import { applyCandidate } from './external/normalize';
 import { EventStore, readJson, writeJsonAtomic } from './store';
 import {
@@ -1367,6 +1369,7 @@ export class RunAuthority {
             result.finalVerification,
             comparison,
             result.unverifiedItems,
+            this.commandReferencedInputs(record, workspace),
           );
           record.patch = patch;
           this.emit(
@@ -1838,6 +1841,7 @@ export class RunAuthority {
               verification,
               comparison,
               composeUnverifiedItems(record.task, record.profile, comparison, truncationReason),
+              this.commandReferencedInputs(record, workspace),
             );
           },
           adoptPatch: (p) => {
@@ -1911,6 +1915,27 @@ export class RunAuthority {
     // 补丁审查阶段会读到 record.crossReview，把发现摆在用户面前再让其决定
   }
 
+  /**
+   * 任务选用的验证命令在 argv 里点名的仓库文件（如 `node check.mjs` 的 check.mjs）。
+   * 模式匹配的验证输入（tsconfig/vite/vitest/测试文件…）不需要这里提供，sealPatch 自己判。
+   */
+  private commandReferencedInputs(
+    record: RunRecord,
+    workspace: MaterializedWorkspace,
+  ): { path: string; commandId: string }[] {
+    const commands = record.task.verificationCommandIds
+      .map((id) => record.profile.commands[id])
+      .filter((c): c is CommandDefinition => Boolean(c));
+    const baseline = workspace.baselinePath();
+    return verificationInputsFromCommands(commands, (rel) => {
+      try {
+        return statSync(join(baseline, rel)).isFile();
+      } catch {
+        return false;
+      }
+    });
+  }
+
   private hostFor(record: RunRecord, deadline: PausableDeadline) {
     return {
       emit: (kind: RunEventKind, summary: string, payload: Record<string, unknown> = {}) =>
@@ -1927,7 +1952,18 @@ export class RunAuthority {
           kind: 'PLAN',
           risk: 'R1',
           title: '批准执行计划',
-          detail: plan.summary,
+          /*
+           * 批准的不只是"计划摘要"，还有它能写到哪：用户没填限定路径时 allowedPaths 兜底为
+           * `**`，这件事必须在批准时看得见，而不是只藏在 TaskForm 的占位符里（08-17 审计 G-3）。
+           */
+          detail:
+            `${plan.summary}\n` +
+            `允许改动范围：${
+              record.task.allowedPaths.length === 0 || (record.task.allowedPaths.length === 1 && record.task.allowedPaths[0] === '**')
+                ? '整个仓库（未限定路径；仅受保护路径除外）'
+                : record.task.allowedPaths.join(', ')
+            }；受保护路径：${record.task.protectedPaths.join(', ') || '（无）'}` +
+            (record.author ? `\n实现方：外部 CLI ${record.author.label}（只在一次性副本里改，差异归一化后进主线）` : ''),
           subjectDigest: plan.digest,
           requestedAt: nowIso(),
           expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
@@ -2285,6 +2321,7 @@ export class RunAuthority {
         [
           `⚠ 挽救封存：${opts.marker}。此补丁未被证明正确，仅供检视与手工挽救，不能被接受为成功`,
         ],
+        this.commandReferencedInputs(record, workspace),
       );
       record.patch = patch;
       this.emit(
@@ -2331,11 +2368,18 @@ export class RunAuthority {
        * 两者都是"接受了补丁"，但只有前者能说"这是被证明过的"。
        * 门禁全部放开之后，正是这条区分让 SUCCEEDED 还剩下意义。
        */
-      const verified =
+      const verificationPassed =
         record.patch.verificationRunId !== null &&
         record.verifications.some(
           (v) => v.verificationRunId === record.patch!.verificationRunId && v.passed,
         );
+      /*
+       * 第三条不肯让步的规则（Slice G）：补丁自己动过验证输入（配置/测试/验证脚本），
+       * 那次"通过"就不能再证明修复正确。验证照样跑、照样展示，但它不构成 SUCCEEDED 的依据。
+       * 旧快照没有 verificationInputsTouched 字段 → undefined → 按空处理，不追溯改写旧终态。
+       */
+      const coverageTouched = record.patch.verificationInputsTouched ?? [];
+      const verified = verificationPassed && coverageTouched.length === 0;
 
       record.view = {
         ...record.view,
@@ -2349,7 +2393,9 @@ export class RunAuthority {
         verified ? 'SUCCEEDED' : 'ACCEPTED_UNVERIFIED',
         verified
           ? '验证通过且用户已接受补丁（补丁未写回宿主仓库，需另行导出）'
-          : '用户已接受补丁，但没有通过的机器验证支撑 —— 正确性仅由人工判断',
+          : verificationPassed
+            ? `用户已接受补丁；验证虽通过，但补丁修改了验证输入（${coverageTouched.slice(0, 5).join(', ')}${coverageTouched.length > 5 ? ' 等' : ''}），该结果不能证明修复正确 —— 正确性仅由人工判断`
+            : '用户已接受补丁，但没有通过的机器验证支撑 —— 正确性仅由人工判断',
       );
     } else if (input.decision === 'REJECT') {
       this.setStatus(record, 'BLOCKED', `用户拒绝了补丁：${input.note || '未填写原因'}`, 'PATCH_REJECTED');
@@ -2853,9 +2899,15 @@ function describePatchVerification(record: RunRecord): string {
   }
   const run = record.verifications.find((v) => v.verificationRunId === p.verificationRunId);
   if (!run) return `UNKNOWN — verification ${p.verificationRunId} not found in run evidence`;
+  const touched = p.verificationInputsTouched ?? [];
+  if (run.passed && touched.length > 0) {
+    return `NO — verification ${p.verificationRunId} passed, but the patch modified verification inputs (${touched.join(', ')}); the pass does not prove the fix`;
+  }
   if (run.passed) return `yes (${p.verificationRunId})`;
   return `NO — verification ${p.verificationRunId} FAILED (salvaged patch; not accepted as success)`;
 }
+
+
 
 function renderPatchFile(record: RunRecord): string {
   const p = record.patch!;

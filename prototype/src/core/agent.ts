@@ -260,6 +260,8 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
           `执行规则：\n` +
           `- 修改现有文件前必须先用 fs_read 取得 receiptId。\n` +
           `- 用 workspace_mutate 提交改动；oldText 必须在文件中唯一命中。\n` +
+          `- 不要修改 tsconfig/vite/vitest/eslint 配置、测试文件或验证脚本来让验证变绿：` +
+          `平台会把这类改动标为 COVERAGE_WEAKENED，补丁将失去"已验证"资格。除非任务明确要求改它们。\n` +
           (verificationEnabled
             ? `- 改完后用 run_command 跑 ${task.verificationCommandIds.join(' / ')} 验证。\n` +
               `- 全部通过后，用一句话说明你做了什么，然后结束（不要再调用工具）。`
@@ -1550,6 +1552,7 @@ function renderExternalAuthorBrief(
     `任务目标：${task.goal}`,
     `允许改动的路径：${renderAllowedPaths(task.allowedPaths)}`,
     `受保护路径（禁止改动）：${task.protectedPaths.join(', ') || '（无）'}`,
+    `验证输入（tsconfig/vite/vitest/eslint 配置、测试文件、验证脚本）：不要为了让验证变绿而改它们 —— 平台会标为 COVERAGE_WEAKENED，补丁将失去"已验证"资格；除非任务明确要求`,
     `验收标准：\n${acceptance}`,
     `用户已批准的计划（按此执行，不要扩大范围）：\n${renderPlan(plan)}`,
     baseline ? `基线验证结果（修改前的真实状态）：\n${summarizeFailures(baseline)}` : '本次任务没有配置验证命令，请格外保守。',

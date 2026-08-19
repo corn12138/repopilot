@@ -345,9 +345,23 @@ function PlanApproval({
   )?.decision;
   const error = action.error?.approvalId === approval.approvalId ? action.error : null;
 
+  // detail 的首行是计划摘要（已由上面的横幅展示）；其后几行是 Core 附上的"批准范围"：
+  // 允许改动的路径、受保护路径、实现方是谁。用户批准的不只是摘要，这些必须在同一张卡上看见。
+  const scopeLines = approval.detail.split('\n').slice(1).filter(Boolean);
+
   return (
     <Card title="待审批计划" hint="批准后才允许产生副作用">
       <Banner tone="info">{plan.summary}</Banner>
+      {scopeLines.length > 0 && (
+        <div
+          data-testid="approval-scope"
+          style={{ fontSize: 11.5, color: 'var(--text-secondary)', margin: '0 0 12px', lineHeight: 1.6 }}
+        >
+          {scopeLines.map((line, i) => (
+            <div key={i}>{line}</div>
+          ))}
+        </div>
+      )}
 
       <ol style={{ paddingLeft: 20, fontSize: 12.5, margin: '0 0 12px' }}>
         {plan.steps.map((s) => (
@@ -512,6 +526,16 @@ function PatchReview({
         <Banner tone="warn">
           本次运行没有执行任何验证命令。补丁的正确性<strong>完全</strong>由你判断；
           接受后 Run 终态是 <code>ACCEPTED_UNVERIFIED</code>，不是 <code>SUCCEEDED</code>。
+        </Banner>
+      )}
+      {(patch.verificationInputsTouched?.length ?? 0) > 0 && (
+        // 验证"通过"的徽章就在上面，所以这条必须紧挨着它：通过的是被改过的验证
+        <Banner tone="warn">
+          <strong>补丁修改了验证输入：</strong>
+          {patch.verificationInputsTouched!.join('、')}。
+          上面的"已修复"是在被改过的配置/测试/验证脚本下跑出来的，<b>不能证明修复正确</b>；
+          接受后 Run 终态是 <code>ACCEPTED_UNVERIFIED</code>，不是 <code>SUCCEEDED</code>。
+          若任务本来就要改这些文件，请自行核对验证语义没有被放宽。
         </Banner>
       )}
 

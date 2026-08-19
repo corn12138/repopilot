@@ -254,3 +254,100 @@ describe('RunDetail 取消动作的就地反馈', () => {
     expect(requestMock.mock.calls.filter((c) => c[0] === 'run.cancel').length).toBe(1);
   });
 });
+
+describe('Slice G：补丁动了验证输入时，"已修复"徽章旁必须有说明', () => {
+  beforeEach(() => {
+    requestMock.mockReset();
+    requestMock.mockImplementation(async () => ({ crossReview: null }));
+  });
+  afterEach(() => cleanup());
+
+  it('verificationInputsTouched 非空 → 紧挨验证徽章出现 COVERAGE 横幅，点名文件并说明终态是 ACCEPTED_UNVERIFIED', async () => {
+    const patch: PatchArtifact = {
+      ...makePatch('p-cov', 'run-cov'),
+      verificationInputsTouched: ['vitest.config.ts', 'src/a.test.ts'],
+      unverifiedItems: ['⚠ COVERAGE_WEAKENED：补丁修改了验证输入 vitest.config.ts, src/a.test.ts（配置 / 测试 / 验证脚本）—— …'],
+    };
+    render(detail(makeRun('run-cov', 'AWAITING_PATCH_REVIEW'), patch));
+    await waitFor(() => expect(screen.getByText(/补丁修改了验证输入：/)).toBeTruthy());
+    const banner = screen.getByText(/补丁修改了验证输入：/).closest('div')!;
+    expect(banner.textContent).toContain('vitest.config.ts、src/a.test.ts');
+    expect(banner.textContent).toContain('ACCEPTED_UNVERIFIED');
+    expect(banner.textContent).toContain('不能证明修复正确');
+    // 徽章照常显示"已修复"—— 事实不隐藏，只是旁边说清楚它证明不了什么
+    expect(screen.getByText(/已修复 typecheck/)).toBeTruthy();
+  });
+
+  it('没动验证输入（字段为空或旧快照缺字段）→ 不出现该横幅', async () => {
+    const { rerender } = render(detail(makeRun('run-ok', 'AWAITING_PATCH_REVIEW'), { ...makePatch('p-ok', 'run-ok'), verificationInputsTouched: [] }));
+    await waitFor(() => expect(screen.getByText(/已修复 typecheck/)).toBeTruthy());
+    expect(screen.queryByText(/补丁修改了验证输入：/)).toBeNull();
+    rerender(detail(makeRun('run-old', 'AWAITING_PATCH_REVIEW'), makePatch('p-old', 'run-old'))); // 无字段
+    expect(screen.queryByText(/补丁修改了验证输入：/)).toBeNull();
+  });
+});
+
+describe('Slice G：批准计划时必须看得见"能写到哪"', () => {
+  beforeEach(() => {
+    requestMock.mockReset();
+    requestMock.mockImplementation(async () => ({ crossReview: null }));
+  });
+  afterEach(() => cleanup());
+
+  it('审批卡显示 Core 附在 detail 里的允许范围 / 受保护路径 / 实现方，而不只有摘要', async () => {
+    const run = makeRun('run-appr', 'AWAITING_PLAN_APPROVAL');
+    const plan = {
+      planId: 'plan-1',
+      runId: run.runId,
+      revision: 1,
+      parentPlanId: null,
+      summary: '把 STATUS 改成 fixed',
+      steps: [{ index: 1, intent: '改 src/app.js', targetPaths: ['src/app.js'], expectedEffect: '' }],
+      risks: [],
+      digest: 'sha256:plan',
+      createdAt: '2026-08-19T00:00:00.000Z',
+    };
+    const approval = {
+      approvalId: 'appr-1',
+      runId: run.runId,
+      attemptId: run.attemptId,
+      kind: 'PLAN' as const,
+      risk: 'R1' as const,
+      title: '批准执行计划',
+      detail:
+        '把 STATUS 改成 fixed\n允许改动范围：整个仓库（未限定路径；仅受保护路径除外）；受保护路径：package.json, .github/**\n实现方：外部 CLI Codex 0.1（只在一次性副本里改，差异归一化后进主线）',
+      subjectDigest: 'sha256:plan',
+      requestedAt: '2026-08-19T00:00:00.000Z',
+      expiresAt: '2026-08-19T00:30:00.000Z',
+    };
+    const approvalAction = {
+      ownerRunId: run.runId,
+      pending: [],
+      error: null,
+      isPending: () => false,
+      decide: vi.fn(async () => false),
+      retry: vi.fn(async () => false),
+      clearError: vi.fn(),
+    } satisfies ApprovalActionController;
+    render(
+      <RunDetail
+        run={run}
+        events={[]}
+        toolCalls={[]}
+        approvals={[approval]}
+        plan={plan as never}
+        patch={null}
+        verifications={[]}
+        approvalAction={approvalAction}
+        onError={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+    const scope = await screen.findByTestId('approval-scope');
+    expect(scope.textContent).toContain('整个仓库（未限定路径');
+    expect(scope.textContent).toContain('受保护路径：package.json, .github/**');
+    expect(scope.textContent).toContain('实现方：外部 CLI Codex 0.1');
+    // 摘要本身不会重复出现在范围块里
+    expect(scope.textContent).not.toContain('把 STATUS 改成 fixed');
+  });
+});

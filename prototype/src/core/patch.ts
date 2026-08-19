@@ -9,6 +9,7 @@ import type {
   VerificationRun,
 } from '@shared/domain';
 import { digestOf, newId, nowIso } from '@shared/ids';
+import { classifyVerificationInputs, describeCoverageWeakening } from './coverage';
 import type { MaterializedWorkspace } from './workspace';
 
 const MAX_DIFF_BYTES_PER_FILE = 60_000;
@@ -31,6 +32,8 @@ export function sealPatch(
   verification: VerificationRun | null,
   comparison: VerificationComparison | null,
   unverifiedItems: readonly string[],
+  /** 验证命令 argv 点名的仓库文件（见 coverage.verificationInputsFromCommands）；模式匹配的那部分不需要调用方提供 */
+  commandReferencedInputs: readonly { path: string; commandId: string }[] = [],
 ): PatchArtifact {
   const baselineRoot = workspace.baselinePath();
   const activeRoot = workspace.activePath;
@@ -80,6 +83,18 @@ export function sealPatch(
 
   const unifiedDiff = chunks.join('\n');
 
+  /*
+   * 验证覆盖是否被补丁自己动过：配置/测试/验证脚本任一被改，这份补丁绑定的"验证通过"
+   * 就不再能证明修复正确。这里只记录与告知；降级发生在接受时（authority.decidePatch）。
+   * 放在 sealPatch 里而不是某个调用点，是为了让首次封存、整改后重封存、挽救封存三条路
+   * 口径一致 —— 否则重封存的补丁会"看起来更干净"。
+   */
+  const touches = classifyVerificationInputs(
+    [...deleted, ...authored],
+    commandReferencedInputs,
+  );
+  const items = touches.length > 0 ? [describeCoverageWeakening(touches), ...unverifiedItems] : [...unverifiedItems];
+
   return {
     patchId: newId('patch'),
     runId,
@@ -92,7 +107,8 @@ export function sealPatch(
     sealedAt: nowIso(),
     verificationRunId: verification?.verificationRunId ?? null,
     comparison,
-    unverifiedItems,
+    unverifiedItems: items,
+    verificationInputsTouched: touches.map((t) => t.path),
     excludedGeneratedFiles: generated,
   };
 }

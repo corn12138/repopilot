@@ -657,6 +657,12 @@ export interface PatchArtifact {
   /** 明确未被验证覆盖的项，必须展示给用户 */
   readonly unverifiedItems: readonly string[];
   /**
+   * 补丁触碰到的**验证输入**（tsconfig/vite/vitest/eslint 配置、测试文件、验证命令点名的脚本）。
+   * 非空表示这次"验证通过"不能证明修复正确：接受后终态只能是 ACCEPTED_UNVERIFIED，
+   * 导出文件头写 NO。可选：旧快照没有此字段，读出 undefined 按空处理（旧语义）。
+   */
+  readonly verificationInputsTouched?: readonly string[];
+  /**
    * 被验证命令生成、因而未纳入补丁的文件（dist/ 等）。
    * 列出来是为了让"补丁里为什么没有它们"可解释，而不是静默省略。
    */

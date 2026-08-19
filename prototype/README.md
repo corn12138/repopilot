@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 43 个文件、777 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 45 个文件、790 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -65,6 +65,9 @@
 | **权威层 e2e（外部作者）**：规划(内部模型)→审批→假 Codex 在 candidate 修好→归一化进主线→真验证通过→接受 `SUCCEEDED`；账本记 1 轮未知用量；自修复第二次调用的简报带失败摘要；没改→`NO_CHANGES`；碰 `.github/**`→candidate 整笔拒绝、主线零写入、`BLOCKED`；退出非零→`BLOCKED`；同厂商作者/审核方→`task.create` 拒绝；连接器不可用→拒绝而不是换内部模型 | `authority.external-author.e2e.test.ts` |
 | **双审闭环（外部作者 + 模型 API 审核方）**：Codex 写 → 平台验证 → 审核方阻断 → Codex 以 REMEDIATE 简报整改（同一 candidate→归一化→CAS 路径）→ 重验 → 第二轮 PASS；`REVIEWER_PASSED`、2 审 1 改、两次 PATCH_SEALED digest 不同 | `authority.external-author.e2e.test.ts` |
 | 任务输入区：外部 CLI 既可选为作者也可选为审核方（此前 Renderer 里 `reviewerConnectorId` 不可达）；不可用的连接器显示为禁用并带原因；作者与审核方撞同一连接器时审核选择被清掉 | `TaskForm.externalAuthor.test.tsx` |
+| **Slice G 验证覆盖**：配置/测试/setup 按模式判为验证输入，普通源码不误判；`node check.mjs` 推出 check.mjs、`pnpm build` 推不出任何文件；flag/绝对路径/`..`/不存在的 token 不算 | `coverage.test.ts` |
+| **Slice G e2e（false-green 封口）**：外部作者把验证脚本改成恒通过、源码仍 broken → 验证"通过" → 补丁 `verificationInputsTouched=['check.mjs']` + `COVERAGE_WEAKENED` → 接受只能 `ACCEPTED_UNVERIFIED`、`terminalFacts.verificationRunId=null`、导出头 `verified: NO`；内部模型走同一条路同样降级；只改源码的对照组仍 `SUCCEEDED` | `authority.coverage.e2e.test.ts` |
+| 审查页：动了验证输入时"已修复"徽章旁出现横幅点名文件并说明终态；旧快照缺字段不出横幅。审批卡显示允许改动范围/受保护路径/实现方 | `RunDetail.test.tsx` |
 
 ## 尚未证明的
 
@@ -327,10 +330,18 @@ CLI 跑起来时的隔离是硬的：
 
 | 终态 | 条件 |
 |---|---|
-| `SUCCEEDED` | 有**通过的**验证 **且** 用户接受了补丁 |
-| `ACCEPTED_UNVERIFIED` | 用户接受了补丁，但没有机器验证支撑 |
+| `SUCCEEDED` | 有**通过的**验证 **且** 用户接受了补丁 **且** 补丁没有动过验证输入 |
+| `ACCEPTED_UNVERIFIED` | 用户接受了补丁，但没有机器验证支撑 —— 或者验证虽通过、补丁却修改了验证输入（`COVERAGE_WEAKENED`） |
 
-两者都由 Core 在状态转换处强制（`authority.ts:setStatus`），构造不出违反的对象。
+两者都由 Core 在状态转换处强制（`authority.ts:setStatus` + `decidePatch`），构造不出违反的对象。
+
+第三个条件是 Slice G 加的：补丁触碰 tsconfig/vite/vitest/eslint 配置、测试文件、或验证命令
+argv 里点名的脚本（`node check.mjs` 的 check.mjs），封存时记进 `PatchArtifact.verificationInputsTouched`，
+未验证清单第一条就是 `⚠ COVERAGE_WEAKENED`，审查页的"已修复"徽章旁边有横幅，接受后只能是
+`ACCEPTED_UNVERIFIED`，导出文件头 `# verified: NO — … modified verification inputs`。
+这是 08-17 审计里"全仓最短的 false-green 路径"的封口；没有做的是"用独立 task assertion 证明
+覆盖没被放宽后放行"—— 原型里只有降级，没有放行。批准计划的卡片上也会显示允许改动范围
+（没填限定路径 = 整个仓库）与受保护路径，批准的不只是摘要。
 影响"成功意味着什么"的事实 —— `baseKind`、`dirtyFileCount`、`subPath`、
 `verificationCommands`、`userDefinedCommands` —— 全部写进 `RUN_CREATED` 事件和 `NOTE`。
 

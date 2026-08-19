@@ -31,6 +31,8 @@
 
 1. **模型不能宣布成功。** `SUCCEEDED` 必须同时绑定通过的 verification 和用户接受的
    patch；没有验证只能是 `ACCEPTED_UNVERIFIED`。校验点在 `authority.ts` 的 `setStatus`。
+   补丁若触碰了验证输入（配置/测试/验证脚本，见 `coverage.ts`），那次"通过"不构成
+   `SUCCEEDED` 的依据，只能 `ACCEPTED_UNVERIFIED`（`decidePatch`）。
 2. **不做模糊匹配。** exact-span 命中 0 次或多次一律整笔失败。见 `mutation.ts`。
 3. **失败时零写入。** 事务先在内存里完整模拟，通过了才落 staged generation，
    再 CAS 切换。任何失败路径下工作区必须逐字节不变。
@@ -66,7 +68,7 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 43 个文件 / 777 个测试，含真实 tsc + vite build 的端到端链路
+pnpm test       # 45 个文件 / 790 个测试，含真实 tsc + vite build 的端到端链路
 pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 ```
