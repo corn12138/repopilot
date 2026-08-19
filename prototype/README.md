@@ -16,12 +16,22 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 567 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路。
+`pnpm test` — 43 个文件、777 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+（`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
+不是快照比对。
 
 | 断言 | 证据位置 |
 |---|---|
 | tracked-only 快照不含 `.git`，untracked 文件永不进快照 | `mutation.test.ts` / `repo.test.ts` |
-| dirty worktree 默认阻断且标记 `overridable`，越过后如实记为 `DIRTY_WORKTREE` | `repo.test.ts` |
+| dirty worktree **直接导入**（导入不设门禁），如实记为 `DIRTY_WORKTREE` + 改动数 | `repo.test.ts` |
+| **untracked 是排除不是改动**：只新建文件的仓库仍是 `CLEAN_COMMIT`，`untrackedCount` 单独报数，绝不并进 `dirtyFileCount` | `repo.test.ts` |
+| 软链接记为 `SYMLINK` 而不是 `BINARY`；读不了的路径记 `UNREADABLE`；NO_VCS 枚举跳过的依赖/产物目录同样进 `excludedPaths` | `repo.test.ts` |
+| 事件日志中间坏一行时，其后事件仍读得出、坏行数可查，且新事件不复用已用过的 seq | `persistence.test.ts` |
+| 凭据文件读不出来时区分 `UNREADABLE`/`ABSENT`，并**拒绝写入**——磁盘字节逐字节不变 | `credentials.isolation.test.ts` |
+| 非 PASS 的外部审核结论在 findings 读不出来时判不可解析，不降级成"零条阻断"的假绿灯 | `external/connector.test.ts` |
+| 清理预演逐字节不动磁盘、不覆盖上一次真实清理的记录，且与真删逐项一致（含级联回收的快照） | `retention.test.ts` |
+| 危险动作第一次点击只展开后果、不执行；算不出后果时**不提供**确认按钮；依据一变自动解除武装 | `ConfirmAction.test.tsx` |
+| 内置 provider 不能被删除 —— 静默成功会让 Main 顺带删掉用户真实的 API Key | `registry.test.ts` |
 | monorepo 子包导入：路径以子包为坐标系，profile 独立解析 | `repo.test.ts` |
 | dirty 判定只看导入范围，别的子包脏了不误伤 | `repo.test.ts` |
 | exact-span replace 命中 0 次 → `ZERO_MATCH`，工作区逐字节不变 | `mutation.test.ts` |
@@ -50,13 +60,22 @@
 | 外部 CLI：无显式凭据拒绝启动（不以宿主登录态运行）、非零退出/不可解析输出一律 FAILED 且不编造发现、manifest 不含 raw secret 与 prompt 正文 | `external/connector.test.ts` |
 | 外部 CLI：同厂商审核直接拒绝（`SAME_VENDOR_REVIEW_DENIED`），异构是不变式不是披露项 | `external/connector.test.ts` |
 | 动态形态探测：**.app 内打包的 CLI 被认出来并可用**（`BUNDLED_CLI`）；bundle 里确实没 CLI 才判不可自动化；独立 CLI 优先于 bundle 内那份；env 覆盖生效且指错时 BLOCKED 不静默回落 | `external/connector.test.ts` |
+| **外部作者（CANDIDATE_AUTHOR，真子进程）**："写完了" = 子进程退出 + 平台 tree diff；退出非零/超时/取消时 candidate 内容一律不读（seal=null）；退出为零时 seal 记录目录事实，作者自述只是 untrusted 备注；cwd 是 candidate 目录、HOME 一次性、只注入一个凭据、宿主 canary 不可见 | `external/author.test.ts` |
+| **candidate → canonical 归一化**：MODIFIED→`REPLACE_WHOLE_FILE`+receipt、ADDED→`CREATE_FILE`、DELETED→整笔拒绝（删除是 P0 hard deny）、非 UTF-8→整笔拒绝、产物路径跳过但报数；受保护路径/范围外/stale generation/超预算一律经 `applyMutationPlan` 拒绝且主线逐字节不变 | `external/normalize.test.ts` |
+| **权威层 e2e（外部作者）**：规划(内部模型)→审批→假 Codex 在 candidate 修好→归一化进主线→真验证通过→接受 `SUCCEEDED`；账本记 1 轮未知用量；自修复第二次调用的简报带失败摘要；没改→`NO_CHANGES`；碰 `.github/**`→candidate 整笔拒绝、主线零写入、`BLOCKED`；退出非零→`BLOCKED`；同厂商作者/审核方→`task.create` 拒绝；连接器不可用→拒绝而不是换内部模型 | `authority.external-author.e2e.test.ts` |
+| **双审闭环（外部作者 + 模型 API 审核方）**：Codex 写 → 平台验证 → 审核方阻断 → Codex 以 REMEDIATE 简报整改（同一 candidate→归一化→CAS 路径）→ 重验 → 第二轮 PASS；`REVIEWER_PASSED`、2 审 1 改、两次 PATCH_SEALED digest 不同 | `authority.external-author.e2e.test.ts` |
+| 任务输入区：外部 CLI 既可选为作者也可选为审核方（此前 Renderer 里 `reviewerConnectorId` 不可达）；不可用的连接器显示为禁用并带原因；作者与审核方撞同一连接器时审核选择被清掉 | `TaskForm.externalAuthor.test.tsx` |
 
 ## 尚未证明的
 
 - 模型判断力：端到端测试用的是确定性替身，不是真实模型。真实闭环需要你自己配 API key 跑。
 - 隔离强度：`utilityProcess` + 子进程**不是**容器级沙箱。`node_modules` 目前是宿主的 symlink，构建脚本以你的用户权限运行。这是原型的显式残余风险，写在 `workspace.ts:linkDependencies` 的注释里。
-- 持久化：Run 事件是 JSONL，不是 SQLite WAL；没有加密、没有保留期、没有级联清理。
-- 崩溃恢复：事件日志能重放，但 Core 重启后不会自动恢复进行中的 Run。
+- 持久化：Run 事件是 JSONL，不是 SQLite WAL；**没有加密**。保留期与级联清理已经有了
+  （`retention.ts`：证据 30 天、工作区终态后 60 分钟宽限、快照引用计数归零才删，
+  逐项结果，任何一项失败或被上限截断整体只能是 `INCOMPLETE`），但那是原型语义，
+  不是 overlay §4 要求的 encrypted artifact root。
+- 崩溃恢复：事件日志能重放，Run 能读回来并标 `restored`，但**不能续跑** ——
+  进行中的 Run 重启后落成 `INTERRUPTED`，不是从断点继续。
 - 交叉审核收敛闭环（2 审核 + 1 整改）：收敛语义 20 条单测钉终止条件，
   authority 真实接线由 `authority.e2e.test.ts` 覆盖（阻断发现 → 实现方整改 →
   真重验 → 真重封存 → 第二轮通过，两次 PATCH_SEALED digest 不同）。
@@ -64,13 +83,24 @@
   e2e 的模型是 HTTP 层脚本，钉的是平台语义，不是模型判断力。
 - 挽救封存的 TIMED_OUT 路径明确不做（终态先于封存被写下），记录在案。
 - 外部编码代理 CLI 连接器（`core/external/connector.ts`）：**发现 + 身份探测 +
-  隔离调用 + 输出解析**已实现并有真子进程证据（见上表三行），环境自检里能看到
-  本机检测到哪些 CLI。**但尚未接进交叉审核循环** —— 现在任务里能选的审核方
-  仍只有模型 API profile。把连接器接成可选审核方是下一步（纯接线，语义已就位）。
-- 外部 CLI 的 **CANDIDATE_AUTHOR 角色（让外部 CLI 写代码）明确不做**：
-  那需要 disposable candidate workspace + single-writer epoch + normalizer，
-  风险高一个量级。本切片只做 READ_ONLY_REVIEWER：只读一段 diff 文本、
-  只吐结构化发现，碰不到工作区。
+  隔离调用 + 输出解析**已实现并有真子进程证据（见上表三行）。它**已经接进交叉审核
+  循环** —— `crossreview.reviewers` 会把模型 API profile 与本机检测到的 CLI 一起报出来
+  （不可用的也报，带原因），`task.create` 的 `reviewerConnectorId` 可以选中一个 CLI 当
+  只读审核方，同厂商仍被硬拒。循环本身对"谁在审"无知，两条路走同一套归一化发现。
+  **尚未证明的是真实 CLI 的审核质量**：测试钉的是隔离、失败分类与不编造发现，
+  不是它挑出来的问题对不对。
+- 外部 CLI 的 **CANDIDATE_AUTHOR 角色（让 Codex / Claude CLI 写代码）已做成 spike 子集**
+  （`core/external/author.ts` + `normalize.ts`），边界按 TD-DEC-016：外部作者只在
+  `workspace.exportCandidate()` 导出的一次性目录里改；退出后平台做 tree diff，
+  把差异归一化成 `REPLACE_WHOLE_FILE`/`CREATE_FILE` 走 `applyMutationPlan`
+  （receipt、digest CAS、protected/allowed path、预算、失败零写入全部照旧），
+  删除/二进制整笔拒绝。**"作者写完了"的唯一来源是子进程退出 + tree diff**，
+  作者输出的 JSON 只是 untrusted 备注。规划/审批/验证/封存/交叉审核全部不变；
+  整改也由同一外部作者执行。**尚未证明的**：真实 Codex/Claude CLI 的改动质量
+  （e2e 的作者是 shell 脚本，钉的是边界不是判断力）；各家 CLI 的非交互/沙箱 flag
+  随版本漂移（`authorArgv` 写死在描述符里，漂移表现为 FAILED/TIMED_OUT，不会假绿）；
+  外部作者是**结果层治理**（diff 归一化 + 验证），没有内部 Agent 那种逐 tool call
+  的动作层审批 —— 这是 DEC-013 需要明写的取舍，不是已接受的决议。
 - 上面这些是 P1 合同 `docs/contracts/external-coding-agent-cross-review.md` 的
   **可丢弃 spike 子集，不是那份合同的实现**：没有 connector 评审流程、
   没有 terms/版本准入、没有 network manifest、没有 resource/thermal 治理。
@@ -138,6 +168,30 @@ pnpm dev
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
+
+### 自检与数据隔离
+
+```bash
+pnpm selftest
+```
+
+自检走**完全相同**的 Main → Core → IPC 通道，跑只读方法、造一个真实 Run、杀掉 Core
+再确认它能被读回来，最后确认 Renderer 真的挂载了（不是白屏）。
+
+它**永远不会写你的真实数据目录**：启动 Core 之前会先创建一次性 data root
+（`REPOPILOT_DATA_ROOT`），结束时无论成功、失败还是抛异常都在 `finally` 里删掉。
+想自己指定位置就先设好这个环境变量，此时自检不会替你删：
+
+```bash
+REPOPILOT_DATA_ROOT=/tmp/rp-check pnpm selftest
+```
+
+隔离同时覆盖凭据文件 —— `credentials.bin` 跟着受管根走，不再固定在
+`~/Library/Application Support/RepoPilotPrototype/`。本机 `safeStorage` 不可用时，
+写入型用例明确报 `SKIP`（环境不具备），不是伪装成通过，也不再抛未处理的 rejection。
+
+> 边界：`pnpm selftest` 需要真实 Electron 运行时，因此**不在** `pnpm test` 里。
+> 它给的是"三个进程真起来了、私有 IPC 真通了"的证据，不是单元测试的替代。
 
 ### 模型配置（参考 `temp/neovate-code` 的 provider 设计）
 

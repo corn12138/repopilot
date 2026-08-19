@@ -254,7 +254,21 @@ export function saveCustomProvider(input: CustomProviderInput): void {
   writeJsonAtomic(CUSTOM_PATH, list);
 }
 
+/**
+ * 删除一个自定义 provider。
+ *
+ * 对不存在的 id 保持幂等（删除一个已经不在的东西，事后状态就是它不在）——
+ * 这是 `removeCustomProvider 只删指定项` 那条用例明确钉住的契约。
+ *
+ * 但**内置 provider 必须报错**。以前这里只是把自定义表过滤一遍，传 'anthropic'
+ * 会返回成功、实际什么也没删。那种"成功"在删除路径上格外危险：调用方会据此认为
+ * 这个 provider 已经没了，进而去清理它的附属物 —— Main 现在正是这么做的，
+ * 于是一次对内置 provider 的删除请求会删掉用户真实的 API Key，而 provider 还在。
+ */
 export function removeCustomProvider(id: string): void {
+  if (BUILT_IN.some((b) => b.id === id)) {
+    throw new Error(`${id} 是内置 provider，不能删除（不填凭据即可让它保持禁用）`);
+  }
   writeJsonAtomic(
     CUSTOM_PATH,
     loadCustomProviders().filter((c) => c.id !== id),
@@ -285,16 +299,40 @@ export function resolveOrigin(d: ProviderDescriptor, override: string): string {
   return d.api;
 }
 
-/** 凭据优先级：应用内录入 > 环境变量。对应 CLI `getProviderApiKey` */
+/**
+ * 凭据优先级：应用内录入 > 环境变量。对应 CLI `getProviderApiKey`。
+ *
+ * 除了「现在用的是哪一个」，还要回答「把应用内这把删掉之后会怎样」——
+ * 那是删除按钮唯一真正重要的事实：掉到 ENV（还能用，但换了一把 key，可能是另一个账号
+ * 和另一份账单）还是掉到 NONE（这个 provider 直接不可用）。
+ *
+ * 以前 `appKey` 存在时直接短路返回 APP，从来不看 `d.env`，于是界面**算不出**这件事，
+ * 只能让用户点下去才知道。fallback 是无副作用的纯查询，没有理由不算。
+ */
 export function resolveKeySource(
   d: ProviderDescriptor,
   appKey: string | undefined,
-): { source: 'APP' | 'ENV' | 'NONE'; envVar: string | null } {
-  if (appKey?.trim()) return { source: 'APP', envVar: null };
+): {
+  source: 'APP' | 'ENV' | 'NONE';
+  envVar: string | null;
+  /** 删掉应用内凭据后会接手的来源。source 非 APP 时与 source 同义。 */
+  fallbackSource: 'ENV' | 'NONE';
+  fallbackEnvVar: string | null;
+} {
+  let fallbackSource: 'ENV' | 'NONE' = 'NONE';
+  let fallbackEnvVar: string | null = null;
   for (const key of d.env) {
-    if (process.env[key]?.trim()) return { source: 'ENV', envVar: key };
+    if (process.env[key]?.trim()) {
+      fallbackSource = 'ENV';
+      fallbackEnvVar = key;
+      break;
+    }
   }
-  return { source: 'NONE', envVar: null };
+  if (appKey?.trim()) return { source: 'APP', envVar: null, fallbackSource, fallbackEnvVar };
+  if (fallbackSource === 'ENV') {
+    return { source: 'ENV', envVar: fallbackEnvVar, fallbackSource, fallbackEnvVar };
+  }
+  return { source: 'NONE', envVar: null, fallbackSource: 'NONE', fallbackEnvVar: null };
 }
 
 export function resolveKey(d: ProviderDescriptor, appKey: string | undefined): string | null {

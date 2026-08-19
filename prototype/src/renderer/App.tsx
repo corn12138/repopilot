@@ -2,49 +2,31 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   ApprovalRequest,
   DoctorCheck,
+  ExclusionEntry,
   ModelConnectionProfile,
   PatchArtifact,
   PlanRevision,
   ProjectRef,
-  RepositoryHarnessProfile,
-  RepositorySnapshot,
   RunEvent,
   RunView,
   SubPackageCandidate,
-  ToolCallView,
-  VerificationRun,
 } from '@shared/domain';
 import { TERMINAL_RUN_STATUSES } from '@shared/domain';
-import { RequestError, call, subscribe } from './bridge';
+import { RequestError, call, setCoreEpoch, subscribe } from './bridge';
 import { Badge, Banner, Card, DoctorBadge, RestoredBadge, RunStatusBadge } from './components/common';
+import { isOwnedReady } from './ownedAsync';
+import { useApprovalAction, type ApprovalActionController } from './useApprovalAction';
+import { useStickToBottom } from './useStickToBottom';
+import {
+  useProjectImport,
+  useRunDetail,
+  type ProjectImportState,
+  type RunDetailState,
+} from './useRendererOrchestration';
 import { Composer } from './views/TaskForm';
 import { RunDetail } from './views/RunDetail';
 import { FileTreePanel } from './views/FileTree';
 import { SettingsView } from './views/Settings';
-
-/**
- * 导入是一个有明确失败态的过程，不是"有结果 / 没结果"两态。
- * 用判别联合表达，UI 就不可能再退化成无限 spinner（PRD-DESK-002）。
- */
-type ImportState =
-  | { status: 'idle' }
-  | { status: 'importing' }
-  | {
-      status: 'done';
-      snapshot: RepositorySnapshot;
-      profile: RepositoryHarnessProfile;
-      candidates: readonly SubPackageCandidate[];
-    }
-  | {
-      status: 'blocked';
-      code: string;
-      message: string;
-      detail: string;
-      candidates: readonly SubPackageCandidate[];
-      /** 被阻断的那次请求用的范围，重试时原样带回去 */
-      subPath: string;
-    }
-  | { status: 'failed'; message: string; detail: string | null };
 
 interface ImportRequest {
   subPath?: string;
@@ -56,20 +38,24 @@ export function App() {
   const [projects, setProjects] = useState<ProjectRef[]>([]);
   const [modelProfiles, setModelProfiles] = useState<ModelConnectionProfile[]>([]);
   const [secureStorage, setSecureStorage] = useState(true);
+  const [credentialStore, setCredentialStore] = useState<'ABSENT' | 'OK' | 'UNREADABLE'>('ABSENT');
+  const [credentialStoreDetail, setCredentialStoreDetail] = useState<string | null>(null);
   const [runs, setRuns] = useState<RunView[]>([]);
 
   const [selectedProject, setSelectedProject] = useState<ProjectRef | null>(null);
-  const [importState, setImportState] = useState<ImportState>({ status: 'idle' });
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [error, setError] = useState<{ message: string; detail: string | null } | null>(null);
-
-  // Run 详情
-  const [events, setEvents] = useState<RunEvent[]>([]);
-  const [toolCalls, setToolCalls] = useState<ToolCallView[]>([]);
-  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
-  const [plan, setPlan] = useState<PlanRevision | null>(null);
-  const [patch, setPatch] = useState<PatchArtifact | null>(null);
-  const [verifications, setVerifications] = useState<VerificationRun[]>([]);
+  const { state: importState, start: startProjectImport } = useProjectImport();
+  const {
+    state: runDetailState,
+    start: loadRunDetail,
+    reset: resetRunDetail,
+    appendEvent,
+    upsertToolCall,
+    replaceApprovals,
+  } = useRunDetail();
+  // Dock 与详情卡必须共享同一个 ref-backed controller，React state 不能充当双入口互斥锁。
+  const approvalAction = useApprovalAction(selectedRunId);
 
   /** 右侧文件树开关 + 刷新令牌（Agent 改完文件后自增，让树重新拉取） */
   const [filesOpen, setFilesOpen] = useState(false);
@@ -77,15 +63,30 @@ export function App() {
   /** 设置页作为一个独立视图，而不是"没选项目时的兜底" */
   const [showSettings, setShowSettings] = useState(false);
 
+  const coreStatusRef = useRef(coreStatus);
+  coreStatusRef.current = coreStatus;
+  const bootstrapRequestRef = useRef(0);
+  const runRefreshMarkerRef = useRef<string | null>(null);
   const selectedRunRef = useRef<string | null>(null);
   selectedRunRef.current = selectedRunId;
-  /** 放进 ref 而不是 effect 依赖：否则每次它重建都会重订阅事件流 */
-  const loadRunDetailRef = useRef<((runId: string) => Promise<void>) | null>(null);
 
   const selectedRun = useMemo(
     () => runs.find((r) => r.runId === selectedRunId) ?? null,
     [runs, selectedRunId],
   );
+  const selectedRunDetail =
+    selectedRunId && isOwnedReady(runDetailState, selectedRunId) ? runDetailState.data : null;
+
+  /*
+   * 时间线跟随。owner 用「当前视图身份」而不是只用 runId：从 Run 切到设置页再切回来
+   * 也应该回到底部，而不是继承上一次的未读计数。计数来源是 durable events 的数量 ——
+   * 它对应时间线上真实存在的行，不是估算出来的进度。
+   */
+  const followOwnerKey = showSettings ? '__settings__' : selectedRunId;
+  const follow = useStickToBottom<HTMLDivElement>({
+    ownerKey: followOwnerKey,
+    itemCount: showSettings ? 0 : (selectedRunDetail?.events.length ?? 0),
+  });
 
   const report = useCallback((err: unknown) => {
     if (err instanceof RequestError) setError({ message: err.message, detail: err.detail });
@@ -94,6 +95,9 @@ export function App() {
 
   // ---- 启动加载 ----
   const bootstrap = useCallback(async () => {
+    if (coreStatusRef.current !== 'READY') return;
+    bootstrapRequestRef.current += 1;
+    const requestId = bootstrapRequestRef.current;
     try {
       const [d, p, m, r] = await Promise.all([
         call('doctor.run', {}),
@@ -101,28 +105,46 @@ export function App() {
         call('model.listProfiles', {}),
         call('run.list', {}),
       ]);
+      if (requestId !== bootstrapRequestRef.current || coreStatusRef.current !== 'READY') return;
       setChecks(d.checks);
       setProjects(p.projects);
       setModelProfiles(m.profiles);
       setSecureStorage(m.secureStorage);
+      setCredentialStore(m.credentialStore);
+      setCredentialStoreDetail(m.credentialStoreDetail);
       setRuns(r.runs);
+      setError(null);
     } catch (err) {
-      report(err);
+      if (requestId === bootstrapRequestRef.current) report(err);
     }
   }, [report]);
 
   useEffect(() => {
+    let active = true;
+    let statusEventRevision = 0;
+
+    /*
+     * 代次必须在任何后续请求之前落地：bootstrap 就是"后续请求"。顺序写反的话，
+     * Core 重启后的第一次 bootstrap 会带着旧 epoch 出去，然后被 Main 正确地拒绝，
+     * 表现为一次莫名其妙的启动失败。
+     */
+    const applyCoreStatus = (status: 'READY' | 'RESTARTING' | 'DOWN', epoch: number) => {
+      setCoreEpoch(epoch);
+      coreStatusRef.current = status;
+      setCoreStatus(status);
+      if (status === 'READY') {
+        void bootstrap();
+      } else {
+        // Core 断开后，在途 bootstrap 即使稍后返回也不再拥有当前界面。
+        bootstrapRequestRef.current += 1;
+      }
+    };
+
     const unsubscribe = subscribe((event) => {
       switch (event.type) {
         case 'core.status':
-          setCoreStatus(event.status);
-          if (event.status === 'READY') {
-            void bootstrap();
-            // 断线窗口里的事件不会补发。selectedRunId 没变，详情 effect 也不会重跑，
-            // 所以这里必须主动补一次，否则时间线会缺一段且用户不知道。
-            const runId = selectedRunRef.current;
-            if (runId) void loadRunDetailRef.current?.(runId);
-          }
+          statusEventRevision += 1;
+          applyCoreStatus(event.status, event.epoch);
           break;
         case 'run.updated':
           setRuns((prev) => {
@@ -135,20 +157,12 @@ export function App() {
           break;
         case 'run.event':
           if (event.runId === selectedRunRef.current) {
-            setEvents((prev) =>
-              prev.some((e) => e.seq === event.event.seq) ? prev : [...prev, event.event],
-            );
+            appendEvent(event.runId, event.event);
           }
           break;
         case 'toolcall.updated':
           if (event.toolCall.runId === selectedRunRef.current) {
-            setToolCalls((prev) => {
-              const idx = prev.findIndex((t) => t.toolCallId === event.toolCall.toolCallId);
-              if (idx < 0) return [...prev, event.toolCall];
-              const next = [...prev];
-              next[idx] = event.toolCall;
-              return next;
-            });
+            upsertToolCall(event.toolCall.runId, event.toolCall);
             // 文件被改动了就刷新文件树，让改动实时可见
             if (event.toolCall.toolName === 'workspace_mutate' && event.toolCall.resolution === 'SUCCEEDED') {
               setFilesKey((k) => k + 1);
@@ -156,97 +170,73 @@ export function App() {
           }
           break;
         case 'approval.updated':
-          if (event.runId === selectedRunRef.current) setApprovals(event.approvals);
+          if (event.runId === selectedRunRef.current) replaceApprovals(event.runId, event.approvals);
           break;
       }
     });
-    void bootstrap();
-    return unsubscribe;
-  }, [bootstrap]);
 
-  // ---- 切换 Run 时全量拉取（不依赖内存中的残留） ----
-  const loadRunDetail = useCallback(
-    async (runId: string) => {
-      try {
-        const [e, t, a, p, pa, v] = await Promise.all([
-          call('run.events', { runId, afterSeq: 0 }),
-          call('run.toolCalls', { runId }),
-          call('approval.pending', { runId }),
-          call('plan.get', { runId }),
-          call('patch.get', { runId }),
-          call('verification.list', { runId }),
-        ]);
-        setEvents(e.events);
-        setToolCalls(t.toolCalls);
-        setApprovals(a.approvals);
-        setPlan(p.plan);
-        setPatch(pa.patch);
-        setVerifications(v.verifications);
-      } catch (err) {
-        report(err);
-      }
-    },
-    [report],
-  );
+    /*
+     * did-finish-load 的状态 push 可能早于 React effect。先同步建立监听，再取 Main 的当前
+     * 快照；若查询期间已有新 push，revision 会让旧快照失去提交资格。
+     */
+    const handshakeRevision = statusEventRevision;
+    void call('core.getStatus', {})
+      .then((snapshot) => {
+        if (!active || statusEventRevision !== handshakeRevision) return;
+        applyCoreStatus(snapshot.status, snapshot.epoch);
+      })
+      .catch((err) => {
+        if (active) report(err);
+      });
 
-  loadRunDetailRef.current = loadRunDetail;
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [appendEvent, bootstrap, replaceApprovals, report, upsertToolCall]);
 
   useEffect(() => {
-    if (!selectedRunId) return;
-    void loadRunDetail(selectedRunId);
-  }, [selectedRunId, loadRunDetail]);
+    if (!selectedRunId) {
+      runRefreshMarkerRef.current = null;
+      resetRunDetail();
+      return;
+    }
+    // 同一个 Run 在 Core 重连后也要重读；断线窗口的 push 不可假设会补发。
+    if (coreStatus === 'READY') {
+      runRefreshMarkerRef.current = selectedRunId;
+      void loadRunDetail(selectedRunId);
+    } else {
+      runRefreshMarkerRef.current = null;
+    }
+  }, [coreStatus, loadRunDetail, resetRunDetail, selectedRunId]);
 
-  // 状态推进到需要新数据的节点时补拉一次
+  // 状态推进到需要新数据的节点时，每个持久化 Run 版本最多补拉一次。
   useEffect(() => {
-    if (!selectedRunId || !selectedRun) return;
-    if (selectedRun.status === 'AWAITING_PLAN_APPROVAL' && !plan) void loadRunDetail(selectedRunId);
-    if (selectedRun.status === 'AWAITING_PATCH_REVIEW' && !patch) void loadRunDetail(selectedRunId);
-    // 失败/中止也可能封存了挽救补丁 —— run.updated 只带 view，不带补丁本体
-    if (
-      (selectedRun.status === 'FAILED' ||
+    if (coreStatus !== 'READY' || !selectedRunId || !selectedRun || !selectedRunDetail) return;
+    const needsRefresh =
+      (selectedRun.status === 'AWAITING_PLAN_APPROVAL' && !selectedRunDetail.plan) ||
+      (selectedRun.status === 'AWAITING_PATCH_REVIEW' && !selectedRunDetail.patch) ||
+      // 失败/中止也可能封存了挽救补丁 —— run.updated 只带 view，不带补丁本体。
+      ((selectedRun.status === 'FAILED' ||
         selectedRun.status === 'BLOCKED' ||
         selectedRun.status === 'CANCELLED') &&
-      !patch
-    ) {
-      void loadRunDetail(selectedRunId);
-    }
-  }, [selectedRun, selectedRunId, plan, patch, loadRunDetail]);
+        !selectedRunDetail.patch);
+    if (!needsRefresh) return;
+
+    const marker = `${selectedRun.runId}:${selectedRun.status}:${selectedRun.updatedAt}`;
+    if (runRefreshMarkerRef.current === marker) return;
+    runRefreshMarkerRef.current = marker;
+    void loadRunDetail(selectedRunId);
+  }, [coreStatus, loadRunDetail, selectedRun, selectedRunDetail, selectedRunId]);
 
   // ---- 动作 ----
-  const importProject = useCallback(async (project: ProjectRef, req: ImportRequest = {}) => {
-    setError(null);
-    setImportState({ status: 'importing' });
-    try {
-      const outcome = await call('project.import', {
-        projectId: project.projectId,
-        ...(req.subPath ? { subPath: req.subPath } : {}),
-      });
-      // 被阻断是终态，不是异常 —— 直接渲染，并带上可以怎么继续
-      setImportState(
-        outcome.outcome === 'IMPORTED'
-          ? {
-              status: 'done',
-              snapshot: outcome.snapshot,
-              profile: outcome.profile,
-              candidates: outcome.candidates,
-            }
-          : {
-              status: 'blocked',
-              code: outcome.code,
-              message: outcome.message,
-              detail: outcome.detail,
-              candidates: outcome.candidates,
-              subPath: req.subPath ?? '',
-            },
-      );
-    } catch (err) {
-      setImportState({
-        status: 'failed',
-        message: err instanceof RequestError ? err.message : ((err as Error).message ?? '导入失败'),
-        detail: err instanceof RequestError ? err.detail : null,
-      });
-    }
-  }, []);
+  const importProject = useCallback(
+    (project: ProjectRef, req: ImportRequest = {}) => {
+      setError(null);
+      void startProjectImport({ project, ...(req.subPath ? { subPath: req.subPath } : {}) });
+    },
+    [startProjectImport],
+  );
 
   const openProject = useCallback(
     (project: ProjectRef) => {
@@ -306,8 +296,20 @@ export function App() {
   }, [runs]);
 
   const enabledModelCount = modelProfiles.filter((m) => m.enabled).length;
-  const snapshotId = importState.status === 'done' ? importState.snapshot.snapshotId : null;
-  const canShowFiles = Boolean(snapshotId);
+  const selectedImportData =
+    selectedProject && isOwnedReady(importState, selectedProject.projectId) ? importState.data : null;
+  const importedProject =
+    selectedImportData?.outcome.outcome === 'IMPORTED' ? selectedImportData.outcome : null;
+  /*
+   * Run 的工作区必须使用创建它的 snapshot，而不是“当前项目最近一次导入”的 snapshot ——
+   * 同一项目重新导入后两者会不同。这份事实现在由 RunView 自己携带（Slice C），
+   * 不再从 plan 推导：plan 要到规划完成才存在，而 PLANNING 阶段的 Run 也该能看文件树。
+   * 证据损坏的 Run 其 snapshotId 为 null，入口如实关闭。
+   */
+  const fileSnapshotId = selectedRunId
+    ? (selectedRun?.snapshotId ?? null)
+    : (importedProject?.snapshot.snapshotId ?? null);
+  const canShowFiles = Boolean(fileSnapshotId);
 
   /** 当前项目下、除正看着的这个之外还在进行中的运行 —— composer 用它提示，防止"以为没反应"再建一个 */
   const activeProjectRun = useMemo(() => {
@@ -335,7 +337,7 @@ export function App() {
 
         <div className="sidebar-scroll">
           {projects.length === 0 && (
-            <div style={{ color: 'var(--text-faint)', fontSize: 11.5, padding: '10px 8px' }}>
+            <div style={{ color: 'var(--text-tertiary)', fontSize: 11.5, padding: '10px 8px' }}>
               还没有项目
             </div>
           )}
@@ -346,6 +348,7 @@ export function App() {
             return (
               <div key={p.projectId} className="project-group">
                 <button
+                  disabled={coreStatus !== 'READY'}
                   className={`list-item ${isCurrent && !selectedRunId && !showSettings ? 'active' : ''}`}
                   onClick={() => openProject(p)}
                 >
@@ -355,6 +358,7 @@ export function App() {
                 {projectRuns.map((r) => (
                   <button
                     key={r.runId}
+                    disabled={coreStatus !== 'READY'}
                     className={`run-item ${selectedRunId === r.runId ? 'active' : ''}`}
                     onClick={() => openRun(r)}
                     title={r.title}
@@ -370,7 +374,12 @@ export function App() {
             );
           })}
 
-          <button className="list-item" onClick={pickProject} style={{ color: 'var(--accent)' }}>
+          <button
+            className="list-item"
+            disabled={coreStatus !== 'READY'}
+            onClick={pickProject}
+            style={{ color: 'var(--accent-interactive)' }}
+          >
             <div className="name">+ 授权本地仓库…</div>
           </button>
         </div>
@@ -384,13 +393,19 @@ export function App() {
             }}
           >
             ⚙ 设置 · API
-            {enabledModelCount === 0 && <span style={{ color: 'var(--warn)' }}> ⚠</span>}
+            {enabledModelCount === 0 && <span style={{ color: 'var(--state-warning-fg)' }}> ⚠</span>}
           </button>
           <button
-            disabled={!canShowFiles}
+            disabled={!canShowFiles || coreStatus !== 'READY'}
             className={filesOpen && canShowFiles ? 'primary' : ''}
             onClick={() => setFilesOpen((v) => !v)}
-            title={canShowFiles ? '文件树' : '先导入一个项目'}
+            title={
+              canShowFiles
+                ? '文件树'
+                : selectedRunId
+                  ? '该 Run 的证据已损坏，快照归属不可知'
+                  : '先导入一个项目'
+            }
           >
             🗂 文件
           </button>
@@ -398,9 +413,15 @@ export function App() {
       </aside>
 
       <main className="main">
-        {!showSettings && selectedRun && <ChatHead run={selectedRun} events={events} />}
+        {!showSettings && selectedRun && (
+          <ChatHead
+            key={`chat-${selectedRun.runId}`}
+            run={selectedRun}
+            events={selectedRunDetail?.events ?? []}
+          />
+        )}
 
-        <div className="chat-scroll">
+        <div className="chat-scroll" ref={follow.containerRef}>
           <div className="chat-scroll-inner">
             {error && (
               <Banner tone="err">
@@ -417,82 +438,198 @@ export function App() {
               <Banner tone="warn">Agent Core {coreStatus === 'DOWN' ? '已退出' : '正在启动'}，操作暂不可用。</Banner>
             )}
 
-            {showSettings ? (
-              <SettingsView
-                checks={checks}
-                profiles={modelProfiles}
-                secureStorage={secureStorage}
-                onProfilesChanged={setModelProfiles}
-                onRefresh={bootstrap}
-                onError={report}
-              />
-            ) : selectedRunId && selectedRun ? (
-              <RunDetail
-                run={selectedRun}
-                events={events}
-                toolCalls={toolCalls}
-                approvals={approvals}
-                plan={plan}
-                patch={patch}
-                verifications={verifications}
-                onError={report}
-                onRefresh={() => void loadRunDetail(selectedRunId)}
-              />
-            ) : selectedProject ? (
-              <SnapshotPanel
-                project={selectedProject}
-                state={importState}
-                onImport={(req) => void importProject(selectedProject, req)}
-              />
-            ) : (
-              <WelcomeView
-                checks={checks}
-                enabledModelCount={enabledModelCount}
-                onPick={pickProject}
-                onSettings={() => setShowSettings(true)}
-              />
-            )}
+            <fieldset
+              disabled={coreStatus !== 'READY'}
+              aria-disabled={coreStatus !== 'READY'}
+              style={{ border: 0, margin: 0, padding: 0, minInlineSize: 0 }}
+            >
+              {showSettings ? (
+                <SettingsView
+                  checks={checks}
+                  profiles={modelProfiles}
+                  secureStorage={secureStorage}
+                  credentialStore={credentialStore}
+                  credentialStoreDetail={credentialStoreDetail}
+                  onProfilesChanged={setModelProfiles}
+                  onRefresh={bootstrap}
+                  onError={report}
+                />
+              ) : selectedRunId && selectedRun ? (
+                selectedRunDetail ? (
+                  <RunDetail
+                    key={`detail-${selectedRun.runId}`}
+                    run={selectedRun}
+                    events={selectedRunDetail.events}
+                    toolCalls={selectedRunDetail.toolCalls}
+                    approvals={selectedRunDetail.approvals}
+                    plan={selectedRunDetail.plan}
+                    patch={selectedRunDetail.patch}
+                    verifications={selectedRunDetail.verifications}
+                    approvalAction={approvalAction}
+                    onError={report}
+                    onRefresh={() => void loadRunDetail(selectedRunId)}
+                  />
+                ) : (
+                  <RunDetailRequestPanel
+                    runId={selectedRunId}
+                    state={runDetailState}
+                    coreReady={coreStatus === 'READY'}
+                    onRetry={() => void loadRunDetail(selectedRunId)}
+                  />
+                )
+              ) : selectedProject ? (
+                <SnapshotPanel
+                  project={selectedProject}
+                  state={importState}
+                  onImport={(req) => importProject(selectedProject, req)}
+                />
+              ) : (
+                <WelcomeView
+                  checks={checks}
+                  enabledModelCount={enabledModelCount}
+                  onPick={pickProject}
+                  onSettings={() => setShowSettings(true)}
+                />
+              )}
+            </fieldset>
           </div>
         </div>
 
+        {/*
+          离底阅读时不抢滚动，只告诉用户积压了多少条。role=status 让它被播报，
+          按钮本身是真按钮，因此 Tab / Enter / Space 与点击是同一条路径。
+        */}
+        {!showSettings && selectedRun && follow.pendingCount > 0 && (
+          <div className="follow-nudge" role="status" aria-live="polite">
+            {/* 外层高度为 0，内层绝对定位 —— 提示出现和消失都不推动时间线或停靠条。 */}
+            <div className="follow-nudge-inner">
+              <button className="follow-nudge-button" onClick={follow.jumpToBottom}>
+                ↓ {follow.pendingCount} 条新事件
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* 审批停靠条：等用户的决定永远压在可视区，不随时间线滚走 */}
-        {!showSettings && selectedRun && (
+        {!showSettings && selectedRun && selectedRunDetail && coreStatus === 'READY' && (
           <ApprovalDock
+            key={`dock-${selectedRun.runId}`}
             run={selectedRun}
-            plan={plan}
-            approvals={approvals}
-            patch={patch}
-            onError={report}
+            plan={selectedRunDetail.plan}
+            approvals={selectedRunDetail.approvals}
+            patch={selectedRunDetail.patch}
+            approvalAction={approvalAction}
           />
         )}
 
-        {!showSettings && selectedProject && importState.status === 'done' && (
-          <Composer
-            project={selectedProject}
-            snapshot={importState.snapshot}
-            profile={importState.profile}
-            modelProfiles={modelProfiles}
-            activeRun={activeProjectRun}
-            onCreated={(run) => {
-              setRuns((prev) => [run, ...prev]);
-              setSelectedRunId(run.runId);
-            }}
-            onReimport={() => void importProject(selectedProject)}
-            onOpenRun={openRun}
-            onOpenSettings={() => setShowSettings(true)}
-            onError={report}
-          />
+        {!showSettings && selectedProject && importedProject && (
+          <fieldset
+            disabled={coreStatus !== 'READY'}
+            aria-disabled={coreStatus !== 'READY'}
+            style={{ border: 0, margin: 0, padding: 0, minInlineSize: 0 }}
+          >
+            <Composer
+              key={`${selectedProject.projectId}:${importedProject.snapshot.snapshotId}`}
+              project={selectedProject}
+              snapshot={importedProject.snapshot}
+              profile={importedProject.profile}
+              modelProfiles={modelProfiles}
+              activeRun={activeProjectRun}
+              onCreated={(run) => {
+                setRuns((prev) => [run, ...prev]);
+                setSelectedRunId(run.runId);
+              }}
+              onReimport={() => importProject(selectedProject)}
+              onOpenRun={openRun}
+              onOpenSettings={() => setShowSettings(true)}
+              onError={report}
+            />
+          </fieldset>
         )}
       </main>
 
-      {filesOpen && snapshotId && (
+      {filesOpen && fileSnapshotId && coreStatus === 'READY' && (
         <FileTreePanel
-          snapshotId={snapshotId}
+          snapshotId={fileSnapshotId}
           runId={selectedRunId}
+          workspaceGeneration={selectedRun?.workspaceGeneration ?? null}
           refreshKey={filesKey}
           onClose={() => setFilesOpen(false)}
         />
       )}
+    </div>
+  );
+}
+
+/** 排除原因的中文标签。分类必须来自数据，不能是一句写死的"依赖、产物、二进制、疑似 secret"。 */
+const EXCLUSION_LABEL: Record<ExclusionEntry['reason'], string> = {
+  GIT_INTERNAL: 'git 内部文件',
+  DEPENDENCY_DIR: '依赖目录',
+  BUILD_OUTPUT: '构建产物',
+  BINARY: '二进制',
+  OVERSIZE: '超过单文件上限',
+  SECRET_SUSPECT: '疑似 secret',
+  SYMLINK: '软链接（不跟随）',
+  UNREADABLE: '存在但读不了',
+  ENUMERATION_TRUNCATED: '枚举被上限截断',
+};
+
+/**
+ * 按原因分组报数。
+ *
+ * 之前这里是一句硬编码的括号说明，无论实际排除了什么都照念 ——
+ * 于是一个 OVERSIZE 排除会被说成"依赖、产物、二进制、疑似 secret"之一，
+ * 而新增的 UNREADABLE / SYMLINK / 截断根本无从表达。报数要报真的那一类。
+ */
+function ExcludedSummary({ excluded }: { excluded: readonly ExclusionEntry[] }) {
+  const byReason = new Map<ExclusionEntry['reason'], number>();
+  for (const entry of excluded) byReason.set(entry.reason, (byReason.get(entry.reason) ?? 0) + 1);
+  if (excluded.length === 0) return <>0 个</>;
+  const parts = [...byReason.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `${EXCLUSION_LABEL[reason]} ${count}`);
+  return (
+    <>
+      {excluded.length} 个（{parts.join('、')}）
+    </>
+  );
+}
+
+function RunDetailRequestPanel({
+  runId,
+  state,
+  coreReady,
+  onRetry,
+}: {
+  runId: string;
+  state: RunDetailState;
+  coreReady: boolean;
+  onRetry: () => void;
+}) {
+  const failure = state.status === 'error' && state.ownerId === runId ? state.error : null;
+  if (failure) {
+    return (
+      <Card title="运行详情" hint={runId} right={<button onClick={onRetry}>重试</button>}>
+        <div role="alert">
+          <Banner tone="err">
+            <strong>{failure.message}</strong>
+          </Banner>
+          {failure.detail && <pre className="output">{failure.detail}</pre>}
+        </div>
+      </Card>
+    );
+  }
+
+  return (
+    <div role="status" aria-live="polite" aria-busy="true">
+      <Card title="运行详情" hint={runId}>
+        <div className="empty">
+          {coreReady ? '正在读取该运行的时间线与审批事实…' : '等待 Agent Core 就绪后读取运行详情…'}
+          <div style={{ fontSize: 11, marginTop: 6 }}>
+            详情归属确认完成前，不会显示或开放其他运行的审批操作。
+          </div>
+        </div>
+      </Card>
     </div>
   );
 }
@@ -525,7 +662,7 @@ function ChatHead({ run, events }: { run: RunView; events: RunEvent[] }) {
 
 function UsageBar({ label, used, max, unit }: { label: string; used: number; max: number; unit?: string }) {
   const ratio = max > 0 ? Math.min(1, used / max) : 0;
-  const tone = ratio >= 0.9 ? 'var(--err)' : ratio >= 0.7 ? 'var(--warn)' : 'var(--accent)';
+  const tone = ratio >= 0.9 ? 'var(--state-failed-fg)' : ratio >= 0.7 ? 'var(--state-warning-fg)' : 'var(--accent-interactive)';
   return (
     <div className="usage-row">
       <span className="usage-label">{label}</span>
@@ -568,7 +705,7 @@ function UsagePanel({ run, events }: { run: RunView; events: RunEvent[] }) {
       {(run.ledger.unknownUsageTurns ?? 0) > 0 && (
         <div className="usage-row">
           <span className="usage-label">用量未知</span>
-          <span className="usage-value" style={{ color: 'var(--warn)' }}>
+          <span className="usage-value" style={{ color: 'var(--state-warning-fg)' }}>
             {run.ledger.unknownUsageTurns} 轮未回报，上面的 token 数不含它们
           </span>
         </div>
@@ -603,53 +740,53 @@ function ApprovalDock({
   plan,
   approvals,
   patch,
-  onError,
+  approvalAction,
 }: {
   run: RunView;
   plan: PlanRevision | null;
   approvals: ApprovalRequest[];
   patch: PatchArtifact | null;
-  onError: (err: unknown) => void;
+  approvalAction: ApprovalActionController;
 }) {
-  const [busy, setBusy] = useState(false);
-
   // 刻意不用 smooth：容器里若有未结束的平滑滚动，smooth 的 scrollIntoView 会被静默吞掉
   // （实测于 Chromium）。这个按钮的全部意义是"一定能找到审批卡"，可靠性 > 动画。
   const jumpTo = (id: string) => document.getElementById(id)?.scrollIntoView({ block: 'center' });
 
   if (run.status === 'AWAITING_PLAN_APPROVAL' && plan && approvals.length > 0) {
     const approval = approvals[0]!;
-    const decide = async (decision: 'APPROVE' | 'REJECT') => {
-      setBusy(true);
-      try {
-        const r = await call('approval.decide', {
-          approvalId: approval.approvalId,
-          decision,
-          subjectDigest: approval.subjectDigest,
-          note: '',
-        });
-        if (!r.accepted) onError(new Error(r.reason ?? '审批未被接受'));
-      } catch (err) {
-        onError(err);
-      } finally {
-        setBusy(false);
-      }
-    };
+    const busy = approvalAction.isPending(approval.approvalId);
+    const pendingDecision = approvalAction.pending.find(
+      (item) => item.approvalId === approval.approvalId,
+    )?.decision;
+    const error =
+      approvalAction.error?.approvalId === approval.approvalId
+        ? approvalAction.error
+        : null;
     return (
-      <div className="dock dock-plan">
+      <div className="dock dock-plan rp-enter">
         <div className="dock-text">
           <strong>计划在等你审批</strong>
           <span className="dock-sub">
-            {plan.steps.length} 步 · {plan.summary.slice(0, 80)}
-            {plan.summary.length > 80 ? '…' : ''}
+            {error
+              ? `${error.message}${error.detail ? ` · ${error.detail}` : ''}`
+              : `${plan.steps.length} 步 · ${plan.summary.slice(0, 80)}${plan.summary.length > 80 ? '…' : ''}`}
           </span>
         </div>
         <button onClick={() => jumpTo('plan-approval-card')}>看完整计划</button>
-        <button className="danger" disabled={busy} onClick={() => void decide('REJECT')}>
-          拒绝
+        {error && <button onClick={() => void approvalAction.retry()}>重试</button>}
+        <button
+          className="danger"
+          disabled={busy}
+          onClick={() => void approvalAction.decide(approval, 'REJECT')}
+        >
+          {pendingDecision === 'REJECT' ? '拒绝中…' : '拒绝'}
         </button>
-        <button className="primary" disabled={busy} onClick={() => void decide('APPROVE')}>
-          批准并执行
+        <button
+          className="primary"
+          disabled={busy}
+          onClick={() => void approvalAction.decide(approval, 'APPROVE')}
+        >
+          {pendingDecision === 'APPROVE' ? '批准中…' : '批准并执行'}
         </button>
       </div>
     );
@@ -659,7 +796,7 @@ function ApprovalDock({
     const added = patch.files.reduce((n, f) => n + f.addedLines, 0);
     const removed = patch.files.reduce((n, f) => n + f.removedLines, 0);
     return (
-      <div className="dock dock-patch">
+      <div className="dock dock-patch rp-enter">
         <div className="dock-text">
           <strong>补丁在等你审查</strong>
           <span className="dock-sub">
@@ -691,7 +828,7 @@ function WelcomeView({
   const blocked = checks.filter((c) => c.status === 'BLOCKED');
   return (
     <Card title="开始">
-      <div style={{ fontSize: 12.5, color: 'var(--text-dim)', marginBottom: 14 }}>
+      <div style={{ fontSize: 12.5, color: 'var(--text-secondary)', marginBottom: 14 }}>
         授权一个本地目录即可开始。任何项目都能导入 —— git 或非 git、干净或有未提交改动、
         是不是 Vite 都可以。
       </div>
@@ -766,64 +903,70 @@ function SnapshotPanel({
   onImport,
 }: {
   project: ProjectRef;
-  state: ImportState;
+  state: ProjectImportState;
   onImport: (req: ImportRequest) => void;
 }) {
-  if (state.status === 'importing' || state.status === 'idle') {
+  const ownsProject = state.ownerId === project.projectId;
+  if (state.status === 'idle' || !ownsProject || state.status === 'loading') {
     return (
-      <Card title={project.name} hint={project.displayPath}>
-        <div className="empty">
-          正在导入快照…
-          <div style={{ fontSize: 11, marginTop: 6 }}>
-            读取 tracked 文件并逐个计算摘要，大仓库需要几秒。
+      <div role="status" aria-live="polite" aria-busy="true">
+        <Card title={project.name} hint={project.displayPath}>
+          <div className="empty">
+            {state.status === 'idle' ? '等待导入快照…' : '正在导入快照…'}
+            <div style={{ fontSize: 11, marginTop: 6 }}>
+              读取 tracked 文件并逐个计算摘要，大仓库需要几秒。
+            </div>
           </div>
-        </div>
-      </Card>
+        </Card>
+      </div>
     );
   }
 
-  if (state.status === 'failed') {
+  if (state.status === 'error') {
     return (
       <Card
         title={project.name}
         hint={project.displayPath}
         right={<button onClick={() => onImport({})}>重试</button>}
       >
-        <Banner tone="err">
-          <strong>{state.message}</strong>
-        </Banner>
-        {state.detail && <pre className="output">{state.detail}</pre>}
+        <div role="alert">
+          <Banner tone="err">
+            <strong>{state.error.message}</strong>
+          </Banner>
+          {state.error.detail && <pre className="output">{state.error.detail}</pre>}
+        </div>
       </Card>
     );
   }
 
-  if (state.status === 'blocked') {
+  const { outcome, requestedSubPath } = state.data;
+  if (outcome.outcome === 'BLOCKED') {
     return (
       <Card
         title={project.name}
         hint={project.displayPath}
-        right={<button onClick={() => onImport({ subPath: state.subPath })}>重试</button>}
+        right={<button onClick={() => onImport({ subPath: requestedSubPath })}>重试</button>}
       >
         <Banner tone="err">
           <strong>
-            {state.message}（{state.code}）
+            {outcome.message}（{outcome.code}）
           </strong>
         </Banner>
-        {state.detail && (
+        {outcome.detail && (
           <pre className="output" style={{ maxHeight: 200 }}>
-            {state.detail}
+            {outcome.detail}
           </pre>
         )}
         <SubPackagePicker
-          candidates={state.candidates}
-          current={state.subPath}
+          candidates={outcome.candidates}
+          current={requestedSubPath}
           onPick={(subPath) => onImport({ subPath })}
         />
       </Card>
     );
   }
 
-  const { snapshot, profile, candidates } = state;
+  const { snapshot, profile, candidates } = outcome;
   const baseTone =
     snapshot.baseKind === 'CLEAN_COMMIT' ? 'ok' : snapshot.baseKind === 'NO_VCS' ? 'err' : 'warn';
   const baseLabel =
@@ -872,8 +1015,31 @@ function SnapshotPanel({
             .join('  |  ') || '（无，可在创建任务时自己填）'}
         </dd>
         <dt>排除文件</dt>
-        <dd>{snapshot.excludedPaths.length} 个（依赖、产物、二进制、疑似 secret）</dd>
+        <dd>
+          <ExcludedSummary excluded={snapshot.excludedPaths} />
+        </dd>
+        <dt>未跟踪文件</dt>
+        <dd>
+          {snapshot.untrackedCount === 0
+            ? '0 个'
+            : `${snapshot.untrackedCount} 个 —— 一个都没进快照（快照只含 tracked 文件）`}
+        </dd>
       </dl>
+
+      {snapshot.untrackedCount > 0 && (
+        <Banner tone="warn">
+          导入范围内有 {snapshot.untrackedCount} 个未跟踪文件，它们**没有**进入快照。
+          如果你要修的改动在这些文件里，先 <code>git add</code> 再重新导入 —— 否则 Agent
+          看不到它们，基于这份快照产生的补丁也不会包含它们。
+        </Banner>
+      )}
+
+      {snapshot.excludedPaths.some((e) => e.reason === 'ENUMERATION_TRUNCATED') && (
+        <Banner tone="err">
+          文件枚举在上限处被截断，这份快照**不完整**。fileCount、tree digest
+          与给模型的仓库信息都只反映被收进来的那一部分。
+        </Banner>
+      )}
 
       {snapshot.baseKind !== 'CLEAN_COMMIT' && (
         <Banner tone="warn">

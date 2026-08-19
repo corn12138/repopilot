@@ -26,9 +26,14 @@ files:
 
 # Core 跑在 utilityProcess 里，入口必须是磁盘上的真实文件路径 ——
 # asar 内的路径喂给 utilityProcess.fork 会拿不到文件。把它解包出去。
+#
+# 解包的是整个 out/main 而不是单独一个 core.js：Main 与 Core 一旦共享任何模块
+# （例如受管数据根的解析），rollup 会把它提成 out/main/chunks/*.js。core.js 被解包、
+# 它 import 的 chunk 还留在 asar 里，打包版会在启动 Core 时才炸 —— 而开发和
+# `pnpm build` 都发现不了。用目录级解包换掉这个"core.js 恰好没有共享依赖"的隐式前提。
 asar: true
 asarUnpack:
-  - out/main/core.js
+  - out/main/**
 
 mac:
   category: public.app-category.developer-tools

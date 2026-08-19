@@ -32,7 +32,18 @@ import type {
   VerificationRun,
 } from './domain';
 
-export const PROTOCOL_VERSION = '0.2.0';
+/*
+ * 0.4.0：信封增加 Core 代次（epoch），逐方法运行时校验开始拒绝未知字段。
+ * 旧端不得静默兼容 —— 一个不带 epoch 的旧 Renderer 必须被明确拒绝，
+ * 而不是被当成"恰好来自当前这一代"。
+ *
+ * 0.5.0：新增 `retention.preview`；`model.listProfiles` 增加 credentialStore 状态；
+ * `PurgeSummaryView` 增加 `dryRun`、`PurgeItemView.outcome` 增加 `WOULD_DELETE`；
+ * `ModelConnectionProfile` 增加 fallbackSource/fallbackEnvVar；
+ * `RepositorySnapshot` 增加 untrackedCount；`RunView` 增加 snapshotId；
+ * `retention.update` 的取值区间收紧到 Core 实际接受的范围。
+ */
+export const PROTOCOL_VERSION = '0.5.0';
 
 export type ImportOutcome =
   | {
@@ -64,6 +75,16 @@ export const IPC_CHANNEL = {
 // ---------------------------------------------------------------------------
 
 export interface RequestMap {
+  /** Main 持有的进程状态快照；Renderer 订阅后用它补齐可能早于监听器发出的首个 push。 */
+  'core.getStatus': {
+    req: Record<string, never>;
+    res: {
+      status: 'READY' | 'RESTARTING' | 'DOWN';
+      detail: string;
+      /** 当前 Core 实例代次；后续每个请求都要带回来。 */
+      epoch: number;
+    };
+  };
   'doctor.run': { req: Record<string, never>; res: { checks: DoctorCheck[] } };
 
   'project.pick': { req: Record<string, never>; res: { project: ProjectRef | null } };
@@ -81,7 +102,19 @@ export interface RequestMap {
 
   'model.listProfiles': {
     req: Record<string, never>;
-    res: { profiles: ModelConnectionProfile[]; secureStorage: boolean };
+    res: {
+      profiles: ModelConnectionProfile[];
+      secureStorage: boolean;
+      /**
+       * 应用内凭据文件的可读性。
+       *
+       * `ABSENT`（没配过）与 `UNREADABLE`（配过但解不开）必须分开：两者都会让
+       * 所有 profile 显示成"没有可用凭据"，但一个要你去填，另一个是你填过的东西
+       * 现在读不出来 —— 处置完全不同。
+       */
+      credentialStore: 'ABSENT' | 'OK' | 'UNREADABLE';
+      credentialStoreDetail: string | null;
+    };
   };
   'model.testProfile': {
     req: { profileId: string };
@@ -148,6 +181,12 @@ export interface RequestMap {
        * 同厂商会被拒绝 —— 异构是硬不变式。
        */
       reviewerConnectorId?: string;
+      /**
+       * 可选：用本机的外部编码代理 CLI 当**作者**（在一次性 candidate 目录里改代码，
+       * 平台把差异归一化成 MutationPlan 后才进主线）。与审核方必须异构；绑定失败
+       * 直接拒绝创建任务，不降级成内部模型去写（那等于换了作者）。
+       */
+      authorConnectorId?: string;
     };
     res: { task: TaskSpec; run: RunView };
   };
@@ -230,6 +269,17 @@ export interface RequestMap {
     req: Record<string, never>;
     res: { summary: PurgeSummaryView; usage: DiskUsage; policy: RetentionPolicyView };
   };
+  /**
+   * 清理预演：完整走一遍判定与体积统计，但一个字节都不删。
+   *
+   * 存在的理由很简单 —— 在此之前，想知道「立即清理」会删掉什么的唯一办法是**真的删一次**。
+   * 传入策略即可预演"如果我把保留期改成这样，会删掉什么"，不改变已保存的策略。
+   * 返回的 summary 带 `dryRun: true`，条目是 `WOULD_DELETE`，两者都无法被误当成已执行。
+   */
+  'retention.preview': {
+    req: { evidenceDays?: number; workspaceGraceMinutes?: number };
+    res: { summary: PurgeSummaryView; policy: RetentionPolicyView };
+  };
 
   'files.tree': {
     req: { snapshotId: string; runId?: string };
@@ -240,7 +290,13 @@ export interface RequestMap {
     };
   };
   'files.read': {
-    req: { snapshotId: string; path: string; runId?: string };
+    req: {
+      snapshotId: string;
+      path: string;
+      runId?: string;
+      /** null 只代表快照；工作区必须携带最后一次 tree 响应确认的 generation。 */
+      expectedGeneration: number | null;
+    };
     res: {
       path: string;
       content: string;
@@ -248,6 +304,9 @@ export interface RequestMap {
       truncated: boolean;
       binary: boolean;
       changed: boolean;
+      /** 与请求 owner 共同校验，防止内容在 generation/source 变化后被旧预览接收。 */
+      source: 'SNAPSHOT' | 'WORKSPACE';
+      generation: number | null;
     };
   };
 
@@ -297,12 +356,15 @@ export type DiskUsage = Record<string, { bytes: number; entries: number }>;
 export interface PurgeItemView {
   readonly domain: 'WORKSPACE' | 'SNAPSHOT' | 'RUN_EVIDENCE' | 'ARTIFACT';
   readonly target: string;
-  readonly outcome: 'DELETED' | 'KEPT_REFERENCED' | 'KEPT_NOT_DUE' | 'FAILED';
+  /** `WOULD_DELETE` 只来自预演；它与 `DELETED` 分开，UI 不可能把两者写成同一句话。 */
+  readonly outcome: 'DELETED' | 'WOULD_DELETE' | 'KEPT_REFERENCED' | 'KEPT_NOT_DUE' | 'FAILED';
   readonly bytesFreed: number;
   readonly reason: string | null;
 }
 
 export interface PurgeSummaryView {
+  /** true = 预演，什么都没删。 */
+  readonly dryRun: boolean;
   readonly startedAt: string;
   readonly finishedAt: string;
   readonly scanned: number;
@@ -326,6 +388,8 @@ export interface IpcEnvelope<M extends RequestMethod = RequestMethod> {
   readonly requestId: string;
   readonly method: M;
   readonly payload: RequestPayload<M>;
+  /** Renderer 认为自己正在对话的 Core 代次；`core.getStatus` 之外都必须带。 */
+  readonly epoch?: number;
 }
 
 export type IpcResult<T> =
@@ -341,6 +405,11 @@ export interface PlatformError {
     | 'POLICY_DENIED'
     | 'BLOCKED'
     | 'CORE_UNAVAILABLE'
+    /**
+     * 请求带的 Core 代次与当前实例不符：界面所依据的那一代 Core 已经不在了。
+     * 与 CORE_UNAVAILABLE 分开，因为处置不同 —— 这个要重新读状态，那个要等进程回来。
+     */
+    | 'CORE_EPOCH_MISMATCH'
     | 'INTERNAL';
   readonly message: string;
   readonly detail: string | null;
@@ -356,7 +425,13 @@ export type PushEvent =
   | { readonly type: 'toolcall.updated'; readonly toolCall: ToolCallView }
   | { readonly type: 'approval.updated'; readonly runId: string; readonly approvals: ApprovalRequest[] }
   | { readonly type: 'retention.swept'; readonly summary: PurgeSummaryView }
-  | { readonly type: 'core.status'; readonly status: 'READY' | 'RESTARTING' | 'DOWN'; readonly detail: string };
+  | {
+      readonly type: 'core.status';
+      readonly status: 'READY' | 'RESTARTING' | 'DOWN';
+      readonly detail: string;
+      /** 与 `core.getStatus` 同源的代次；Renderer 据此更新后续请求要带的 epoch。 */
+      readonly epoch: number;
+    };
 
 // ---------------------------------------------------------------------------
 // Preload 暴露给 Renderer 的唯一 API 面
@@ -367,6 +442,8 @@ export interface RepoPilotBridge {
   request<M extends RequestMethod>(
     method: M,
     payload: RequestPayload<M>,
+    /** Renderer 已知的 Core 代次；不传等同于"我还不知道"，只有握手方法能这样。 */
+    epoch?: number,
   ): Promise<IpcResult<ResponsePayload<M>>>;
   subscribe(handler: (event: PushEvent) => void): () => void;
 }

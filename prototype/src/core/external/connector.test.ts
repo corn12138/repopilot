@@ -104,10 +104,35 @@ describe('parseReviewOutput：解析不出就是 null，绝不编造发现', () 
     expect(parseReviewOutput(raw)).toBeNull();
   });
 
-  it('findings 不是数组时归零，而不是把整个结论丢掉', () => {
+  it('PASS + findings 不是数组时归零，而不是把整个结论丢掉', () => {
+    // PASS 时发现清单不驱动任何决定，归零是安全的。
     const r = parseReviewOutput('{"verdict":"PASS","findings":"none"}');
     expect(r?.verdict).toBe('PASS');
     expect(r?.findings).toEqual([]);
+  });
+
+  /*
+   * 同样的归零在 verdict 不是 PASS 时会变成假绿灯：
+   * `agent.ts` 判 REVIEWER_PASSED 的条件是 `verdict === 'PASS' || blocking.length === 0`，
+   * 所以「要求整改 + 读不出来的 findings」会被当成"审核方没提意见"走完循环。
+   * 审核方明说要改，平台却判通过 —— 这是静默通过，不是宽容。
+   */
+  it.each([
+    ['findings 不是数组', '{"verdict":"CHANGES_REQUESTED","findings":"lots"}'],
+    ['findings 里混了非对象项', '{"verdict":"CHANGES_REQUESTED","findings":[{"a":1},"oops"]}'],
+    ['INCONCLUSIVE 同理', '{"verdict":"INCONCLUSIVE","findings":42}'],
+  ])('非 PASS + %s → null，绝不降级成零条阻断', (_label, raw) => {
+    const r = parseReviewOutput(raw);
+    // 负向断言：任何带着 findings=[] 的非 PASS 结论都会在 agent 里变成 REVIEWER_PASSED。
+    expect(r).toBeNull();
+  });
+
+  it('非 PASS + 完整可读的 findings 正常通过', () => {
+    const r = parseReviewOutput(
+      '{"verdict":"CHANGES_REQUESTED","findings":[{"title":"x","blocking":true}]}',
+    );
+    expect(r?.verdict).toBe('CHANGES_REQUESTED');
+    expect(r?.findings).toHaveLength(1);
   });
 });
 

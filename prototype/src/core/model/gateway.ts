@@ -146,7 +146,7 @@ export class ModelGateway {
     const d = descriptorOf(providerId);
     const s = this.settingsOf(providerId);
     const appKey = this.appKeys.get(providerId);
-    const { source, envVar } = resolveKeySource(d, appKey);
+    const { source, envVar, fallbackSource, fallbackEnvVar } = resolveKeySource(d, appKey);
     const origin = resolveOrigin(d, s.baseUrlOverride);
     const effectiveKey = resolveKey(d, appKey);
 
@@ -163,8 +163,12 @@ export class ModelGateway {
       isRelay: isRelay(d, origin),
       modelId: s.modelId,
       availableModels: d.models,
-      credentialEnvVar: d.env[0] ?? '',
+      // 实际生效的那个优先；没有生效的就报第一个候选（该填哪个）。
+      credentialEnvVar: envVar ?? d.env[0] ?? '',
+      credentialEnvVars: d.env,
       credentialSource: source,
+      fallbackSource,
+      fallbackEnvVar,
       credentialHint: effectiveKey ? `…${effectiveKey.slice(-4)}` : null,
       docUrl: d.doc,
       // 有 key 就算启用；应用内录入和环境变量都算

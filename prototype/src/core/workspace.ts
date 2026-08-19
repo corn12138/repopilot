@@ -233,6 +233,53 @@ export class MaterializedWorkspace {
     return this.changedVsBaseline().authored;
   }
 
+  /**
+   * 把当前 active generation 的**内容**导出成一个一次性 candidate 目录，
+   * 给外部编码代理（Codex / Claude CLI 当作者）在里面自由改。
+   *
+   * 这是 TD-DEC-016 写明的 candidate-to-canonical 边界的原型落点：
+   *   - candidate 目录**不是** generation：它没有编号、不参与 stage()/commit() 的
+   *     CAS、不能成为 active。外部作者改完之后，平台只拿它与导出时的 baseTree 做
+   *     tree diff，再把差异**归一化成 MutationPlan** 走 applyMutationPlan —— 于是
+   *     receipt、whole-file digest CAS、protected/allowed path、预算、失败零写入
+   *     全部照旧生效。外部作者从头到尾碰不到主线 generation。
+   *   - 目录放在工作区根下（`candidate-<id>`），cleanup() 会一并回收；
+   *     正常路径由调用方在归一化完成后立刻 discardCandidate()。
+   *   - 同 stage() 一样挂宿主 node_modules 的 symlink（作者可能要 tsc/vitest 自检）。
+   *     残余风险与 linkDependencies 处注释相同，这里不额外放宽也不额外收紧。
+   *   - baseTree 在导出**当下**计算并随返回值交给调用方：归一化时用它而不是
+   *     重新读 active —— active 若在期间被别的事务推进，applyMutationPlan 的
+   *     generation/receipt 校验会拒绝，这正是想要的。
+   */
+  exportCandidate(): {
+    candidateId: string;
+    path: string;
+    baseGeneration: number;
+    baseTree: TreeEntry[];
+  } {
+    const candidateId = newId('cand');
+    const path = join(this.root, `candidate-${candidateId}`);
+    rmSync(path, { recursive: true, force: true });
+    cloneTree(this.activePath, path);
+    this.linkDependencies(path);
+    return {
+      candidateId,
+      path,
+      baseGeneration: this.active,
+      baseTree: listTree(this.activePath),
+    };
+  }
+
+  /** 丢弃 candidate 目录。只接受本工作区根下的 candidate-* 路径，别的路径一律拒绝。 */
+  discardCandidate(path: string): void {
+    const rootResolved = resolve(this.root);
+    const target = resolve(path);
+    if (!target.startsWith(rootResolved + sep) || !relative(rootResolved, target).startsWith('candidate-')) {
+      throw new Error(`拒绝删除非 candidate 路径：${path}`);
+    }
+    rmSync(target, { recursive: true, force: true });
+  }
+
   baselinePath(): string {
     return this.generationPath(0);
   }

@@ -59,6 +59,36 @@ export interface AgentHost {
  */
 export type ModelInvoker = Pick<ModelGateway, 'invoke'>;
 
+/**
+ * 外部作者（Codex / Claude CLI 当实现方）的编排接口。
+ *
+ * Loop 只看到这一个函数：给它一份简报，它回来的是**平台判定过的**结果 ——
+ * candidate 被归一化采用（APPLIED，主线 generation 已前进）、没有变更、被拒绝、
+ * 调用失败或取消。作者自己说了什么不在这个返回值里；那只是 authority 记进事件的备注。
+ * 这样 runAgent 里"执行 → 验证 → 自修复 → 交叉审核整改"的循环对"谁在改"无知，
+ * 与 reviewer 的 ReviewPassRunner 是同一个形状。
+ */
+export type ExternalAuthorOutcome =
+  | { readonly kind: 'APPLIED'; readonly generation: number; readonly changedPaths: readonly string[] }
+  | { readonly kind: 'NO_CHANGES' }
+  | { readonly kind: 'REJECTED'; readonly reason: string; readonly detail: string }
+  /** 调用层失败：BLOCKED / FAILED / TIMED_OUT —— candidate 已整笔丢弃 */
+  | { readonly kind: 'FAILED'; readonly detail: string }
+  | { readonly kind: 'CANCELLED' };
+
+export type ExternalAuthorRunner = (input: {
+  readonly phase: 'IMPLEMENT' | 'SELF_FIX' | 'REMEDIATE';
+  readonly brief: string;
+  readonly round: number;
+}) => Promise<ExternalAuthorOutcome>;
+
+/** 外部作者在整改/实现时调用失败或被拒 —— 交叉审核循环把它折叠成 ERROR 并转人工 */
+export class ExternalAuthorFailed extends Error {
+  constructor(readonly detail: string) {
+    super(detail);
+  }
+}
+
 export interface AgentDeps {
   readonly task: TaskSpec;
   readonly snapshot: RepositorySnapshot;
@@ -71,6 +101,11 @@ export interface AgentDeps {
   readonly attemptId: string;
   readonly signal: AbortSignal;
   readonly host: AgentHost;
+  /**
+   * 可选：外部编码代理当作者。存在时，执行/自修复/整改阶段不再走内部模型的
+   * executionTurns，而是调它；规划、审批、验证、封存、交叉审核全部不变。
+   */
+  readonly externalAuthor?: ExternalAuthorRunner;
 }
 
 export interface AgentResult {
@@ -215,12 +250,13 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
 
   // ---- 3. 执行 + 有界自修复 ----
   host.setStatus('EXECUTING', null);
-  // 规划期末尾刚回填过 tool_result（也是 user），必须合并而不是新起一条 —— 见 pushUser
-  pushUser(conversation, [
-    {
-      type: 'text',
-      text:
-        `用户已批准以下计划，现在开始执行。\n\n${renderPlan(plan)}\n\n` +
+  if (!deps.externalAuthor) {
+    // 规划期末尾刚回填过 tool_result（也是 user），必须合并而不是新起一条 —— 见 pushUser
+    pushUser(conversation, [
+      {
+        type: 'text',
+        text:
+          `用户已批准以下计划，现在开始执行。\n\n${renderPlan(plan)}\n\n` +
           `执行规则：\n` +
           `- 修改现有文件前必须先用 fs_read 取得 receiptId。\n` +
           `- 用 workspace_mutate 提交改动；oldText 必须在文件中唯一命中。\n` +
@@ -230,8 +266,13 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
             : `- 本次任务没有配置验证命令，你无法证明改动是对的。因此要格外保守：\n` +
               `  只做计划里明确说过的改动，不要顺手重构。\n` +
               `- 改完后用一句话说明你做了什么、以及哪些地方你没有把握，然后结束。`),
-    },
-  ]);
+      },
+    ]);
+  } else {
+    host.emit('NOTE', '本次由外部编码代理当作者：它只在一次性 candidate 目录里改，平台把差异归一化后才进入主线', {
+      externalAuthor: true,
+    });
+  }
 
   let finalVerification: VerificationRun | null = null;
   /** 最后一轮执行是怎么结束的 —— 供收尾时判断"是不是被预算掐断的" */
@@ -239,9 +280,70 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
   let round = 0;
   const maxRounds = task.budget.maxSelfFixRounds;
 
+  /**
+   * 一轮"改代码"。内部模型走 executionTurns；外部作者走 runner。
+   * 两条路对下游完全等价：之后都是 changedFilesVsBaseline → 验证 → 自修复判定。
+   */
+  const implementOnce = async (
+    phase: 'IMPLEMENT' | 'SELF_FIX',
+    failureSummary: string | null,
+  ): Promise<{ end: ExecutionEnd } | { stop: AgentResult }> => {
+    if (!deps.externalAuthor) return { end: await executionTurns(deps, conversation) };
+    const outcome = await deps.externalAuthor({
+      phase,
+      brief: renderExternalAuthorBrief(deps, plan, baseline, failureSummary),
+      round,
+    });
+    switch (outcome.kind) {
+      case 'APPLIED':
+        return { end: { kind: 'MODEL_ENDED_TURN' } };
+      case 'NO_CHANGES':
+        if (phase === 'SELF_FIX') {
+          // 自修复轮没改任何东西：再验一遍只会得到同样的失败，直接如实停下
+          return {
+            stop: {
+              kind: 'VERIFICATION_FAILED',
+              detail: '外部作者在自修复轮没有产生任何文件变更，验证仍未通过。',
+              baseline,
+              finalVerification,
+              unverifiedItems: [],
+            },
+          };
+        }
+        return { end: { kind: 'MODEL_ENDED_TURN' } }; // 下游按 changedFilesVsBaseline()==0 判 NO_CHANGES
+      case 'CANCELLED':
+        throw new AgentCancelled();
+      case 'REJECTED':
+        return {
+          stop: {
+            kind: 'BLOCKED',
+            detail: `外部作者的改动未被采用（${outcome.reason}）：${outcome.detail}`,
+            baseline,
+            finalVerification,
+            unverifiedItems: [],
+          },
+        };
+      case 'FAILED':
+        return {
+          stop: {
+            kind: 'BLOCKED',
+            detail: `外部作者调用失败：${outcome.detail}`,
+            baseline,
+            finalVerification,
+            unverifiedItems: [],
+          },
+        };
+    }
+  };
+
   for (;;) {
     throwIfCancelled(signal);
-    const ended = await executionTurns(deps, conversation);
+    const attempt = await implementOnce(
+      round === 0 ? 'IMPLEMENT' : 'SELF_FIX',
+      round === 0 || !finalVerification ? null : summarizeFailures(finalVerification),
+    );
+    if ('stop' in attempt) return attempt.stop;
+    const ended = attempt.end;
     lastEnd = ended;
     throwIfCancelled(signal);
 
@@ -318,16 +420,19 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
     round += 1;
     host.chargeSelfFixRound();
     host.emit('SELF_FIX_ROUND', `进入第 ${round}/${maxRounds} 轮自修复`, { round });
-    // 上一轮若以 BUDGET_EXHAUSTED 提前返回，末尾可能仍是 user —— 用 pushUser 合并
-    pushUser(conversation, [
-      {
-        type: 'text',
-        text:
-          `验证仍未通过。这是第 ${round}/${maxRounds} 轮自修复，也是你最后的机会之一。\n\n` +
-          `${summarizeFailures(finalVerification)}\n\n` +
-          `请先判断这是不是与之前相同的失败。如果是同一个错误，说明上一次的改法不对，换一种思路。`,
-      },
-    ]);
+    if (!deps.externalAuthor) {
+      // 上一轮若以 BUDGET_EXHAUSTED 提前返回，末尾可能仍是 user —— 用 pushUser 合并
+      pushUser(conversation, [
+        {
+          type: 'text',
+          text:
+            `验证仍未通过。这是第 ${round}/${maxRounds} 轮自修复，也是你最后的机会之一。\n\n` +
+            `${summarizeFailures(finalVerification)}\n\n` +
+            `请先判断这是不是与之前相同的失败。如果是同一个错误，说明上一次的改法不对，换一种思路。`,
+        },
+      ]);
+    }
+    // 外部作者：失败摘要在下一轮 implementOnce 的简报里带过去
   }
 
   const comparison = compareVerification(baseline!, finalVerification);
@@ -789,10 +894,31 @@ export async function runRemediationPass(
   input: RemediationPassInput,
 ): Promise<RemediationPassResult> {
   const before = deps.workspace.activeGeneration;
+  if (deps.externalAuthor) {
+    // 外部作者整改：同一份简报（去掉内部工具规则），同一个 candidate → 归一化 → CAS 路径。
+    // 调用失败/被拒不伪装成"没改"：抛出让循环记 ERROR 并转人工，NO_CHANGES 才是 NO_DELTA。
+    const outcome = await deps.externalAuthor({
+      phase: 'REMEDIATE',
+      brief: renderRemediationBrief(deps.task, input.patch, input.findings, 'EXTERNAL'),
+      round: 0,
+    });
+    switch (outcome.kind) {
+      case 'APPLIED':
+        return { mutated: deps.workspace.activeGeneration !== before, truncationReason: null };
+      case 'NO_CHANGES':
+        return { mutated: false, truncationReason: null };
+      case 'CANCELLED':
+        throw new AgentCancelled();
+      case 'REJECTED':
+        throw new ExternalAuthorFailed(`整改改动未被采用（${outcome.reason}）：${outcome.detail}`);
+      case 'FAILED':
+        throw new ExternalAuthorFailed(`外部作者整改调用失败：${outcome.detail}`);
+    }
+  }
   const conversation: ModelMessage[] = [
     {
       role: 'user',
-      content: [{ type: 'text', text: renderRemediationBrief(deps.task, input.patch, input.findings) }],
+      content: [{ type: 'text', text: renderRemediationBrief(deps.task, input.patch, input.findings, 'INTERNAL') }],
     },
   ];
   const ended = await executionTurns(deps, conversation);
@@ -806,6 +932,7 @@ function renderRemediationBrief(
   task: TaskSpec,
   patch: PatchArtifact,
   findings: readonly ReviewFinding[],
+  mode: 'INTERNAL' | 'EXTERNAL',
 ): string {
   const list = findings
     .map((f, i) => {
@@ -834,7 +961,7 @@ ${patch.unifiedDiff.length > 24_000 ? '（diff 过长已截断，可用 fs_read 
 规则：
 - **只**修复上面列出的阻断项。不要顺手重构、不要扩大范围 —— 范围蔓延本身就是审核要抓的问题。
 - 认为某条发现不成立时，不改它即可（下一轮审核与人工都会看到你的取舍），不要为了"响应"而乱改。
-- 修改文件前先 fs_read 拿 receipt。改完直接结束回合，无需汇报。`;
+${mode === 'INTERNAL' ? '- 修改文件前先 fs_read 拿 receipt。改完直接结束回合，无需汇报。' : '- 直接在当前目录修改文件；改完按平台要求输出 JSON 备注即可。'}`;
 }
 
 /**
@@ -936,7 +1063,7 @@ export async function runCrossReviewCycle(
 
   host.emit(
     'NOTE',
-    `交叉审核发现 ${blocking1.length} 条阻断 → 自动整改（1/${CROSS_REVIEW_LIMITS.maxRemediations}），由实现方 route 执行`,
+    `交叉审核发现 ${blocking1.length} 条阻断 → 自动整改（1/${CROSS_REVIEW_LIMITS.maxRemediations}），由实现方执行（${deps.externalAuthor ? '外部作者，candidate → 归一化 → CAS' : '实现方 route'}）`,
     { blocking: blocking1.length },
   );
   remediations += 1;
@@ -1351,10 +1478,33 @@ function buildTaskBrief(deps: AgentDeps, baseline: VerificationRun | null): stri
           ? ` + ${deps.snapshot.dirtyFileCount} 项未提交改动`
           : '');
 
+  /*
+   * 模型的世界就是这份快照。它没进来的东西，模型不该以为自己能改 ——
+   * 否则模型会去"修"一个它看不见的文件，然后把失败归因到别处。
+   */
+  const absences: string[] = [];
+  if (deps.snapshot.untrackedCount > 0) {
+    absences.push(
+      `- 未跟踪文件: ${deps.snapshot.untrackedCount} 个，**不在快照里**（快照只含 tracked 文件，它们对你不可见）`,
+    );
+  }
+  const truncatedEnumeration = deps.snapshot.excludedPaths.some(
+    (e) => e.reason === 'ENUMERATION_TRUNCATED',
+  );
+  if (truncatedEnumeration) {
+    absences.push('- 注意: 文件枚举被上限截断，这份快照不完整，上面的文件数不是仓库全部');
+  }
+  const unreadable = deps.snapshot.excludedPaths.filter((e) => e.reason === 'UNREADABLE').length;
+  if (unreadable > 0) {
+    absences.push(`- 读取失败: ${unreadable} 个路径存在但读不了，不在快照里`);
+  }
+
   const header = `仓库信息：
 - base: ${base}
 - 快照文件数: ${deps.snapshot.fileCount}
-- 检测到的技术栈信号: ${deps.profile.detectedSignals.join(', ') || '（无）'}`;
+- 检测到的技术栈信号: ${deps.profile.detectedSignals.join(', ') || '（无）'}${
+    absences.length > 0 ? `\n${absences.join('\n')}` : ''
+  }`;
 
   if (!baseline) {
     return `请完成以下任务。
@@ -1382,6 +1532,31 @@ function renderPlan(plan: PlanRevision): string {
     .map((s) => `${s.index}. ${s.intent}${s.targetPaths.length ? ` [${s.targetPaths.join(', ')}]` : ''}`)
     .join('\n');
   return `计划摘要: ${plan.summary}\n${steps}${plan.risks.length ? `\n风险: ${plan.risks.join('; ')}` : ''}`;
+}
+
+/**
+ * 给外部作者的简报：目标、范围、受保护路径、验收、**用户批准的计划**、基线失败，
+ * 以及自修复轮的上一次验证失败摘要。不含仓库地图 —— 它在 candidate 目录里自己看。
+ */
+function renderExternalAuthorBrief(
+  deps: AgentDeps,
+  plan: PlanRevision,
+  baseline: VerificationRun | null,
+  failureSummary: string | null,
+): string {
+  const { task } = deps;
+  const acceptance = task.acceptance.length ? task.acceptance.map((a) => `- ${a}`).join('\n') : '（未填写）';
+  return [
+    `任务目标：${task.goal}`,
+    `允许改动的路径：${renderAllowedPaths(task.allowedPaths)}`,
+    `受保护路径（禁止改动）：${task.protectedPaths.join(', ') || '（无）'}`,
+    `验收标准：\n${acceptance}`,
+    `用户已批准的计划（按此执行，不要扩大范围）：\n${renderPlan(plan)}`,
+    baseline ? `基线验证结果（修改前的真实状态）：\n${summarizeFailures(baseline)}` : '本次任务没有配置验证命令，请格外保守。',
+    failureSummary ? `上一版改动之后的验证结果（仍未通过）：\n${failureSummary}\n请先判断是否与之前相同的失败；是同一个错误就换一种思路。` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 function buildUnverifiedItems(

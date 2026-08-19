@@ -363,6 +363,7 @@ const SNAPSHOT: RepositorySnapshot = {
   branch: 'main',
   baseKind: 'CLEAN_COMMIT',
   dirtyFileCount: 0,
+  untrackedCount: 0,
   subPath: '',
   fileCount: 2,
   totalBytes: 42,

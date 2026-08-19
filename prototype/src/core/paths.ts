@@ -1,18 +1,16 @@
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
+import { resolveDataRoot } from '@shared/dataRoot';
 
 /**
  * 所有 RepoPilot 管理的数据都在这一个受管根下。
  * 原型阶段不做加密（用户明确把存储放到后续），但目录布局按 overlay §4 的分域设计，
  * 后面替换成 encrypted artifact root 时不需要改调用方。
+ *
+ * 根路径来自 `@shared/dataRoot`，可用 `REPOPILOT_DATA_ROOT` 显式隔离 ——
+ * 自检与本地实验因此不必往真实用户目录里写东西。
  */
-export const DATA_ROOT = join(
-  homedir(),
-  'Library',
-  'Application Support',
-  'RepoPilotPrototype',
-);
+export const DATA_ROOT = resolveDataRoot();
 
 export const PATHS = {
   root: DATA_ROOT,

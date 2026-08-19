@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url';
-import { writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import {
   BrowserWindow,
@@ -18,7 +19,13 @@ import {
   type IpcResult,
   type PlatformError,
   type PushEvent,
+  type RequestMethod,
 } from '@shared/protocol';
+import { isRequestMethod, methodTimeoutMs } from '@shared/ipcContract';
+import { classifyEnvelope } from './envelope';
+import { probeRenderedStyles } from './renderProbe';
+import { DATA_ROOT_ENV, isIsolatedDataRoot, resolveDataRoot } from '@shared/dataRoot';
+import { CoreRequestBroker } from './coreChannel';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -41,8 +48,22 @@ let coreReady = false;
 /** 退出中标记：区分"Core 意外崩溃需重启"和"应用正在退出" */
 let quitting = false;
 
-const pending = new Map<string, (result: IpcResult<unknown>) => void>();
-let requestSeq = 0;
+/**
+ * Core 实例代次。每次 Core 就绪自增一次。
+ *
+ * Renderer 的界面是某一代 Core 的投影：那一代崩溃后，工作区没了、活着的 Run 被判成
+ * INTERRUPTED、内存里的审批也不复存在。带着旧代次发来的请求不是"稍微过时"，
+ * 而是**基于一个已经不存在的世界**。让它静默地被新实例应答，等于把两代事实缝在一起。
+ * 所以除了用来获取代次的 core.getStatus，其余方法都必须带上匹配的 epoch。
+ */
+let coreEpoch = 0;
+
+const broker = new CoreRequestBroker({
+  post: (message) => {
+    if (!core) throw new Error('Agent Core 不在运行');
+    core.postMessage(message);
+  },
+});
 
 // ---------------------------------------------------------------------------
 // Core 监督
@@ -67,9 +88,15 @@ function startCore(): void {
 
     if (data.kind === 'ready') {
       coreReady = true;
+      coreEpoch += 1;
       // Core 每次（重）启动都要重新注入凭据 —— 它只在内存持有，重启即丢
       void syncCredentialsToCore().then(() => {
-        pushToRenderer({ type: 'core.status', status: 'READY', detail: 'Agent Core 已就绪' });
+        pushToRenderer({
+          type: 'core.status',
+          status: 'READY',
+          detail: 'Agent Core 已就绪',
+          epoch: coreEpoch,
+        });
       });
       return;
     }
@@ -78,10 +105,8 @@ function startCore(): void {
       return;
     }
     if (data.kind === 'response') {
-      const resolve = pending.get(data.requestId);
-      if (!resolve) return;
-      pending.delete(data.requestId);
-      resolve(
+      broker.settle(
+        data.requestId,
         data.ok
           ? { ok: true, data: data.data }
           : { ok: false, error: data.error as PlatformError },
@@ -93,16 +118,20 @@ function startCore(): void {
     coreReady = false;
     core = null;
     // 所有在途请求必须收到明确失败，不能永远挂着
-    for (const [id, resolve] of pending) {
-      pending.delete(id);
-      resolve({
-        ok: false,
-        error: { code: 'CORE_UNAVAILABLE', message: 'Agent Core 已退出', detail: `exit code ${code}` },
-      });
-    }
-    pushToRenderer({ type: 'core.status', status: 'DOWN', detail: `Agent Core 退出 (code=${code})` });
+    broker.failAll(`exit code ${code}`);
+    pushToRenderer({
+      type: 'core.status',
+      status: 'DOWN',
+      detail: `Agent Core 退出 (code=${code})`,
+      epoch: coreEpoch,
+    });
     if (!quitting) {
-      pushToRenderer({ type: 'core.status', status: 'RESTARTING', detail: '正在重启 Agent Core' });
+      pushToRenderer({
+        type: 'core.status',
+        status: 'RESTARTING',
+        detail: '正在重启 Agent Core',
+        epoch: coreEpoch,
+      });
       setTimeout(startCore, 1000);
     }
   });
@@ -122,6 +151,9 @@ function killCore(): void {
   core?.kill();
 }
 
+/** Main 自己发起的内部调用（`__` 前缀方法）没有 Renderer 合同，用这个上限。 */
+const INTERNAL_CALL_TIMEOUT_MS = 120_000;
+
 function callCore(method: string, payload: unknown): Promise<IpcResult<unknown>> {
   if (!core || !coreReady) {
     return Promise.resolve({
@@ -129,12 +161,8 @@ function callCore(method: string, payload: unknown): Promise<IpcResult<unknown>>
       error: { code: 'CORE_UNAVAILABLE', message: 'Agent Core 尚未就绪', detail: null },
     });
   }
-  requestSeq += 1;
-  const requestId = `req_${requestSeq}`;
-  return new Promise((resolve) => {
-    pending.set(requestId, resolve);
-    core!.postMessage({ kind: 'request', requestId, method, payload });
-  });
+  const timeoutMs = isRequestMethod(method) ? methodTimeoutMs(method) : INTERNAL_CALL_TIMEOUT_MS;
+  return broker.request(method, payload, timeoutMs);
 }
 
 function pushToRenderer(event: PushEvent): void {
@@ -147,72 +175,63 @@ function pushToRenderer(event: PushEvent): void {
 // Renderer 请求入口
 // ---------------------------------------------------------------------------
 
-/** 白名单：不在这个集合里的方法名一律拒绝，不存在通用 invoke */
-const ALLOWED_METHODS = new Set([
-  'doctor.run',
-  'project.pick',
-  'project.list',
-  'project.import',
-  'model.listProfiles',
-  'model.testProfile',
-  'model.setKey',
-  'model.updateProfile',
-  'model.addProvider',
-  'model.removeProvider',
-  'task.create',
-  'run.get',
-  'run.list',
-  'run.events',
-  'run.toolCalls',
-  'run.cancel',
-  'plan.get',
-  'approval.pending',
-  'approval.decide',
-  'patch.get',
-  'crossreview.get',
-  'crossreview.continue',
-  'crossreview.reviewers',
-  'patch.decide',
-  'patch.export',
-  'verification.list',
-  'files.tree',
-  'files.read',
-  'retention.get',
-  'retention.update',
-  'retention.sweepNow',
-]);
+/** Main 当下持有的 Core 进程状态快照。getStatus 与 core.status push 必须同源。 */
+function coreStatusSnapshot(): { status: 'READY' | 'RESTARTING' | 'DOWN'; detail: string; epoch: number } {
+  return {
+    status: coreReady ? 'READY' : core ? 'RESTARTING' : 'DOWN',
+    detail: coreReady ? 'Agent Core 已就绪' : core ? 'Agent Core 尚未就绪' : 'Agent Core 已退出',
+    epoch: coreEpoch,
+  };
+}
 
-const MAX_PAYLOAD_BYTES = 256 * 1024;
-
+/*
+ * 外层兜底。
+ *
+ * 处理体里任何未预期的抛出（凭据写盘 ENOSPC/EACCES、原生对话框失败……）如果直接
+ * 逃出 ipcMain.handle，Renderer 拿到的是一个 rejected invoke —— `bridge.call` 只会
+ * 从 `{ok:false}` 信封构造 RequestError，于是那条错误既没有 code 也没有 detail，
+ * 界面只能显示一句无来源的字符串。每个请求都必须有一个**结构化**的结局。
+ */
 ipcMain.handle(IPC_CHANNEL.request, async (event, raw: unknown): Promise<IpcResult<unknown>> => {
+  try {
+    return await handleRendererRequest(event, raw);
+  } catch (err) {
+    console.error('[main] 未预期的请求失败', err);
+    return {
+      ok: false,
+      error: {
+        code: 'INTERNAL',
+        message: 'Main 处理请求时发生未预期错误',
+        detail: (err as Error).message?.slice(0, 300) ?? null,
+      },
+    };
+  }
+});
+
+async function handleRendererRequest(
+  event: Electron.IpcMainInvokeEvent,
+  raw: unknown,
+): Promise<IpcResult<unknown>> {
   // 绑定 sender：只接受主窗口发来的请求
   if (!mainWindow || event.sender !== mainWindow.webContents) {
     return { ok: false, error: { code: 'POLICY_DENIED', message: '未授权的发送方', detail: null } };
   }
 
-  const envelope = raw as { protocolVersion?: string; method?: string; payload?: unknown };
-  if (envelope?.protocolVersion !== PROTOCOL_VERSION) {
-    return {
-      ok: false,
-      error: {
-        code: 'BAD_REQUEST',
-        message: '协议版本不匹配',
-        detail: `期望 ${PROTOCOL_VERSION}，收到 ${String(envelope?.protocolVersion)}`,
-      },
-    };
-  }
-  if (typeof envelope.method !== 'string' || !ALLOWED_METHODS.has(envelope.method)) {
-    return {
-      ok: false,
-      error: { code: 'POLICY_DENIED', message: `方法不在白名单内: ${String(envelope.method)}`, detail: null },
-    };
-  }
-  if (Buffer.byteLength(JSON.stringify(envelope.payload ?? {}), 'utf8') > MAX_PAYLOAD_BYTES) {
-    return { ok: false, error: { code: 'BAD_REQUEST', message: '请求体过大', detail: null } };
+  // 协议版本、方法白名单、Core 代次、payload 合同 —— 判定逻辑在 envelope.ts 里可测。
+  const decision = classifyEnvelope(raw, coreEpoch);
+  if (decision.kind === 'reject') return { ok: false, error: decision.error };
+  const { method, payload } = decision;
+
+  /*
+   * Core 状态属于 Main 的进程监督事实，不转交 Core。push 负责实时变化，这个快照负责
+   * Renderer 订阅建立前已经发生的 READY；两者合起来才不会把一次性事件当持久状态。
+   */
+  if (method === 'core.getStatus') {
+    return { ok: true, data: coreStatusSnapshot() };
   }
 
   // project.pick 是原生手势能力，由 Main 自己实现，然后把结果登记进 Core
-  if (envelope.method === 'project.pick') {
+  if (method === 'project.pick') {
     const result = await dialog.showOpenDialog(mainWindow, {
       title: '选择要授权给 RepoPilot 的 Git 仓库',
       properties: ['openDirectory'],
@@ -224,44 +243,97 @@ ipcMain.handle(IPC_CHANNEL.request, async (event, raw: unknown): Promise<IpcResu
     return callCore('__project.register', { hostPath: result.filePaths[0] });
   }
 
-  if (envelope.method === 'patch.export') {
-    return exportPatch(envelope.payload as ExportRequest);
+  if (method === 'patch.export') {
+    return exportPatch(payload as unknown as ExportRequest);
   }
 
   // 凭据写入只在 Main 完成：Renderer 送来明文，落盘前立刻加密，之后再不回传
-  if (envelope.method === 'model.setKey') {
-    const { profileId, apiKey } = envelope.payload as { profileId: string; apiKey: string };
+  if (method === 'model.setKey') {
+    const { profileId, apiKey } = payload as { profileId: string; apiKey: string };
     const providerId = profileId.replace(/^profile_/, '');
     if (!providerId) {
       return { ok: false, error: { code: 'BAD_REQUEST', message: '未知 profile', detail: null } };
     }
-    if (apiKey.trim() && !credentials.isAvailable()) {
+    if (!credentials.isAvailable()) {
+      // 删除也要写盘，所以钥匙串不可用时两个方向都做不了 —— 说清楚，不要假装成功。
       return {
         ok: false,
         error: {
           code: 'INTERNAL',
-          message: '系统钥匙串不可用，无法安全保存凭据',
+          message: '系统钥匙串不可用，无法读写应用内凭据',
           detail: '可改用环境变量方式提供 API Key',
         },
       };
     }
-    credentials.setKey(providerId, apiKey);
+    try {
+      credentials.setKey(providerId, apiKey);
+    } catch (err) {
+      /*
+       * 存储读不出来时写入会用「只有这一把 key」覆盖掉那份其实还在的密文，
+       * 一次「保存」就把其余 provider 的凭据全删了。拒绝并说清楚，不静默继续。
+       */
+      if (err instanceof credentials.CredentialStoreUnreadable) {
+        return {
+          ok: false,
+          error: { code: 'CONFLICT', message: err.message, detail: err.detail },
+        };
+      }
+      throw err;
+    }
     return syncCredentialsToCore();
   }
 
-  if (envelope.method === 'model.listProfiles') {
+  /*
+   * 删自定义 provider 时把它的应用内凭据一并删掉。
+   *
+   * 以前只有 Core 侧的描述符被删，`credentials.bin` 里那把加密的 key 原样留着 ——
+   * 用户界面上再也看不到它，但它还在磁盘上；更糟的是重新添加一个同名 provider 会让它
+   * **悄悄复活**（profile 直接显示 credentialSource=APP 和旧 key 的末四位）。
+   * 一个删掉的东西不该在暗处留一份秘密。删不掉时如实报错，不假装删干净了。
+   */
+  if (method === 'model.removeProvider') {
+    const { providerId } = payload as { providerId: string };
+    const res = await callCore('model.removeProvider', payload);
+    if (!res.ok) return res;
+    try {
+      credentials.removeKey(providerId);
+    } catch (err) {
+      if (err instanceof credentials.CredentialStoreUnreadable) {
+        return {
+          ok: false,
+          error: {
+            code: 'CONFLICT',
+            message: `Provider 已删除，但它的应用内凭据没能一并删掉：${err.message}`,
+            detail: err.detail,
+          },
+        };
+      }
+      throw err;
+    }
+    // Core 内存里也要同步移除，否则这一代 Core 仍持有那把 key。
+    const synced = await syncCredentialsToCore();
+    return synced.ok ? res : synced;
+  }
+
+  if (method === 'model.listProfiles') {
     const res = await callCore('model.listProfiles', {});
     if (res.ok) {
+      // 凭据文件只有 Main 碰得到，所以可读性也只能由 Main 回答。
       return {
         ok: true,
-        data: { ...(res.data as object), secureStorage: credentials.isAvailable() },
+        data: {
+          ...(res.data as object),
+          secureStorage: credentials.isAvailable(),
+          credentialStore: credentials.state(),
+          credentialStoreDetail: credentials.stateDetail(),
+        },
       };
     }
     return res;
   }
 
-  return callCore(envelope.method, envelope.payload ?? {});
-});
+  return callCore(method, payload);
+}
 
 /** 把解密后的凭据推进 Core 内存。启动时和每次改动后各调一次。 */
 async function syncCredentialsToCore(): Promise<IpcResult<unknown>> {
@@ -365,11 +437,7 @@ function createWindow(): void {
   // Core 的 ready 推送可能早于 Renderer 订阅完成。事件是"推"的，不能指望
   // 订阅方一定在场 —— 所以每次 Renderer 加载完成后补发一次当前状态。
   mainWindow.webContents.on('did-finish-load', () => {
-    pushToRenderer({
-      type: 'core.status',
-      status: coreReady ? 'READY' : core ? 'RESTARTING' : 'DOWN',
-      detail: coreReady ? 'Agent Core 已就绪' : 'Agent Core 尚未就绪',
-    });
+    pushToRenderer({ type: 'core.status', ...coreStatusSnapshot() });
   });
 
   const devUrl = process.env.ELECTRON_RENDERER_URL;
@@ -381,11 +449,16 @@ function createWindow(): void {
 }
 
 /**
- * 自检模式：`REPOPILOT_SELFTEST=1 npx electron .`
+ * 自检模式：`pnpm selftest`（内部即 `REPOPILOT_SELFTEST=1 npx electron .`）。
  *
  * 走**完全相同**的 Main → Core 通道跑几个只读方法，打印结果后退出。
  * 用途是拿到"三个进程真的起来了、私有 IPC 真的通了"的确定性证据，
  * 而不是靠"启动没报错"来推断。
+ *
+ * 隔离约定（Slice C）：自检**必须**运行在一次性 data root 下。它会创建 credential、
+ * project、snapshot、run，还会启动 retention 清扫 —— 对着真实用户目录做这些事，
+ * 等于用你的数据来验证代码。`prepareSelfTestRoot()` 在 Core 启动前设置
+ * `REPOPILOT_DATA_ROOT`，`finishSelfTest()` 在任何退出路径上都会清掉它。
  */
 async function selfTest(): Promise<void> {
   const started = Date.now();
@@ -441,7 +514,8 @@ async function selfTest(): Promise<void> {
   }
 
   // 可选：对一个真实仓库跑导入，验证成功/阻断都返回**明确终态**而不是永远挂起
-  const probeRepo = process.env.REPOPILOT_SELFTEST_REPO;
+  // （只读宿主仓库，但会在受管根下产生 snapshot，所以同样要求隔离）
+  const probeRepo = isIsolatedDataRoot() ? process.env.REPOPILOT_SELFTEST_REPO : undefined;
   if (probeRepo) {
     const reg = await callCore('__project.register', { hostPath: probeRepo });
     if (!reg.ok) {
@@ -508,6 +582,7 @@ async function selfTest(): Promise<void> {
             const read = await callCore('files.read', {
               snapshotId: lastSnapshotId,
               path: first.path,
+              expectedGeneration: null,
             });
             if (!read.ok) {
               console.error(`[selftest] FAIL files.read → ${JSON.stringify(read.error)}`);
@@ -522,6 +597,7 @@ async function selfTest(): Promise<void> {
           const escape = await callCore('files.read', {
             snapshotId: lastSnapshotId,
             path: '../../../../etc/passwd',
+            expectedGeneration: null,
           });
           if (escape.ok) {
             console.error('[selftest] FAIL 路径逃逸竟然被允许');
@@ -534,8 +610,26 @@ async function selfTest(): Promise<void> {
     }
   }
 
+  /*
+   * 两道前置闸门，缺一不可：
+   *   隔离  —— 没隔离就绝不写凭据 / profile / Run，宁可整段 SKIP；
+   *   钥匙串 —— 不可用时明确 BLOCKED，而不是让 encryptString 抛出未处理 rejection
+   *             并把整个自检挂住（阶段审计 P2-5 记的就是这条）。
+   */
+  const isolated = isIsolatedDataRoot();
+  const secureStorageAvailable = credentials.isAvailable();
+  if (!isolated) {
+    console.error('[selftest] BLOCKED 未运行在隔离 data root 下，跳过所有写入型用例');
+    failures += 1;
+  } else if (!secureStorageAvailable) {
+    console.log(
+      '[selftest] SKIP 凭据、profile 与重启恢复用例：本机 safeStorage 不可用' +
+        `（凭据文件位置 ${credentials.storagePath()}）。这不是失败，是环境不具备。`,
+    );
+  }
+
   // 凭据与 profile 配置：走与 UI 完全相同的路径，最后清理掉写入的测试值
-  {
+  if (isolated && secureStorageAvailable) {
     const before = credentials.getAll().anthropic;
     const show = async (label: string): Promise<Record<string, unknown> | null> => {
       const r = await callCore('model.listProfiles', {});
@@ -639,7 +733,7 @@ async function selfTest(): Promise<void> {
   }
 
   // 重启恢复：造一个真实 Run → 杀 Core → 确认新实例能把它读回来
-  {
+  if (isolated && secureStorageAvailable) {
     /*
      * 造一个真实的、跑到一半的 Run，然后在它非终态时杀掉 Core。
      *
@@ -813,6 +907,16 @@ async function selfTest(): Promise<void> {
       console.error(`[selftest] FAIL renderer 白屏或 bridge 缺失 ${JSON.stringify(mounted)}`);
       failures += 1;
     }
+
+    /*
+     * 渲染层取证：计算样式 + 真实几何 + prefers-reduced-motion 媒体模拟。
+     * 这一段拿到的是单测拿不到的东西 —— jsdom 不应用外部样式表、也没有布局，
+     * 所以"CSS 真的生效了""容器真的能滚""减少动效真的关掉了运动"只能在这里证明。
+     */
+    const probe = await probeRenderedStyles(mainWindow!.webContents);
+    for (const pass of probe.passes) console.log(`[selftest] PASS 渲染层 · ${pass}`);
+    for (const failure of probe.failures) console.error(`[selftest] FAIL 渲染层 · ${failure}`);
+    failures += probe.failures.length;
   } else {
     console.error('[selftest] FAIL renderer 未能完成加载');
     failures += 1;
@@ -824,13 +928,107 @@ async function selfTest(): Promise<void> {
   app.exit(failures === 0 ? 0 : 1);
 }
 
-app.whenReady().then(() => {
-  startCore();
+// ---------------------------------------------------------------------------
+// 自检的数据隔离
+// ---------------------------------------------------------------------------
 
-  if (process.env.REPOPILOT_SELFTEST === '1') {
-    void selfTest();
+/** 本次自检自己创建的一次性根；用户显式指定 data root 时为 null（不由我们删）。 */
+let selfTestOwnedRoot: string | null = null;
+
+/**
+ * 在 Core 启动**之前**准备隔离根。
+ *
+ * 时机是硬要求：`core/paths.ts` 与 `main/credentials.ts` 都在模块加载时就把
+ * DATA_ROOT 定下来了，Core 又是带着 `process.env` 快照 fork 出去的。晚一步设置，
+ * 隔离就只在 Main 生效，Core 仍然写你的真实目录。
+ */
+function prepareSelfTestRoot(): void {
+  if (process.env[DATA_ROOT_ENV]?.trim()) {
+    console.log(`[selftest] 使用调用方指定的隔离 data root：${resolveDataRoot()}`);
     return;
   }
+  selfTestOwnedRoot = mkdtempSync(join(tmpdir(), 'repopilot-selftest-'));
+  process.env[DATA_ROOT_ENV] = selfTestOwnedRoot;
+  console.log(`[selftest] 已创建一次性 data root：${selfTestOwnedRoot}`);
+}
+
+/**
+ * 收尾：先证明"没留下东西"，再删掉一次性根。
+ *
+ * 顺序不能反 —— 先删再数，数出来永远是零，那种"清理干净"是自证的。
+ */
+function reportSelfTestResidue(): number {
+  const root = resolveDataRoot();
+  if (!existsSync(root)) {
+    console.log('[selftest] PASS 种子数据为零：data root 不存在');
+    return 0;
+  }
+  const counts = ['runs', 'workspaces', 'snapshots', 'artifacts'].map((name) => {
+    const dir = join(root, name);
+    return { name, entries: existsSync(dir) ? readdirSync(dir).length : 0 };
+  });
+  const credentialFile = credentials.storagePath();
+  const leakedCredentials = existsSync(credentialFile) && !credentialFile.startsWith(root);
+  const seeded = counts.reduce((sum, c) => sum + c.entries, 0);
+
+  console.log(
+    `[selftest] 隔离根内种子数据：${counts.map((c) => `${c.name}=${c.entries}`).join(' ')}` +
+      ` · credentials=${credentialFile.startsWith(root) ? '隔离内' : '隔离外（异常）'}`,
+  );
+  if (leakedCredentials) {
+    console.error(`[selftest] FAIL 凭据文件落在隔离根之外：${credentialFile}`);
+    return 1;
+  }
+  // 种子数据本身不是失败 —— 它证明自检真的跑通了闭环；随一次性根一起删掉即可。
+  if (seeded > 0 && selfTestOwnedRoot === null) {
+    console.log('[selftest] 注意：data root 由调用方指定，种子数据保留在那里，不由自检删除');
+  }
+  return 0;
+}
+
+function cleanupSelfTestRoot(): void {
+  if (!selfTestOwnedRoot) return;
+  try {
+    rmSync(selfTestOwnedRoot, { recursive: true, force: true });
+    console.log(`[selftest] 已删除一次性 data root：${selfTestOwnedRoot}`);
+  } catch (err) {
+    console.error(`[selftest] 一次性 data root 删除失败：${(err as Error).message}`);
+  }
+  selfTestOwnedRoot = null;
+}
+
+/**
+ * 自检的唯一入口。
+ *
+ * `try/finally` 包住全部流程：无论 selfTest 正常结束、抛异常、还是在中途
+ * `app.exit()`，一次性根都必须被删掉。此前没有这层包裹，任何一条异常路径
+ * 都会把种子数据永久留在磁盘上。
+ */
+async function runSelfTestIsolated(): Promise<void> {
+  try {
+    await selfTest();
+  } catch (err) {
+    console.error(`[selftest] FAIL 自检抛出未处理异常：${(err as Error).stack ?? String(err)}`);
+    quitting = true;
+    core?.kill();
+    app.exit(1);
+  } finally {
+    const residueFailures = reportSelfTestResidue();
+    cleanupSelfTestRoot();
+    if (residueFailures > 0) app.exit(1);
+  }
+}
+
+app.whenReady().then(() => {
+  if (process.env.REPOPILOT_SELFTEST === '1') {
+    // 必须先隔离，再启动 Core —— Core 的 DATA_ROOT 在它自己的模块加载时就冻结了。
+    prepareSelfTestRoot();
+    startCore();
+    void runSelfTestIsolated();
+    return;
+  }
+
+  startCore();
 
   createWindow();
 

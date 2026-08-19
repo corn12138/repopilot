@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type {
   ApprovalRequest,
   CrossReviewRecord,
@@ -22,6 +22,13 @@ import {
   RunStatusBadge,
   timeOf,
 } from '../components/common';
+import {
+  createLatestRequestGuard,
+  OWNED_ASYNC_IDLE,
+  type LatestRequestGuard,
+  type OwnedAsyncState,
+} from '../ownedAsync';
+import type { ApprovalActionController } from '../useApprovalAction';
 import { Transcript } from './Transcript';
 
 export function RunDetail({
@@ -32,6 +39,7 @@ export function RunDetail({
   plan,
   patch,
   verifications,
+  approvalAction,
   onError,
   onRefresh,
 }: {
@@ -42,38 +50,84 @@ export function RunDetail({
   plan: PlanRevision | null;
   patch: PatchArtifact | null;
   verifications: VerificationRun[];
+  approvalAction: ApprovalActionController;
   onError: (err: unknown) => void;
   onRefresh: () => void;
 }) {
   const [showRaw, setShowRaw] = useState(false);
   const active = !TERMINAL_RUN_STATUSES.includes(run.status);
 
-  // 交叉审核记录随 Run 状态变化拉取（进行中会从 CROSS_REVIEWING 变到终态）
-  const [crossReview, setCrossReview] = useState<CrossReviewRecord | null>(null);
+  const crossReviewRequestsRef = useRef<LatestRequestGuard<string> | null>(null);
+  if (crossReviewRequestsRef.current === null) {
+    crossReviewRequestsRef.current = createLatestRequestGuard<string>();
+  }
+  const crossReviewRequests = crossReviewRequestsRef.current;
+  const [crossReviewState, setCrossReviewState] = useState<
+    OwnedAsyncState<string, CrossReviewRecord | null, string>
+  >(OWNED_ASYNC_IDLE);
+
+  // 交叉审核记录随 Run 状态变化拉取（进行中会从 CROSS_REVIEWING 变到终态）。
   useEffect(() => {
-    let alive = true;
+    const identity = crossReviewRequests.begin(run.runId);
+    setCrossReviewState({ status: 'loading', ...identity });
     void call('crossreview.get', { runId: run.runId })
       .then((r) => {
-        if (alive) setCrossReview(r.crossReview);
+        // runId 还不够：同一 Run 的较新状态刷新也必须压过旧请求，避免旧审核记录回流。
+        if (!crossReviewRequests.isLatest(identity)) return;
+        setCrossReviewState({ status: 'ready', ...identity, data: r.crossReview });
       })
-      .catch(() => {
-        /* 交叉审核记录拉取失败不该拖垮整个详情页 */
+      .catch((error: unknown) => {
+        if (!crossReviewRequests.isLatest(identity)) return;
+        setCrossReviewState({
+          status: 'error',
+          ...identity,
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
     return () => {
-      alive = false;
+      if (crossReviewRequests.isLatest(identity)) crossReviewRequests.invalidate();
     };
-  }, [run.runId, run.status]);
+  }, [crossReviewRequests, run.runId, run.status]);
+
+  // 渲染时再核对 owner，使 Run B 连一帧 Run A 的审核记录都不会接手。
+  const ownedCrossReviewState =
+    crossReviewState.status !== 'idle' && crossReviewState.ownerId === run.runId
+      ? crossReviewState
+      : null;
+  const crossReview =
+    ownedCrossReviewState?.status === 'ready' ? ownedCrossReviewState.data : null;
+  const crossReviewError =
+    ownedCrossReviewState?.status === 'error' ? ownedCrossReviewState.error : null;
+
+  /*
+   * 取消是一次有明确目标的危险动作，所以它的 busy 与失败必须留在按钮旁边，
+   * 而不是只飞到页面顶部的通用错误条里 —— 长页面下用户根本看不到那里发生了什么。
+   * 单航班：请求在途时不接受第二次点击，避免向同一个 Run 连发取消。
+   */
+  const [cancelState, setCancelState] = useState<
+    | { readonly status: 'idle' }
+    | { readonly status: 'pending' }
+    | { readonly status: 'failed'; readonly message: string }
+  >({ status: 'idle' });
 
   const cancel = async () => {
+    if (cancelState.status === 'pending') return;
+    setCancelState({ status: 'pending' });
     try {
       await call('run.cancel', { runId: run.runId, reason: '用户在 UI 中取消' });
+      setCancelState({ status: 'idle' });
     } catch (err) {
+      setCancelState({
+        status: 'failed',
+        message: err instanceof Error ? err.message : '取消请求失败',
+      });
       onError(err);
     }
   };
 
   return (
-    <>
+    // 入场只有 opacity + 4px transform，不改变任何布局事实；reduced-motion 下自动关闭。
+    <div className="rp-enter">
       <Card
         title="运行"
         hint={run.runId}
@@ -81,13 +135,29 @@ export function RunDetail({
           <div className="row">
             <button onClick={onRefresh}>刷新</button>
             {active && (
-              <button className="danger" onClick={() => void cancel()}>
-                取消
+              <button
+                className="danger"
+                disabled={cancelState.status === 'pending'}
+                aria-busy={cancelState.status === 'pending'}
+                onClick={() => void cancel()}
+              >
+                {cancelState.status === 'pending' ? '取消中…' : '取消'}
               </button>
             )}
           </div>
         }
       >
+        {cancelState.status === 'failed' && (
+          <div role="alert">
+            <Banner tone="err">
+              <strong>取消失败：{cancelState.message}</strong>
+              <div className="row" style={{ marginTop: 8 }}>
+                <button onClick={() => void cancel()}>重试取消</button>
+                <button onClick={() => setCancelState({ status: 'idle' })}>收起</button>
+              </div>
+            </Banner>
+          </div>
+        )}
         <div className="row wrap" style={{ marginBottom: 12 }}>
           <RunStatusBadge status={run.status} />
           {run.failureClass && <FailureClassBadge failureClass={run.failureClass} />}
@@ -162,7 +232,7 @@ export function RunDetail({
 
       {approvals.length > 0 && plan && run.status === 'AWAITING_PLAN_APPROVAL' && (
         <div id="plan-approval-card">
-          <PlanApproval approval={approvals[0]!} plan={plan} onError={onError} />
+          <PlanApproval approval={approvals[0]!} plan={plan} action={approvalAction} />
         </div>
       )}
 
@@ -170,15 +240,26 @@ export function RunDetail({
         <Banner tone="info">第二个模型正在只读交叉审核这个补丁…</Banner>
       )}
 
+      {crossReviewError && (
+        <Banner tone="err">交叉审核记录读取失败：{crossReviewError}</Banner>
+      )}
+
       {crossReview && <CrossReviewPanel record={crossReview} />}
 
       {crossReview && (
-        <CrossReviewContinueGate run={run} record={crossReview} onError={onError} />
+        <CrossReviewContinueGate
+          key={run.runId}
+          run={run}
+          record={crossReview}
+          onError={onError}
+        />
       )}
 
       {patch && (
         <div id="patch-review-card">
+          {/* patchId 是确认动作边界；A 的确认、busy、说明状态都不能进入 B。 */}
           <PatchReview
+            key={patch.patchId}
             patch={patch}
             canDecide={run.status === 'AWAITING_PATCH_REVIEW'}
             accepted={run.status === 'SUCCEEDED' || run.status === 'ACCEPTED_UNVERIFIED'}
@@ -216,7 +297,7 @@ export function RunDetail({
           <Transcript events={events} toolCalls={toolCalls} />
         )}
       </Card>
-    </>
+    </div>
   );
 }
 
@@ -252,30 +333,17 @@ function FailureClassBadge({ failureClass }: { failureClass: string }) {
 function PlanApproval({
   approval,
   plan,
-  onError,
+  action,
 }: {
   approval: ApprovalRequest;
   plan: PlanRevision;
-  onError: (err: unknown) => void;
+  action: ApprovalActionController;
 }) {
-  const [busy, setBusy] = useState(false);
-
-  const decide = async (decision: 'APPROVE' | 'REJECT') => {
-    setBusy(true);
-    try {
-      const r = await call('approval.decide', {
-        approvalId: approval.approvalId,
-        decision,
-        subjectDigest: approval.subjectDigest,
-        note: '',
-      });
-      if (!r.accepted) onError(new Error(r.reason ?? '审批未被接受'));
-    } catch (err) {
-      onError(err);
-    } finally {
-      setBusy(false);
-    }
-  };
+  const busy = action.isPending(approval.approvalId);
+  const pendingDecision = action.pending.find(
+    (item) => item.approvalId === approval.approvalId,
+  )?.decision;
+  const error = action.error?.approvalId === approval.approvalId ? action.error : null;
 
   return (
     <Card title="待审批计划" hint="批准后才允许产生副作用">
@@ -286,12 +354,12 @@ function PlanApproval({
           <li key={s.index} style={{ marginBottom: 6 }}>
             {s.intent}
             {s.targetPaths.length > 0 && (
-              <div style={{ color: 'var(--text-faint)', fontFamily: 'var(--mono)', fontSize: 11 }}>
+              <div style={{ color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
                 {s.targetPaths.join(', ')}
               </div>
             )}
             {s.expectedEffect && (
-              <div style={{ color: 'var(--text-dim)', fontSize: 11.5 }}>预期：{s.expectedEffect}</div>
+              <div style={{ color: 'var(--text-secondary)', fontSize: 11.5 }}>预期：{s.expectedEffect}</div>
             )}
           </li>
         ))}
@@ -299,7 +367,7 @@ function PlanApproval({
 
       {plan.risks.length > 0 && (
         <>
-          <div style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>风险</div>
+          <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>风险</div>
           <ul className="plain">
             {plan.risks.map((r, i) => (
               <li key={i}>{r}</li>
@@ -308,16 +376,37 @@ function PlanApproval({
         </>
       )}
 
+      {error && (
+        <div role="alert" style={{ marginTop: 12 }}>
+          <Banner tone="err">
+            <strong>{error.message}</strong>
+            {error.detail && <div style={{ marginTop: 4 }}>{error.detail}</div>}
+            <div className="row" style={{ marginTop: 8 }}>
+              <button onClick={() => void action.retry()}>重试这次决定</button>
+              <button onClick={action.clearError}>收起</button>
+            </div>
+          </Banner>
+        </div>
+      )}
+
       <div className="row" style={{ marginTop: 14 }}>
-        <span style={{ fontFamily: 'var(--mono)', fontSize: 10.5, color: 'var(--text-faint)' }}>
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5, color: 'var(--text-tertiary)' }}>
           plan digest {plan.digest.slice(7, 27)}…
         </span>
         <span className="spacer" />
-        <button className="danger" disabled={busy} onClick={() => void decide('REJECT')}>
-          拒绝
+        <button
+          className="danger"
+          disabled={busy}
+          onClick={() => void action.decide(approval, 'REJECT')}
+        >
+          {pendingDecision === 'REJECT' ? '拒绝中…' : '拒绝'}
         </button>
-        <button className="primary" disabled={busy} onClick={() => void decide('APPROVE')}>
-          批准并执行
+        <button
+          className="primary"
+          disabled={busy}
+          onClick={() => void action.decide(approval, 'APPROVE')}
+        >
+          {pendingDecision === 'APPROVE' ? '批准中…' : '批准并执行'}
         </button>
       </div>
     </Card>
@@ -441,13 +530,13 @@ function PatchReview({
             <Badge tone={f.changeKind === 'ADDED' ? 'info' : 'default'}>{f.changeKind}</Badge>
             <code>{f.path}</code>
             <span className="spacer" style={{ flex: 1 }} />
-            <span style={{ color: 'var(--ok)', fontSize: 11 }}>+{f.addedLines}</span>
-            <span style={{ color: 'var(--err)', fontSize: 11 }}>-{f.removedLines}</span>
+            <span style={{ color: 'var(--state-verified-fg)', fontSize: 11 }}>+{f.addedLines}</span>
+            <span style={{ color: 'var(--state-failed-fg)', fontSize: 11 }}>-{f.removedLines}</span>
           </summary>
           <div className="body">
             <DiffView diff={f.diff} />
             {f.diffTruncated && (
-              <div style={{ color: 'var(--warn)', fontSize: 11, marginTop: 4 }}>diff 已截断</div>
+              <div style={{ color: 'var(--state-warning-fg)', fontSize: 11, marginTop: 4 }}>diff 已截断</div>
             )}
           </div>
         </details>
@@ -457,7 +546,7 @@ function PatchReview({
         <details className="toolcall" style={{ marginTop: 10 }}>
           <summary>
             <Badge tone="warn">已排除</Badge>
-            <span style={{ color: 'var(--text-dim)' }}>
+            <span style={{ color: 'var(--text-secondary)' }}>
               {patch.excludedGeneratedFiles.length} 个由验证命令生成的文件未纳入补丁
             </span>
           </summary>
@@ -468,7 +557,7 @@ function PatchReview({
       )}
 
       <div style={{ marginTop: 14 }}>
-        <div style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>未验证项（接受前请确认）</div>
+        <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>未验证项（接受前请确认）</div>
         <ul className="plain">
           {patch.unverifiedItems.map((u, i) => (
             <li key={i}>{u}</li>
@@ -483,7 +572,7 @@ function PatchReview({
             <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="可选" />
           </div>
           <div className="row">
-            <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
               接受只是记录你的判断；补丁要不要落到仓库，接受之后再单独决定。
             </span>
             <span className="spacer" />
@@ -501,10 +590,10 @@ function PatchReview({
       )}
 
       {salvage && (
-        <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid var(--border)' }}>
+        <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid var(--border-hairline)' }}>
           <div className="row" style={{ marginBottom: 10 }}>
             <strong style={{ fontSize: 12.5 }}>挽救导出</strong>
-            <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+            <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
               没有「应用到仓库」—— 那条路只对被接受的补丁开放
             </span>
             <span className="spacer" />
@@ -517,14 +606,14 @@ function PatchReview({
           </div>
           {exportMsg && (
             <Banner tone={exportMsg.ok ? 'info' : 'err'}>
-              <span style={{ fontFamily: 'var(--mono)', fontSize: 11.5 }}>{exportMsg.text}</span>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5 }}>{exportMsg.text}</span>
             </Banner>
           )}
         </div>
       )}
 
       {accepted && (
-        <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid var(--border)' }}>
+        <div style={{ marginTop: 16, paddingTop: 14, borderTop: '1px solid var(--border-hairline)' }}>
           <div className="row" style={{ marginBottom: 10 }}>
             <strong style={{ fontSize: 12.5 }}>交付</strong>
             <span className="spacer" />
@@ -561,7 +650,7 @@ function PatchReview({
                   margin: 0,
                   whiteSpace: 'pre-wrap',
                   font: 'inherit',
-                  fontFamily: exportMsg.ok ? 'inherit' : 'var(--mono)',
+                  fontFamily: exportMsg.ok ? 'inherit' : 'var(--font-mono)',
                   fontSize: exportMsg.ok ? 12.5 : 11,
                 }}
               >
@@ -656,7 +745,7 @@ function CrossReviewContinueGate({
         )}
       </Banner>
       <div className="row" style={{ marginTop: 10 }}>
-        <span style={{ fontSize: 11, color: 'var(--text-faint)' }}>
+        <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
           累计：{record.reviewerInvocations} 轮审核 · {record.remediations} 次整改
           {continuations > 0 ? ` · 用户续期 ${continuations} 次` : ''}（计数只增不清）
         </span>
@@ -699,7 +788,7 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
       </dl>
 
       {findings.length === 0 ? (
-        <p style={{ color: 'var(--text-dim)', marginTop: 10 }}>审核方没有提出发现。</p>
+        <p style={{ color: 'var(--text-secondary)', marginTop: 10 }}>审核方没有提出发现。</p>
       ) : (
         record.rounds.map((round) => (
           <div key={round.round} style={{ marginTop: 10 }}>
@@ -715,22 +804,22 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
                 <summary>
                   <Badge tone={SEVERITY_TONE[f.severity]}>{f.severity}</Badge>
                   {f.blocking && <Badge tone="err">阻断</Badge>}
-                  <code style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>
+                  <code style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
                     {f.file ?? '（无具体文件）'}
                     {f.range ? `:${f.range[0]}-${f.range[1]}` : ''}
                   </code>
                   <span className="spacer" style={{ flex: 1 }} />
-                  <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
+                  <span style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>
                     信心 {(f.confidence * 100).toFixed(0)}%
                   </span>
                 </summary>
                 <div className="body">
                   <p style={{ margin: '6px 0' }}>{f.evidence}</p>
                   {f.reproduction && (
-                    <p style={{ margin: '6px 0', color: 'var(--text-dim)' }}>复现：{f.reproduction}</p>
+                    <p style={{ margin: '6px 0', color: 'var(--text-secondary)' }}>复现：{f.reproduction}</p>
                   )}
                   {f.suggestedRemediation && (
-                    <p style={{ margin: '6px 0', color: 'var(--text-dim)' }}>
+                    <p style={{ margin: '6px 0', color: 'var(--text-secondary)' }}>
                       建议：{f.suggestedRemediation}
                     </p>
                   )}
@@ -738,7 +827,7 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
               </details>
             ))}
             {round.findings.length === 0 && multiRound && (
-              <p style={{ color: 'var(--text-dim)', margin: '4px 2px' }}>本轮没有发现。</p>
+              <p style={{ color: 'var(--text-secondary)', margin: '4px 2px' }}>本轮没有发现。</p>
             )}
           </div>
         ))
@@ -755,19 +844,19 @@ function VerificationPanel({ verifications }: { verifications: VerificationRun[]
           <summary>
             <Badge tone={v.phase === 'BASELINE' ? 'default' : 'info'}>{v.phase}</Badge>
             <Badge tone={v.passed ? 'ok' : 'err'}>{v.passed ? 'PASSED' : 'FAILED'}</Badge>
-            <span style={{ color: 'var(--text-dim)' }}>gen-{v.generation}</span>
+            <span style={{ color: 'var(--text-secondary)' }}>gen-{v.generation}</span>
             <span className="spacer" style={{ flex: 1 }} />
-            <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>{timeOf(v.startedAt)}</span>
+            <span style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>{timeOf(v.startedAt)}</span>
           </summary>
           <div className="body">
             {v.commands.map((c, i) => (
               <div key={i} style={{ marginBottom: 10 }}>
                 <div className="row" style={{ marginBottom: 4 }}>
                   <Badge tone={c.outcome === 'EXIT_ZERO' ? 'ok' : 'err'}>{c.outcome}</Badge>
-                  <code style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>
+                  <code style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
                     {c.argv.join(' ') || c.commandId}
                   </code>
-                  <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>
+                  <span style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>
                     exit={c.exitCode ?? 'null'} · {c.durationMs}ms
                   </span>
                 </div>

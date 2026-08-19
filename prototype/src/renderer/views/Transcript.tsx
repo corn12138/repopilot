@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { CommandOutcome, RunEvent, ToolCallView } from '@shared/domain';
 import { Badge, DiffView, RiskBadge, timeOf } from '../components/common';
 
@@ -35,6 +35,49 @@ type Item =
       children: Item[];
     };
 
+/**
+ * 一类没有在时间线上单独成行的事件。
+ *
+ * 分两级，因为它们对用户的意义不同：
+ *   omitted —— 这条事件的信息在这个视图里看不到；
+ *   merged  —— 事件本身没占一行，但它的内容已经体现在别的行/卡片上。
+ *
+ * 两级都要报数（不变式：任何截断、过滤、排除都显示数量和原因），但只有 omitted
+ * 进主标题。否则每个 Run 都会挂上几十条 TOOL_CALL_RESOLVED 的"省略"提示，
+ * 用户很快学会无视这块区域 —— 那时报数就等于没报。
+ *
+ * `recoverable` 再区分「折叠了，展开就能看」和「投影里根本没有正文」。
+ */
+interface Omission {
+  readonly key: string;
+  readonly count: number;
+  readonly reason: string;
+  readonly recoverable: boolean;
+  readonly level: 'omitted' | 'merged';
+}
+
+interface Projection {
+  readonly items: Item[];
+  readonly omissions: Omission[];
+}
+
+/** 常规阶段流转：默认折叠，因为它们不需要用户做任何决定。 */
+const ROUTINE_STATUS = new Set(['PLANNING', 'EXECUTING', 'VERIFYING']);
+
+/**
+ * 这些事件不单独成行，但内容在同一个 Run 视图里有归宿：
+ * 工具调用的解析结果画在那一行的徽标与预览上，审批在审批卡与停靠条上，
+ * 验证开始由验证结束那一行代表，交叉审核由 CrossReviewPanel 呈现。
+ */
+const MERGED_KINDS = new Set<string>([
+  'TOOL_CALL_RESOLVED',
+  'TOOL_CALL_APPROVAL_REQUIRED',
+  'VERIFICATION_STARTED',
+  'CROSS_REVIEW_STARTED',
+  'CROSS_REVIEW_ROUND',
+  'CROSS_REVIEW_FINISHED',
+]);
+
 export function Transcript({
   events,
   toolCalls,
@@ -42,9 +85,13 @@ export function Transcript({
   events: readonly RunEvent[];
   toolCalls: readonly ToolCallView[];
 }) {
-  const items = useMemo(() => build(events, toolCalls), [events, toolCalls]);
+  const [showRoutine, setShowRoutine] = useState(false);
+  const { items, omissions } = useMemo(
+    () => build(events, toolCalls, showRoutine),
+    [events, toolCalls, showRoutine],
+  );
 
-  if (items.length === 0) {
+  if (items.length === 0 && omissions.length === 0) {
     return <div className="empty">还没有内容。任务开始后这里会实时出现。</div>;
   }
 
@@ -53,16 +100,93 @@ export function Transcript({
       {items.map((item) => (
         <Row key={`${item.kind}-${item.seq}`} item={item} />
       ))}
+      <OmissionNotice
+        omissions={omissions}
+        expanded={showRoutine}
+        onToggle={() => setShowRoutine((v) => !v)}
+      />
     </div>
   );
 }
 
-function build(events: readonly RunEvent[], toolCalls: readonly ToolCallView[]): Item[] {
+/**
+ * 省略披露。
+ *
+ * 刻意放在时间线末尾而不是折叠进某一行：用户需要在读完之后仍然知道
+ * 「我没看到的是哪些、有多少、为什么」，而不是靠发现某个小三角才知道有东西被藏了。
+ */
+function OmissionNotice({
+  omissions,
+  expanded,
+  onToggle,
+}: {
+  omissions: readonly Omission[];
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const omitted = omissions.filter((o) => o.level === 'omitted');
+  const merged = omissions.filter((o) => o.level === 'merged');
+  const omittedTotal = omitted.reduce((sum, o) => sum + o.count, 0);
+  const mergedTotal = merged.reduce((sum, o) => sum + o.count, 0);
+  const recoverable = omitted.filter((o) => o.recoverable).reduce((sum, o) => sum + o.count, 0);
+  // 展开后仍要留住入口，否则用户没法把噪音收回去。
+  if (omittedTotal === 0 && mergedTotal === 0 && !expanded) return null;
+
+  return (
+    <div className="transcript-omissions">
+      <div className="transcript-omissions-head">
+        <span>
+          {omittedTotal > 0
+            ? `时间线省略了 ${omittedTotal} 条事件`
+            : expanded
+              ? '常规阶段流转已全部展开'
+              : '没有事件被省略'}
+        </span>
+        <span className="spacer" />
+        {(recoverable > 0 || expanded) && (
+          <button className="linklike" onClick={onToggle} aria-pressed={expanded}>
+            {expanded ? '重新折叠常规阶段流转' : `展开这 ${recoverable} 条`}
+          </button>
+        )}
+      </div>
+      {omitted.length > 0 && (
+        <ul className="transcript-omissions-list">
+          {omitted.map((o) => (
+            <li key={o.key}>
+              {o.count} 条 · {o.reason}
+              {!o.recoverable && <span className="transcript-omissions-hard">（正文不可恢复）</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {mergedTotal > 0 && (
+        <div className="transcript-omissions-merged">
+          另有 {mergedTotal} 条事件没有单独成行，但内容已并入对应的行或卡片：
+          {merged.map((o) => o.reason).join('；')}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function build(
+  events: readonly RunEvent[],
+  toolCalls: readonly ToolCallView[],
+  includeRoutineStatus: boolean,
+): Projection {
   const byId = new Map(toolCalls.map((t) => [t.toolCallId, t]));
   const items: Item[] = [];
   const seenTool = new Set<string>();
   let currentTurn: Extract<Item, { kind: 'turn' }> | null = null;
   let turnIndex = 0;
+
+  // 省略计数：每一个 `break` 掉的事件都必须落到某个计数器里，不允许静默丢弃。
+  let routineStatus = 0;
+  let unmatchedTool = 0;
+  let duplicateTool = 0;
+  let malformedVerification = 0;
+  const unprojectedKinds = new Map<string, number>();
+  const mergedKinds = new Map<string, number>();
 
   for (const e of events) {
     switch (e.kind) {
@@ -111,7 +235,15 @@ function build(events: readonly RunEvent[], toolCalls: readonly ToolCallView[]):
       case 'TOOL_CALL_PROPOSED': {
         const id = String(e.payload.toolCallId ?? '');
         const call = byId.get(id);
-        if (!call || seenTool.has(id)) break;
+        if (seenTool.has(id)) {
+          duplicateTool += 1;
+          break;
+        }
+        if (!call) {
+          // 事件是真的，只是 ToolCallView 还没回填或已随进程结束丢失。
+          unmatchedTool += 1;
+          break;
+        }
         seenTool.add(id);
         const toolItem: Item =
           call.toolName === 'run_command'
@@ -126,7 +258,10 @@ function build(events: readonly RunEvent[], toolCalls: readonly ToolCallView[]):
         const v = e.payload.verification as
           | { phase: string; passed: boolean; commands: CommandOutcome[] }
           | undefined;
-        if (!v) break;
+        if (!v) {
+          malformedVerification += 1;
+          break;
+        }
         items.push({
           kind: 'verify',
           seq: e.seq,
@@ -163,7 +298,11 @@ function build(events: readonly RunEvent[], toolCalls: readonly ToolCallView[]):
 
       case 'STATUS_CHANGED': {
         const to = String(e.payload.to ?? '');
-        if (to === 'PLANNING' || to === 'EXECUTING' || to === 'VERIFYING') break; // 噪音
+        // 常规阶段流转默认折叠，但必须报数 —— 折叠不等于可以假装它不存在。
+        if (ROUTINE_STATUS.has(to) && !includeRoutineStatus) {
+          routineStatus += 1;
+          break;
+        }
         items.push({
           kind: 'status',
           seq: e.seq,
@@ -182,11 +321,87 @@ function build(events: readonly RunEvent[], toolCalls: readonly ToolCallView[]):
       }
 
       default:
+        /*
+         * 时间线只投影了一部分事件种类。哪一类都要落账，但要分清
+         * 「内容在别的行上」和「这个视图里真的看不到」——把两者混成一句
+         * "省略了 N 条"，等于每个 Run 都拉响一次不需要处理的警报。
+         */
+        if (MERGED_KINDS.has(e.kind)) {
+          mergedKinds.set(e.kind, (mergedKinds.get(e.kind) ?? 0) + 1);
+        } else {
+          unprojectedKinds.set(e.kind, (unprojectedKinds.get(e.kind) ?? 0) + 1);
+        }
         break;
     }
   }
 
-  return items;
+  const omissions: Omission[] = [];
+  if (routineStatus > 0) {
+    omissions.push({
+      key: 'routine-status',
+      count: routineStatus,
+      reason: '常规阶段流转（PLANNING / EXECUTING / VERIFYING），默认折叠以突出需要你决定的事件',
+      recoverable: true,
+      level: 'omitted',
+    });
+  }
+  if (unmatchedTool > 0) {
+    omissions.push({
+      key: 'unmatched-tool',
+      count: unmatchedTool,
+      reason: '工具调用事件存在，但对应的调用详情尚未回填或已随进程结束丢失',
+      recoverable: false,
+      level: 'omitted',
+    });
+  }
+  if (duplicateTool > 0) {
+    omissions.push({
+      key: 'duplicate-tool',
+      count: duplicateTool,
+      reason: '同一次工具调用的重复事件引用，只保留首次出现的位置',
+      recoverable: false,
+      level: 'omitted',
+    });
+  }
+  if (malformedVerification > 0) {
+    omissions.push({
+      key: 'malformed-verification',
+      count: malformedVerification,
+      reason: '验证完成事件缺少 verification 正文，无法确定阶段与命令结果',
+      recoverable: false,
+      level: 'omitted',
+    });
+  }
+  if (unprojectedKinds.size > 0) {
+    const kinds = countedKinds(unprojectedKinds);
+    omissions.push({
+      key: 'unprojected-kinds',
+      count: kinds.total,
+      reason: `未投影到时间线、且这个视图里没有其他呈现的事件种类：${kinds.text}`,
+      recoverable: false,
+      level: 'omitted',
+    });
+  }
+  if (mergedKinds.size > 0) {
+    const kinds = countedKinds(mergedKinds);
+    omissions.push({
+      key: 'merged-kinds',
+      count: kinds.total,
+      reason: kinds.text,
+      recoverable: false,
+      level: 'merged',
+    });
+  }
+
+  return { items, omissions };
+}
+
+function countedKinds(counts: Map<string, number>): { total: number; text: string } {
+  const sorted = [...counts.entries()].sort(([a], [b]) => a.localeCompare(b));
+  return {
+    total: sorted.reduce((sum, [, count]) => sum + count, 0),
+    text: sorted.map(([kind, count]) => `${kind}×${count}`).join('、'),
+  };
 }
 
 function Row({ item }: { item: Item }) {
@@ -214,7 +429,7 @@ function Row({ item }: { item: Item }) {
               ))}
             </ol>
             {item.risks.length > 0 && (
-              <div style={{ color: 'var(--warn)', fontSize: 11.5, marginTop: 6 }}>
+              <div style={{ color: 'var(--state-warning-fg)', fontSize: 11.5, marginTop: 6 }}>
                 风险：{item.risks.join('；')}
               </div>
             )}
@@ -320,6 +535,30 @@ function TerminalBlock({ call, at }: { call: ToolCallView; at: string }) {
       ) : (
         <pre className="term-body dim">{call.resolution ? '（无输出）' : '执行中…'}</pre>
       )}
+      <PreviewFooter call={call} />
+    </div>
+  );
+}
+
+/**
+ * 预览截断的如实交代。
+ *
+ * 之前只在 ToolBlock 里显示 artifactRef，而 `previewTruncated` 从来没有出现在界面上 ——
+ * 于是「这就是全部输出」和「这是被砍过的开头」看起来一模一样。命令输出尤其危险：
+ * 用户会据此判断构建到底失败在哪一步。
+ */
+function PreviewFooter({ call }: { call: ToolCallView }) {
+  if (!call.previewTruncated && !call.artifactRef) return null;
+  return (
+    <div className="preview-footer">
+      {call.previewTruncated && <span>上面只是预览，正文已被截断。</span>}
+      {call.artifactRef ? (
+        <span>
+          完整输出见 artifact <code>{call.artifactRef}</code>
+        </span>
+      ) : (
+        call.previewTruncated && <span>这次调用没有封存完整 artifact，被截掉的部分无法找回。</span>
+      )}
     </div>
   );
 }
@@ -349,7 +588,7 @@ function ToolBlock({ call, at }: { call: ToolCallView; at: string }) {
       <summary>
         <RiskBadge risk={call.risk} />
         <code>{call.toolName}</code>
-        <span style={{ color: 'var(--text-dim)' }}>{call.argsSummary}</span>
+        <span style={{ color: 'var(--text-secondary)' }}>{call.argsSummary}</span>
         <span className="spacer" />
         {call.durationMs !== null && <span className="msg-time">{call.durationMs}ms</span>}
         <Badge tone={call.resolution === 'SUCCEEDED' ? 'ok' : failed ? 'err' : 'info'}>
@@ -365,11 +604,7 @@ function ToolBlock({ call, at }: { call: ToolCallView; at: string }) {
           ) : (
             <pre className="term-body">{call.preview}</pre>
           ))}
-        {call.artifactRef && (
-          <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginTop: 4 }}>
-            完整输出 artifact {call.artifactRef}
-          </div>
-        )}
+        <PreviewFooter call={call} />
       </div>
     </details>
   );

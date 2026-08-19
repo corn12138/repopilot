@@ -48,9 +48,10 @@ import {
   runReviewPass,
   type AgentDeps,
   type ReviewPassRunner,
+  type ExternalAuthorRunner,
 } from './agent';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
-import { DEFAULT_MUTATION_POLICY } from './mutation';
+import { DEFAULT_MUTATION_POLICY, type MutationPolicy } from './mutation';
 import { applyPatchWithGit, sealPatch } from './patch';
 import {
   type ImportOptions,
@@ -71,6 +72,8 @@ import {
   type ExternalConnectorProfile,
   type ExternalVendor,
 } from './external/connector';
+import { runExternalCliAuthor } from './external/author';
+import { applyCandidate } from './external/normalize';
 import { EventStore, readJson, writeJsonAtomic } from './store';
 import {
   RUN_STATE_SCHEMA_VERSION,
@@ -82,6 +85,7 @@ import {
   type LiveReferences,
   type PurgeSummary,
   type RetentionPolicy,
+  clampPolicy,
   diskUsage,
   loadLastSummary,
   loadPolicy,
@@ -131,6 +135,8 @@ export class PausableDeadline {
   private remaining: number;
   private startedAt = 0;
   private done = false;
+  /** 已经"真正在跑"的毫秒数：暂停期间不计入。是墙钟预算的唯一口径来源。 */
+  private consumed = 0;
 
   constructor(
     totalMs: number,
@@ -144,6 +150,7 @@ export class PausableDeadline {
     if (this.done || this.handle) return;
     this.startedAt = Date.now();
     this.handle = setTimeout(() => {
+      this.bank();
       this.handle = null;
       this.done = true;
       this.onFire();
@@ -151,11 +158,20 @@ export class PausableDeadline {
     this.handle.unref?.();
   }
 
+  /** 把当前这段运行时间记入 consumed / 扣出 remaining。只在有活动计时器时有意义。 */
+  private bank(): void {
+    if (!this.handle) return;
+    const ran = Date.now() - this.startedAt;
+    this.consumed += ran;
+    this.remaining -= ran;
+    this.startedAt = Date.now();
+  }
+
   pause(): void {
     if (this.done || !this.handle) return;
+    this.bank();
     clearTimeout(this.handle);
     this.handle = null;
-    this.remaining -= Date.now() - this.startedAt;
   }
 
   resume(): void {
@@ -163,11 +179,24 @@ export class PausableDeadline {
   }
 
   clear(): void {
+    this.bank();
     this.done = true;
     if (this.handle) {
       clearTimeout(this.handle);
       this.handle = null;
     }
+  }
+
+  /**
+   * 净运行时长（排除暂停区间）。
+   *
+   * budgetExceeded 与账本的 elapsedMs 都必须从这里取，而不是各自 `Date.now() - startedAt`：
+   * 之前正是两套口径 —— deadline 把审批等待排除在 TIMED_OUT 之外，账本却把它算进
+   * 计算预算 —— 导致用户审批久一点、批准后第一轮 budgetExceeded 立刻命中，
+   * 终态还被归因成 NO_CHANGES。一个 Run 只能有一种"用了多久"。
+   */
+  elapsedMs(): number {
+    return this.consumed + (this.handle ? Date.now() - this.startedAt : 0);
   }
 }
 
@@ -176,8 +205,21 @@ export class PausableDeadline {
  * 内部可能自己重试。防的是挂死，不是延迟 SLA。
  */
 const EXTERNAL_REVIEW_TIMEOUT_MS = 300_000;
+/** 外部作者单次调用上限：改代码比审代码慢得多，但仍受任务墙钟预算收口 */
+const EXTERNAL_AUTHOR_TIMEOUT_MS = 900_000;
 
 /** 审核方绑定：模型 API 与外部 CLI 两种选手，规则完全相同 */
+/**
+ * 外部作者绑定：本机 Codex / Claude CLI 当实现方。与 reviewer 的 EXTERNAL_CLI 分支同形，
+ * 但角色不同 —— 它会在一次性 candidate 目录里写文件（见 external/author.ts）。
+ * 没有 MODEL_API 分支：用模型 API 当作者就是 RepoPilot 自己的 Agent Loop，不需要绑定。
+ */
+export interface AuthorBinding {
+  readonly connector: ExternalConnectorProfile;
+  readonly apiKey: string;
+  readonly label: string;
+}
+
 export type ReviewerBinding =
   | {
       readonly kind: 'MODEL_API';
@@ -220,6 +262,8 @@ interface RunRecord {
    * 循环编排对此无知 —— 它只拿到一个 ReviewPassRunner。
    */
   reviewer: ReviewerBinding | null;
+  /** 外部作者。null = 由 RepoPilot 自己的 Agent Loop 实现（默认） */
+  author: AuthorBinding | null;
   /** 交叉审核聚合记录；跑过才有 */
   crossReview: CrossReviewRecord | null;
   /** 实现方冻结路由 + 执行起点。交叉审核续期（crossreview.continue）复用；恢复态没有 */
@@ -265,6 +309,46 @@ export function checkPatchApplyGate(input: {
   return { ok: true };
 }
 
+/**
+ * 写回前的实体归属链复核。
+ *
+ * `git apply --check` 只能证明补丁在某个目录里能干净应用，不能证明那个目录就是
+ * 产生补丁的项目。这里故意重复任务创建时的归属校验，并把 Run / Attempt / base / generation
+ * 一并绑定；即使持久化证据损坏或内存记录被错误拼接，也必须在接触宿主仓库前 fail-closed。
+ */
+export function checkPatchApplyOwnership(input: {
+  requestedRunId: string;
+  projectId: string;
+  view: Pick<RunView, 'runId' | 'taskId' | 'projectId' | 'attemptId' | 'workspaceGeneration'>;
+  task: Pick<TaskSpec, 'taskId' | 'projectId' | 'snapshotId' | 'profileId'>;
+  snapshot: Pick<RepositorySnapshot, 'snapshotId' | 'projectId' | 'baseSha'>;
+  profile: Pick<RepositoryHarnessProfile, 'profileId' | 'snapshotId'>;
+  patch: Pick<PatchArtifact, 'runId' | 'attemptId' | 'baseSha' | 'generation'>;
+}): PatchApplyGate {
+  const mismatches: Array<[valid: boolean, detail: string]> = [
+    [input.view.runId === input.requestedRunId, 'Run 索引与 Run 记录不一致'],
+    [input.task.taskId === input.view.taskId, 'Task 与 Run 记录不一致'],
+    [input.task.projectId === input.view.projectId, 'Task 与 Run 的项目归属不一致'],
+    [input.projectId === input.task.projectId, '宿主项目与 Task 的项目归属不一致'],
+    [input.snapshot.projectId === input.task.projectId, 'Snapshot 与 Task 的项目归属不一致'],
+    [input.task.snapshotId === input.snapshot.snapshotId, 'Task 与 Snapshot 记录不一致'],
+    [input.task.profileId === input.profile.profileId, 'Task 与 Profile 记录不一致'],
+    [input.profile.snapshotId === input.snapshot.snapshotId, 'Profile 与 Snapshot 归属不一致'],
+    [input.patch.runId === input.view.runId, 'Patch 与 Run 归属不一致'],
+    [input.patch.attemptId === input.view.attemptId, 'Patch 与 Attempt 归属不一致'],
+    [input.patch.baseSha === input.snapshot.baseSha, 'Patch base 与 Snapshot base 不一致'],
+    [input.patch.generation === input.view.workspaceGeneration, 'Patch 与 Run 的 workspace generation 不一致'],
+  ];
+  const mismatch = mismatches.find(([valid]) => !valid);
+  return mismatch
+    ? {
+        ok: false,
+        reason: 'OWNERSHIP_MISMATCH',
+        detail: `实体归属校验失败，已拒绝写回宿主仓库：${mismatch[1]}`,
+      }
+    : { ok: true };
+}
+
 export class RunAuthority {
   private readonly projects = new Map<string, ProjectRecord>();
   private readonly snapshots = new Map<string, RepositorySnapshot>();
@@ -272,13 +356,31 @@ export class RunAuthority {
   private readonly runs = new Map<string, RunRecord>();
   private readonly gateway = new ModelGateway();
 
-  constructor(private readonly push: (event: PushEvent) => void) {
+  private readonly backgroundRetention: boolean;
+
+  /**
+   * `backgroundRetention` 默认开：产品里一个进程只有一个 RunAuthority，
+   * 启动扫一次 + 每 6 小时一次是它该做的事。
+   *
+   * 只有测试需要关掉它。原因不是"清理有 bug"，而是测试里**多个 Authority 共用同一个
+   * 受管数据根**（`vi.mock('./paths')` 整个文件一个 root，每个 Harness 一个 Authority）——
+   * 每个实例都会在 +5s 时对这个共享根跑一遍 sweep，把**别的用例**正跑着的工作区、快照、
+   * artifact 按"孤儿 / 已终态过宽限期"删掉。表现是随机的 `文件不存在: src/app.js`、
+   * 模型脚本对不上、spawn 失败 —— 看起来像 flake，其实是真删。
+   *
+   * 关掉的是**调度**，不是 sweep 本身：retention 的行为仍由 retention.test.ts 直接测。
+   */
+  constructor(
+    private readonly push: (event: PushEvent) => void,
+    options: { backgroundRetention?: boolean } = {},
+  ) {
     ensureDataRoot();
     for (const rec of readJson<ProjectRecord[]>(PATHS.projects, [])) {
       this.projects.set(rec.ref.projectId, rec);
     }
     this.rehydrateRuns();
-    this.startRetentionSchedule();
+    this.backgroundRetention = options.backgroundRetention ?? true;
+    if (this.backgroundRetention) this.startRetentionSchedule();
   }
 
   // -------------------------------------------------------------------------
@@ -339,15 +441,29 @@ export class RunAuthority {
       const s = loaded.state;
       // 事件比状态新 = 崩溃发生在两次写之间。如实标注，不假装一致
       const eventsAhead = events.lastSeq() > s.eventHighWatermark;
+      /*
+       * 日志本身有读不出来的行，是比"状态落后"更硬的损坏：时间线中间缺了东西，
+       * 而缺口在界面上与"这个 Run 本来就只跑到这里"无法区分。它优先于 EVENTS_AHEAD。
+       */
+      const logDamage = events.damageReport();
 
       const record: RunRecord = {
         view: {
           ...s.view,
+          /*
+           * 旧状态文件里没有 snapshotId 这个字段。回填成持久化状态里那份 snapshot 的 id ——
+           * 它就是这个 Run 真正的坐标系，不是推测。留着 undefined 会让 Renderer 侧的
+           * "不可知"与"旧格式"混成一种表现。
+           */
+          snapshotId: s.view.snapshotId ?? s.snapshot?.snapshotId ?? null,
           restored: true,
-          evidence: eventsAhead ? 'EVENTS_AHEAD' : 'INTACT',
-          evidenceDetail: eventsAhead
-            ? `事件流已到 seq ${events.lastSeq()}，状态快照停在 seq ${s.eventHighWatermark} —— 末尾若干事件未反映在状态里`
-            : null,
+          evidence: logDamage ? 'DAMAGED' : eventsAhead ? 'EVENTS_AHEAD' : 'INTACT',
+          evidenceDetail: logDamage
+            ? `events.jsonl 第 ${logDamage.firstBadLine} 行起共 ${logDamage.unparseableLines} 行无法解析：` +
+              '时间线在这些位置有缺口，其余事件仍已读出'
+            : eventsAhead
+              ? `事件流已到 seq ${events.lastSeq()}，状态快照停在 seq ${s.eventHighWatermark} —— 末尾若干事件未反映在状态里`
+              : null,
         },
         task: s.task,
         snapshot: s.snapshot,
@@ -363,6 +479,7 @@ export class RunAuthority {
         patch: s.patch,
         // 恢复态不再续跑，reviewer route 不重建；但已完成的审核记录要留着展示
         reviewer: null,
+        author: null,
         crossReview: s.crossReview ?? null,
       };
 
@@ -394,11 +511,26 @@ export class RunAuthority {
     });
 
     const wsDir = workspaceDir(record.view.runId);
+    const workspaceRetained = existsSync(wsDir);
+    /*
+     * 子进程的去向只能如实分两种说：
+     *   - 上一个进程走了正常退出路径（shutdown 追加过 PROCESS_EXIT_SIGNAL）：SIGTERM 已发，终止未确认；
+     *   - 没有那条事件（崩溃 / 强杀 / 老版本）：一无所知，detached 进程组可能仍在跑。
+     * 模型流是进程内 fetch，随进程退出必然释放，这一条可以确定地说。
+     * 之前的措辞对两种情况都写"子进程已释放"—— 那是一条伪造的清理事实。
+     */
+    const signalled = record.events
+      .all()
+      .some((e) => e.kind === 'NOTE' && (e.payload as { kind?: unknown } | undefined)?.kind === 'PROCESS_EXIT_SIGNAL');
+    const childProcesses: 'SIGTERM_SENT_UNCONFIRMED' | 'UNKNOWN' = signalled ? 'SIGTERM_SENT_UNCONFIRMED' : 'UNKNOWN';
+    const childText = signalled
+      ? '子进程：退出时已向命令进程组发送 SIGTERM，但未确认终止'
+      : '子进程：状态未知（进程未经正常退出路径，运行中的命令可能仍在执行）';
     record.events.append(
       record.view.attemptId,
       'CLEANUP_SUMMARY',
-      `子进程与模型流已随进程退出释放；工作区 ${existsSync(wsDir) ? `仍在磁盘上（gen-${record.view.workspaceGeneration}）` : '已不存在'}`,
-      { workspaceRetained: existsSync(wsDir), reason: 'PROCESS_EXIT' },
+      `模型流已随进程退出释放；${childText}；工作区 ${workspaceRetained ? `仍在磁盘上（gen-${record.view.workspaceGeneration}）` : '已不存在'}`,
+      { workspaceRetained, reason: 'PROCESS_EXIT', modelStream: 'RELEASED', childProcesses },
     );
     this.persist(record);
   }
@@ -415,6 +547,8 @@ export class RunAuthority {
         runId,
         taskId: String(first.payload.taskId ?? 'unknown'),
         projectId: '',
+        // 状态快照读不出来 = 快照归属不可知。写 null，而不是猜一个。
+        snapshotId: null,
         title: first.summary.replace(/^任务已创建：/, '') || runId,
         attemptId: first.attemptId,
         attemptNo: 1,
@@ -450,6 +584,7 @@ export class RunAuthority {
       plan: null,
       patch: null,
       reviewer: null,
+      author: null,
       crossReview: null,
     };
   }
@@ -603,14 +738,36 @@ export class RunAuthority {
         return { summary, usage: diskUsage(), policy: loadPolicy() };
       }
 
+      /*
+       * 预演。走的是与真删**完全相同**的判定路径（同一个 sweep、同一份 liveReferences），
+       * 只跳过 rmSync —— 所以它给出的不是估算，是"按当前事实，这一次会删掉这些"。
+       * 传入的策略只用于本次预演，不写盘：预览一个还没决定要不要保存的策略，
+       * 不该产生任何持久化后果。
+       */
+      case 'retention.preview': {
+        const previewPolicy = clampPolicy({
+          ...loadPolicy(),
+          ...(payload.evidenceDays !== undefined ? { evidenceDays: Number(payload.evidenceDays) } : {}),
+          ...(payload.workspaceGraceMinutes !== undefined
+            ? { workspaceGraceMinutes: Number(payload.workspaceGraceMinutes) }
+            : {}),
+        });
+        const summary = sweep(this.liveReferences(), previewPolicy, Date.now(), { dryRun: true });
+        return { summary, policy: previewPolicy };
+      }
+
       case 'files.tree':
-        return this.fileTree(String(payload.snapshotId), payload.runId ? String(payload.runId) : null);
+        return this.fileTree(
+          String(payload.snapshotId),
+          payload.runId === undefined ? null : String(payload.runId),
+        );
 
       case 'files.read':
         return this.readFile(
           String(payload.snapshotId),
           String(payload.path),
-          payload.runId ? String(payload.runId) : null,
+          payload.runId === undefined ? null : String(payload.runId),
+          parseExpectedGeneration(payload.expectedGeneration),
         );
 
       // Main 需要补丁正文来存文件 / 写剪贴板；这两件事是原生能力，由 Main 做
@@ -872,11 +1029,33 @@ export class RunAuthority {
     customCommands?: Array<{ label: string; argv: string[] }>;
     reviewerModelProfileId?: string;
     reviewerConnectorId?: string;
+    /** 可选：用本机外部 CLI 当作者（Codex 写 / Claude 审，或反过来）。与审核方必须异构 */
+    authorConnectorId?: string;
   }): { task: TaskSpec; run: RunView } {
     const project = this.projects.get(input.projectId);
     const snapshot = this.snapshots.get(input.snapshotId);
     const profile = this.profiles.get(input.profileId);
     if (!project || !snapshot || !profile) throw platformError('NOT_FOUND', '项目/快照/Profile 不存在');
+
+    /*
+     * 三个 ID 都来自 Renderer，分别“存在”不等于属于同一条实体链。这个检查必须早于
+     * withUserCommands、route freeze、workspace 创建、Run/event 落盘和异步命令启动；
+     * 否则迟到响应或被篡改的 IPC 可以把 A 的快照与 B 的宿主仓库拼成一个合法外观的 Run。
+     */
+    if (project.ref.projectId !== input.projectId || snapshot.projectId !== input.projectId) {
+      throw platformError(
+        'CONFLICT',
+        '快照与所选项目的归属不一致，已拒绝创建任务',
+        '请重新打开项目并等待该项目的导入完成后再创建任务。',
+      );
+    }
+    if (profile.snapshotId !== input.snapshotId) {
+      throw platformError(
+        'CONFLICT',
+        'Profile 与所选快照的归属不一致，已拒绝创建任务',
+        '请重新导入当前项目，使用同一次导入返回的 Snapshot 与 Profile。',
+      );
+    }
 
     /*
      * 这里**不再有 profile 门禁**。任何导入进来的项目都可以创建任务。
@@ -931,6 +1110,12 @@ export class RunAuthority {
       }
     }
 
+    // 外部作者：绑定失败不降级 —— 用户点名要外部 CLI 写代码，悄悄换成内部模型去写等于换了作者
+    let author: AuthorBinding | null = null;
+    if (input.authorConnectorId) {
+      author = this.bindCliAuthor(input.authorConnectorId, reviewer);
+    }
+
     const task: TaskSpec = {
       taskId: newId('task'),
       projectId: input.projectId,
@@ -982,6 +1167,7 @@ export class RunAuthority {
       runId,
       taskId: task.taskId,
       projectId: input.projectId,
+      snapshotId: snapshot.snapshotId,
       title: task.goal.length > 60 ? `${task.goal.slice(0, 60)}…` : task.goal,
       attemptId,
       attemptNo: 1,
@@ -1013,6 +1199,7 @@ export class RunAuthority {
       plan: null,
       patch: null,
       reviewer,
+      author,
       crossReview: null,
     };
     this.runs.set(runId, record);
@@ -1024,6 +1211,8 @@ export class RunAuthority {
       // 越过默认门禁的事实必须留在事件里，不能只存在于当时那次点击
       baseKind: snapshot.baseKind,
       dirtyFileCount: snapshot.dirtyFileCount,
+      untrackedCount: snapshot.untrackedCount,
+      excludedCount: snapshot.excludedPaths.length,
       subPath: snapshot.subPath || null,
       profileSupportStatus: effectiveProfile.supportStatus,
       verificationCommands: input.verificationCommandIds,
@@ -1040,6 +1229,34 @@ export class RunAuthority {
     }
     if (snapshot.baseKind === 'NO_VCS') {
       this.emit(record, 'NOTE', '该项目不在版本控制下：基线是导入当时的目录内容，没有可回溯的 commit');
+    }
+    /*
+     * untracked 文件的缺席是个**独立**事实，必须与 dirty 分开说。
+     * 只新建了文件的仓库现在是 CLEAN_COMMIT 基线，如果这条 NOTE 不发，
+     * 用户与模型都会以为那些新文件在快照里。
+     */
+    if (snapshot.untrackedCount > 0) {
+      this.emit(
+        record,
+        'NOTE',
+        `导入范围内有 ${snapshot.untrackedCount} 个未跟踪文件，它们没有进入快照：` +
+          `快照只含 tracked 文件，因此这些文件对 Agent 不可见，补丁也不会包含它们`,
+      );
+    }
+    if (snapshot.excludedPaths.some((e) => e.reason === 'ENUMERATION_TRUNCATED')) {
+      this.emit(
+        record,
+        'NOTE',
+        '文件枚举在上限处被截断：这份快照不完整，文件数与 tree digest 只反映被收进来的那一部分',
+      );
+    }
+    const unreadable = snapshot.excludedPaths.filter((e) => e.reason === 'UNREADABLE').length;
+    if (unreadable > 0) {
+      this.emit(
+        record,
+        'NOTE',
+        `${unreadable} 个路径存在但读不了（权限或竞态），没有进入快照 —— 与"不存在"不同，这里是读取失败`,
+      );
     }
     if (input.verificationCommandIds.length === 0) {
       this.emit(
@@ -1065,6 +1282,15 @@ export class RunAuthority {
             ? { reviewerRoute: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId } }
             : { connectorId: reviewer.connector.connectorId, identityDigest: reviewer.connector.identityDigest }),
         },
+      );
+    }
+
+    if (author) {
+      this.emit(
+        record,
+        'NOTE',
+        `本任务由外部编码代理当作者：${author.label}（只在一次性 candidate 目录里改，差异归一化后才进主线；规划/审批/验证/封存仍由平台执行）`,
+        { authorConnectorId: author.connector.connectorId, identityDigest: author.connector.identityDigest },
       );
     }
 
@@ -1098,6 +1324,11 @@ export class RunAuthority {
     });
     record.deadline = deadline;
 
+    const mutationPolicy = {
+      ...DEFAULT_MUTATION_POLICY,
+      allowedPaths: record.task.allowedPaths,
+      protectedPaths: record.task.protectedPaths,
+    };
     try {
       const result = await runAgent({
         task: record.task,
@@ -1106,15 +1337,14 @@ export class RunAuthority {
         workspace,
         gateway: this.gateway,
         resolution,
-        mutationPolicy: {
-          ...DEFAULT_MUTATION_POLICY,
-          allowedPaths: record.task.allowedPaths,
-          protectedPaths: record.task.protectedPaths,
-        },
+        mutationPolicy,
         runId: record.view.runId,
         attemptId: record.view.attemptId,
         signal: record.abort.signal,
-        host: this.hostFor(record, startedAt, deadline),
+        host: this.hostFor(record, deadline),
+        ...(record.author
+          ? { externalAuthor: this.authorRunnerFor(record, record.author, workspace, mutationPolicy, deadline) }
+          : {}),
       });
 
       for (const v of [result.baseline, result.finalVerification]) {
@@ -1305,6 +1535,138 @@ export class RunAuthority {
     };
   }
 
+  private bindCliAuthor(connectorId: string, reviewer: ReviewerBinding | null): AuthorBinding {
+    const d = descriptorOfConnector(connectorId);
+    if (!d) throw platformError('BAD_REQUEST', `未知的外部连接器：${connectorId}`);
+    const connector = probeConnector(d);
+    if (connector.state !== 'READY') {
+      throw platformError('BAD_REQUEST', `外部作者 ${d.label} 不可用：${connector.detail}`, connector.remediation ?? undefined);
+    }
+    // 异构不变式对"作者 vs 审核方"同样成立：Codex 写就不能 Codex 审
+    if (reviewer) {
+      const reviewerVendor =
+        reviewer.kind === 'EXTERNAL_CLI' ? reviewer.connector.vendor : vendorOfProvider(reviewer.resolution.providerId);
+      if (reviewerVendor) {
+        try {
+          assertHeterogeneousVendor(connector.vendor, reviewerVendor);
+        } catch (err) {
+          throw platformError('BAD_REQUEST', (err as Error).message, '换一个不同厂商的审核方，或不启用交叉审核');
+        }
+      }
+    }
+    const apiKey = this.gateway.credentialForVendor(connector.credentialEnvVar);
+    if (!apiKey) {
+      throw platformError(
+        'BAD_REQUEST',
+        `缺少 ${connector.credentialEnvVar}：拒绝让外部 CLI 用宿主登录态运行，请先配置该供应商的 Key`,
+      );
+    }
+    return { connector, apiKey, label: `${connector.label} ${connector.version ?? ''}`.trim() };
+  }
+
+  /**
+   * 造一个外部作者执行器。Loop 拿到的只是这个函数；它负责 candidate 的完整生命周期：
+   * exportCandidate → 调用 CLI → 退出即封存 → applyCandidate（归一化 + CAS）→ discardCandidate。
+   * 无论成败，candidate 目录都在 finally 里丢弃；主线 generation 只会因 applyMutationPlan 前进。
+   */
+  private authorRunnerFor(
+    record: RunRecord,
+    author: AuthorBinding,
+    workspace: MaterializedWorkspace,
+    policy: MutationPolicy,
+    deadline: PausableDeadline,
+  ): ExternalAuthorRunner {
+    return async (i) => {
+      const candidate = workspace.exportCandidate();
+      this.emit(
+        record,
+        'NOTE',
+        `外部作者 ${author.label} 开始 ${i.phase}：candidate ${candidate.candidateId} 基于 gen-${candidate.baseGeneration}`,
+        { phase: i.phase, candidateId: candidate.candidateId, baseGeneration: candidate.baseGeneration },
+      );
+      try {
+        // 作者超时受任务墙钟收口：剩余时间不够 15 分钟就只给剩余时间（至少 30s 让它能诚实失败）
+        const remaining = record.task.budget.maxWallClockMs - deadline.elapsedMs();
+        const timeoutMs = Math.max(30_000, Math.min(EXTERNAL_AUTHOR_TIMEOUT_MS, remaining));
+        const result = await runExternalCliAuthor({
+          connector: author.connector,
+          apiKey: author.apiKey,
+          brief: i.brief,
+          phase: i.phase,
+          runId: record.view.runId,
+          attemptId: record.view.attemptId,
+          timeoutMs,
+          signal: record.abort.signal,
+          candidate,
+        });
+        // 与 reviewer 同样平行落账：外部 CLI 调用不伪装成模型 API 出站；token 未知 → 账本记未知轮次
+        this.emit(
+          record,
+          'MODEL_INVOCATION',
+          `${i.phase} 调用外部 CLI 作者 ${author.label}（${result.manifest.state}${
+            result.manifest.exitCode !== null ? ` exit=${result.manifest.exitCode}` : ''
+          }${result.manifest.changedCount !== null ? ` changed=${result.manifest.changedCount}` : ''}）`,
+          { externalInvocation: result.manifest },
+        );
+        this.charge(record, deadline, { modelTurns: 1, inputTokens: null, outputTokens: null });
+
+        if (result.manifest.state === 'CANCELLED') return { kind: 'CANCELLED' };
+        if (result.manifest.state !== 'SEALED' || !result.seal) {
+          return { kind: 'FAILED', detail: result.manifest.failureDetail ?? result.manifest.state };
+        }
+        if (result.seal.authorNote) {
+          this.emit(record, 'NOTE', `作者备注（untrusted，不驱动判定）：${result.seal.authorNote.summary ?? '（无摘要）'}`, {
+            authorNote: result.seal.authorNote,
+          });
+        }
+
+        const applied = applyCandidate(workspace, result.seal, candidate.path, record.view.runId, policy);
+        switch (applied.kind) {
+          case 'APPLIED': {
+            const skipped =
+              applied.skippedGenerated.length > 0 ? `；另有 ${applied.skippedGenerated.length} 个命令产物路径被跳过` : '';
+            this.emit(
+              record,
+              'MUTATION_APPLIED',
+              `外部作者的 candidate 已归一化采用：gen-${applied.outputGeneration}，${applied.changedPaths.length} 个文件${skipped}`,
+              {
+                source: 'EXTERNAL_AUTHOR',
+                candidateId: candidate.candidateId,
+                outputGeneration: applied.outputGeneration,
+                treeDigest: applied.treeDigest,
+                paths: applied.changedPaths,
+                skippedGenerated: applied.skippedGenerated,
+              },
+            );
+            // 刷新 view.workspaceGeneration（charge 顺带做了，但 APPLIED 之后再同步一次更稳）
+            this.charge(record, deadline, {});
+            return { kind: 'APPLIED', generation: applied.outputGeneration, changedPaths: applied.changedPaths };
+          }
+          case 'NO_CHANGES':
+            this.emit(
+              record,
+              'NOTE',
+              `外部作者退出但没有可采用的源码变更${
+                applied.skippedGenerated.length > 0 ? `（只动了 ${applied.skippedGenerated.length} 个命令产物路径）` : ''
+              }`,
+              { candidateId: candidate.candidateId, skippedGenerated: applied.skippedGenerated },
+            );
+            return { kind: 'NO_CHANGES' };
+          case 'REJECTED':
+            this.emit(
+              record,
+              'NOTE',
+              `外部作者的 candidate 被拒绝（${applied.reason}）：${applied.detail}；主线零写入`,
+              { candidateId: candidate.candidateId, reason: applied.reason, paths: applied.paths },
+            );
+            return { kind: 'REJECTED', reason: applied.reason, detail: applied.detail };
+        }
+      } finally {
+        workspace.discardCandidate(candidate.path);
+      }
+    };
+  }
+
   /**
    * 造一个审核执行器。**两种选手，同一套规则** ——
    * 都产出 CrossReviewRound、都用平台算的指纹、都受同一个循环的收敛约束。
@@ -1404,6 +1766,11 @@ export class RunAuthority {
       ...(isContinuation ? { continuation: (prior?.userContinuations ?? 0) + 1 } : {}),
     });
 
+    const crossReviewPolicy: MutationPolicy = {
+      ...DEFAULT_MUTATION_POLICY,
+      allowedPaths: record.task.allowedPaths,
+      protectedPaths: record.task.protectedPaths,
+    };
     const deps: AgentDeps = {
       task: record.task,
       snapshot: record.snapshot,
@@ -1412,15 +1779,15 @@ export class RunAuthority {
       gateway: this.gateway,
       // 整改要以实现方身份改文件；审核调用走注入的 review 执行器，不经这里
       resolution: implementerResolution,
-      mutationPolicy: {
-        ...DEFAULT_MUTATION_POLICY,
-        allowedPaths: record.task.allowedPaths,
-        protectedPaths: record.task.protectedPaths,
-      },
+      mutationPolicy: crossReviewPolicy,
       runId: record.view.runId,
       attemptId: record.view.attemptId,
       signal: record.abort.signal,
-      host: this.hostFor(record, startedAt, deadline),
+      host: this.hostFor(record, deadline),
+      // 外部作者任务：整改也由同一个外部作者执行（同一 candidate → 归一化 → CAS 路径），不换成内部模型
+      ...(record.author
+        ? { externalAuthor: this.authorRunnerFor(record, record.author, workspace, crossReviewPolicy, deadline) }
+        : {}),
     };
 
     // 进入循环时的那一代 —— 第 1 轮审核是平台强制只读的，代号不会在审核中漂移
@@ -1544,7 +1911,7 @@ export class RunAuthority {
     // 补丁审查阶段会读到 record.crossReview，把发现摆在用户面前再让其决定
   }
 
-  private hostFor(record: RunRecord, startedAt: number, deadline: PausableDeadline) {
+  private hostFor(record: RunRecord, deadline: PausableDeadline) {
     return {
       emit: (kind: RunEventKind, summary: string, payload: Record<string, unknown> = {}) =>
         this.emit(record, kind, summary, payload),
@@ -1678,15 +2045,15 @@ export class RunAuthority {
       },
 
       chargeModelTurn: (inputTokens: number | null, outputTokens: number | null) =>
-        this.charge(record, startedAt, {
+        this.charge(record, deadline, {
           modelTurns: 1,
           inputTokens,
           outputTokens,
         }),
 
-      chargeToolCall: () => this.charge(record, startedAt, { toolCalls: 1 }),
+      chargeToolCall: () => this.charge(record, deadline, { toolCalls: 1 }),
 
-      chargeSelfFixRound: () => this.charge(record, startedAt, { selfFixRounds: 1 }),
+      chargeSelfFixRound: () => this.charge(record, deadline, { selfFixRounds: 1 }),
 
       budgetExceeded: () => {
         const l = record.view.ledger;
@@ -1696,18 +2063,19 @@ export class RunAuthority {
         if (l.inputTokens + l.outputTokens >= lim.maxTotalTokens) {
           return { exceeded: true, reason: `token 达上限 ${lim.maxTotalTokens}` };
         }
-        if (Date.now() - startedAt >= lim.maxWallClockMs) return { exceeded: true, reason: '超过时间预算' };
+        if (deadline.elapsedMs() >= lim.maxWallClockMs) return { exceeded: true, reason: '超过时间预算' };
         return { exceeded: false, reason: '' };
       },
     };
   }
 
   /** 账本只增不减 —— retry / deny / cancel 都不回退已消耗量 */
-  private charge(record: RunRecord, startedAt: number, delta: LedgerCharge): void {
+  private charge(record: RunRecord, deadline: PausableDeadline, delta: LedgerCharge): void {
     record.view = {
       ...record.view,
       // null/undefined 的三态语义在 applyLedgerCharge：null 计入未知轮次，不折算成 0
-      ledger: applyLedgerCharge(record.view.ledger, delta, Date.now() - startedAt),
+      // elapsedMs 与 TIMED_OUT 判定同源：审批等待不计入
+      ledger: applyLedgerCharge(record.view.ledger, delta, deadline.elapsedMs()),
       workspaceGeneration: record.workspace?.activeGeneration ?? record.view.workspaceGeneration,
       updatedAt: nowIso(),
     };
@@ -2078,28 +2446,56 @@ export class RunAuthority {
   // 文件浏览（只读）
   // -------------------------------------------------------------------------
 
-  /** 选定读取根：有 Run 就看它工作区的当前代，否则看快照原貌 */
+  /** 选定读取根；显式 runId 是强 owner，任何缺失或错配都不得降级成快照读取。 */
   private browseRoot(
     snapshotId: string,
     runId: string | null,
   ): { root: string; baselineRoot: string | null; source: 'SNAPSHOT' | 'WORKSPACE'; generation: number | null } {
-    if (runId) {
+    if (runId !== null) {
       const record = this.runs.get(runId);
-      if (record && !record.workspace) {
+      if (!record) {
+        throw platformError(
+          'NOT_FOUND',
+          `Run 不存在: ${runId}`,
+          '请求明确指定了 Run，Core 不会静默回退到快照',
+        );
+      }
+      // 文件浏览重新证明持久化实体链，不能只相信 record 内恰好有同名 snapshot 字段。
+      if (
+        record.view.evidence === 'DAMAGED' ||
+        !record.task ||
+        !record.snapshot ||
+        record.view.runId !== runId ||
+        record.view.taskId !== record.task.taskId ||
+        record.task.snapshotId !== record.snapshot.snapshotId ||
+        record.task.projectId !== record.snapshot.projectId ||
+        record.view.projectId !== record.snapshot.projectId ||
+        record.snapshot.snapshotId !== snapshotId
+      ) {
+        throw platformError(
+          'CONFLICT',
+          'Run 与请求快照的归属不一致，已拒绝读取文件',
+          `requestedRunId=${runId}, actualRunId=${record.view.runId}, ` +
+            `requestedSnapshotId=${snapshotId}, taskSnapshotId=${record.task?.snapshotId ?? 'unknown'}, ` +
+            `actualSnapshotId=${record.snapshot?.snapshotId ?? 'unknown'}, ` +
+            `viewProjectId=${record.view.projectId || 'unknown'}, ` +
+            `taskProjectId=${record.task?.projectId ?? 'unknown'}, ` +
+            `snapshotProjectId=${record.snapshot?.projectId ?? 'unknown'}`,
+        );
+      }
+      if (!record.workspace) {
         throw platformError(
           'CONFLICT',
           '该 Run 已从磁盘恢复，工作区不再可用',
           '只能查看导入时的快照原貌；补丁内容仍可在「补丁审查」里查看和导出',
         );
       }
-      if (record && record.workspace) {
-        return {
-          root: record.workspace!.activePath,
-          baselineRoot: record.workspace!.baselinePath(),
-          source: 'WORKSPACE',
-          generation: record.workspace!.activeGeneration,
-        };
-      }
+      return {
+        root: record.workspace.activePath,
+        baselineRoot: record.workspace.baselinePath(),
+        source: 'WORKSPACE',
+        generation: record.workspace.activeGeneration,
+      };
     }
     if (!this.snapshots.has(snapshotId)) throw platformError('NOT_FOUND', '快照不存在');
     return { root: snapshotDir(snapshotId), baselineRoot: null, source: 'SNAPSHOT', generation: null };
@@ -2122,8 +2518,21 @@ export class RunAuthority {
     return { entries, source, generation };
   }
 
-  private readFile(snapshotId: string, path: string, runId: string | null) {
-    const { root, baselineRoot } = this.browseRoot(snapshotId, runId);
+  private readFile(
+    snapshotId: string,
+    path: string,
+    runId: string | null,
+    expectedGeneration: number | null,
+  ) {
+    const { root, baselineRoot, source, generation } = this.browseRoot(snapshotId, runId);
+    // Core 单写者下这段检查到同步 readFileSync 之间没有 await；错代请求会在触碰文件前失败。
+    if (expectedGeneration !== generation) {
+      throw platformError(
+        'CONFLICT',
+        '文件来源 generation 已变化，请刷新文件树后重试',
+        `source=${source}, expectedGeneration=${String(expectedGeneration)}, actualGeneration=${String(generation)}`,
+      );
+    }
     let abs: string;
     try {
       abs = resolveManaged(root, path); // 拒绝绝对路径 / `..` / symlink
@@ -2149,6 +2558,8 @@ export class RunAuthority {
       truncated,
       binary,
       changed,
+      source,
+      generation,
     };
   }
 
@@ -2187,15 +2598,28 @@ export class RunAuthority {
       requestedDigest: patchDigest,
     });
     if (!gate.ok) return gate;
-    if (record.view.evidence === 'DAMAGED' || !record.snapshot || !record.task) {
+    if (record.view.evidence === 'DAMAGED' || !record.snapshot || !record.task || !record.profile) {
       return {
         ok: false,
         reason: 'EVIDENCE_DAMAGED',
-        detail: '该 Run 的状态快照已损坏，无法确定补丁的坐标系，拒绝应用',
+        detail: '该 Run 的状态快照已损坏，无法确定补丁的实体归属与坐标系，拒绝应用',
       };
     }
     const project = this.projects.get(record.task.projectId);
     if (!project) return { ok: false, reason: 'PROJECT_MISSING', detail: '项目不存在' };
+
+    // acceptance/digest 证明“用户接受了眼前这份补丁”；归属复核证明“写入的是它所属的项目”。
+    const ownership = checkPatchApplyOwnership({
+      requestedRunId: runId,
+      projectId: project.ref.projectId,
+      view: record.view,
+      task: record.task,
+      snapshot: record.snapshot,
+      profile: record.profile,
+      patch: record.patch,
+    });
+    if (!ownership.ok) return ownership;
+
     if (record.snapshot.baseKind === 'NO_VCS') {
       return {
         ok: false,
@@ -2254,6 +2678,35 @@ export class RunAuthority {
   // 通用
   // -------------------------------------------------------------------------
 
+  /**
+   * 进程退出前的尽力清理：向所有活动 Run 发 abort，让每个正在运行的验证/工具命令
+   * 的进程组同步收到 SIGTERM（runCommand 的 abort 监听里 `process.kill(-pid)` 是同步的）。
+   *
+   * 这里刻意**不**改 Run 状态：应用退出不是用户取消，重启后由 closeInterruptedRun
+   * 落成 INTERRUPTED 才是事实。但要同步追加一条持久化事件，让重启后的清理说明能区分
+   * 「正常退出路径、已发过 SIGTERM」与「崩溃/强杀、什么都没来得及做」—— 之前的说明
+   * 无论哪种情况都写死"子进程已随进程退出释放"，而 detached 进程组并不会随父进程死。
+   *
+   * 已知不做的：不等待 SIGKILL 升级（那是 runCommand 里的定时器，进程马上就退了），
+   * 所以这里只能承诺"发过 SIGTERM"，不能承诺"已终止"。说明文字必须照此措辞。
+   */
+  shutdown(reason: string): { signalledRuns: number } {
+    let signalledRuns = 0;
+    for (const record of this.runs.values()) {
+      if (isTerminal(record.view.status) || record.view.restored) continue;
+      if (record.abort.signal.aborted) continue;
+      record.events.append(
+        record.view.attemptId,
+        'NOTE',
+        `进程收到退出信号（${reason}）：已向该 Run 运行中的命令进程组发送 SIGTERM，不等待终止确认`,
+        { kind: 'PROCESS_EXIT_SIGNAL', reason },
+      );
+      record.abort.abort();
+      signalledRuns += 1;
+    }
+    return { signalledRuns };
+  }
+
   private cancel(runId: string, reason: string): RunView {
     const record = this.require(runId);
     if (isTerminal(record.view.status)) return record.view;
@@ -2302,7 +2755,7 @@ export class RunAuthority {
     this.push({ type: 'run.updated', run: record.view });
 
     // Run 刚终态，它的工作区通常是最大的一块 —— 过了宽限期就该回收
-    if (isTerminal(status)) {
+    if (isTerminal(status) && this.backgroundRetention) {
       setTimeout(() => this.runSweep('run-terminal'), 30_000).unref?.();
     }
   }
@@ -2351,6 +2804,16 @@ export function platformError(
   return new CoreError({ code, message, detail });
 }
 
+/** IPC 仍是未知输入；generation 不能靠 `Number(...)` 把缺失、字符串或小数悄悄变成 owner。 */
+function parseExpectedGeneration(value: unknown): number | null {
+  if (value === null) return null;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return value;
+  throw platformError(
+    'BAD_REQUEST',
+    'expectedGeneration 必须是非负安全整数或 null',
+  );
+}
+
 /** 恢复态 Run 用的 AbortController：一出生就是已取消，任何误用都会立刻停 */
 function abortedController(): AbortController {
   const ac = new AbortController();
@@ -2374,10 +2837,28 @@ function suggestPatchFilename(record: RunRecord): string {
   return `repopilot-${scope}-${stamp}.patch`;
 }
 
-/** 补丁文件带头部元信息：光有 diff 没法说明它是基于什么、验证过没有 */
+/**
+ * 补丁文件带头部元信息：光有 diff 没法说明它是基于什么、验证过没有。
+ *
+ * `verified` 一行必须与 decidePatch 用同一条判定 —— 看那次验证**是否通过**，
+ * 而不是看 verificationRunId 是否非空。挽救封存的补丁恰恰带着一次失败的验证 id，
+ * 只判非空会在导出文件里打出 `verified: yes`，那是离开应用之后最难追回的一句假话。
+ */
+function describePatchVerification(record: RunRecord): string {
+  const p = record.patch!;
+  if (p.verificationRunId === null) {
+    return record.view.terminalFacts
+      ? 'NO — accepted without machine verification'
+      : 'NO — no machine verification was run';
+  }
+  const run = record.verifications.find((v) => v.verificationRunId === p.verificationRunId);
+  if (!run) return `UNKNOWN — verification ${p.verificationRunId} not found in run evidence`;
+  if (run.passed) return `yes (${p.verificationRunId})`;
+  return `NO — verification ${p.verificationRunId} FAILED (salvaged patch; not accepted as success)`;
+}
+
 function renderPatchFile(record: RunRecord): string {
   const p = record.patch!;
-  const verified = p.verificationRunId !== null;
   const header = [
     `# RepoPilot patch`,
     `# patchId:     ${p.patchId}`,
@@ -2388,7 +2869,7 @@ function renderPatchFile(record: RunRecord): string {
       record.snapshot.dirtyFileCount ? ` (${record.snapshot.dirtyFileCount} uncommitted changes at snapshot time)` : ''
     }`,
     `# scope:       ${record.snapshot.subPath || '(repository root)'}`,
-    `# verified:    ${verified ? `yes (${p.verificationRunId})` : 'NO — accepted without machine verification'}`,
+    `# verified:    ${describePatchVerification(record)}`,
     `# task:        ${record.task.goal.replace(/\n/g, ' ')}`,
     `#`,
     `# apply with:  git apply -p1${record.snapshot.subPath ? ` --directory=${record.snapshot.subPath}` : ''} <this-file>`,

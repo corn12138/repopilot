@@ -16,6 +16,7 @@
     "dist:mac:x64": "npm run build && electron-builder --mac --x64 --config electron-builder.yml"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.2",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.0.3",
@@ -23,6 +24,7 @@
     "electron": "^33.3.1",
     "electron-builder": "^26.15.3",
     "electron-vite": "^2.3.0",
+    "jsdom": "^30.0.1",
     "typescript": "^5.7.3",
     "vite": "^5.4.11",
     "vitest": "^2.1.8"

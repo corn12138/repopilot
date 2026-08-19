@@ -68,4 +68,27 @@ process.on('unhandledRejection', (err) => {
   console.error('[core] unhandledRejection', err);
 });
 
+/*
+ * 正常退出路径（Main 的 utilityProcess.kill() 在 POSIX 上发 SIGTERM）：
+ * 同步向所有活动 Run 的命令进程组发 SIGTERM，再退出。全程同步，不等任何 Promise ——
+ * 父进程随时可能把我们连根拔掉，能保证的只有"信号发出去了"。
+ * 不注册的话 Node 默认对 SIGTERM 直接退出，detached 的 vite/tsc 会变成以用户身份
+ * 继续写工作区的孤儿，而重启后的清理说明还宣称它们"已释放"。
+ */
+let shuttingDown = false;
+const onExitSignal = (signal: NodeJS.Signals): void => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    const { signalledRuns } = authority.shutdown(signal);
+    console.error(`[core] ${signal}: signalled ${signalledRuns} active run(s), exiting`);
+  } catch (err) {
+    console.error('[core] shutdown failed', err);
+  }
+  process.exit(0);
+};
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+  process.on(sig, () => onExitSignal(sig));
+}
+
 send({ kind: 'ready' });

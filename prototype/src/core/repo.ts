@@ -98,15 +98,29 @@ export function importSnapshot(
 
   let baseSha = '';
   let branch = '';
-  let dirtyLines: string[] = [];
+  let trackedDirtyCount = 0;
+  let untrackedCount = 0;
   let listed: string[];
+  /** 枚举阶段就已经丢掉的东西；与逐文件阶段的排除合并后一起报数。 */
+  const enumerationExclusions: ExclusionEntry[] = [];
 
   if (isGit) {
     // dirty 只是一个属性，不是门禁；范围限定在导入范围内
     const statusArgs = ['status', '--porcelain'];
     if (subPath) statusArgs.push('--', subPath);
     const status = git(hostPath, statusArgs).trim();
-    dirtyLines = status ? status.split('\n') : [];
+    /*
+     * porcelain 的 `??` 是 untracked，与"tracked 但被改过"是两件完全不同的事：
+     *   tracked 改动 → 文件在快照里，内容是工作区版本
+     *   untracked   → 文件**根本不在快照里**
+     * 以前两者合并成一个 dirtyFileCount，于是"只新建了一个文件"的仓库会被显示成
+     * 「工作区基线 · 1 项改动」——而快照内容其实与 HEAD 逐字节相同，用户以为
+     * 正在被修的那个新文件压根没进来。分开数是这条不变式的最低要求。
+     */
+    for (const line of status ? status.split('\n') : []) {
+      if (line.startsWith('??')) untrackedCount += 1;
+      else trackedDirtyCount += 1;
+    }
 
     baseSha = git(hostPath, ['rev-parse', 'HEAD']).trim();
     branch = git(hostPath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
@@ -121,7 +135,9 @@ export function importSnapshot(
       .filter(Boolean);
   } else {
     // 非 git 目录：直接走文件树，用与 git 相同的排除规则
-    listed = walkPlainDirectory(scopeRoot);
+    const walked = walkPlainDirectory(scopeRoot);
+    listed = walked.files;
+    enumerationExclusions.push(...walked.excluded);
   }
 
   if (listed.length === 0) {
@@ -137,7 +153,7 @@ export function importSnapshot(
   rmSync(target, { recursive: true, force: true });
   mkdirSync(target, { recursive: true });
 
-  const excluded: ExclusionEntry[] = [];
+  const excluded: ExclusionEntry[] = [...enumerationExclusions];
   const included: Array<{ path: string; digest: string }> = [];
   let totalBytes = 0;
 
@@ -147,11 +163,22 @@ export function importSnapshot(
     try {
       st = lstatSync(abs);
     } catch {
+      /*
+       * 以前是裸 `continue`：git 说这个文件存在，我们读不到，然后它从两边都消失了 ——
+       * 既不在 included，也不在 excluded，fileCount 只是悄悄小了一个。
+       * 权限问题和 ls-files 之后的竞态删除都会走到这里，两者都必须留下痕迹。
+       */
+      excluded.push({ path: rel, reason: 'UNREADABLE', bytes: 0 });
       continue;
     }
     // 不跟随 symlink：软链接一律不进快照
     if (!st.isFile()) {
-      excluded.push({ path: rel, reason: 'BINARY', bytes: 0 });
+      // 以前一律记成 BINARY —— symlink 不是二进制文件，那是分类撒谎。
+      excluded.push({
+        path: rel,
+        reason: st.isSymbolicLink() ? 'SYMLINK' : 'UNREADABLE',
+        bytes: 0,
+      });
       continue;
     }
 
@@ -184,8 +211,14 @@ export function importSnapshot(
     projectId,
     baseSha,
     branch,
-    baseKind: !isGit ? 'NO_VCS' : dirtyLines.length > 0 ? 'DIRTY_WORKTREE' : 'CLEAN_COMMIT',
-    dirtyFileCount: dirtyLines.length,
+    /*
+     * 只有 tracked 改动才让基线偏离 commit。只新建了 untracked 文件时，快照内容与 HEAD
+     * 逐字节相同 —— 那就是一个干净 commit 基线，谎称 DIRTY_WORKTREE 反而掩盖了真正的问题
+     * （那个新文件根本没进来），后者由 untrackedCount 单独报。
+     */
+    baseKind: !isGit ? 'NO_VCS' : trackedDirtyCount > 0 ? 'DIRTY_WORKTREE' : 'CLEAN_COMMIT',
+    dirtyFileCount: trackedDirtyCount,
+    untrackedCount,
     subPath,
     fileCount: included.length,
     totalBytes,
@@ -205,33 +238,75 @@ function normalizeSubPath(input: string | undefined): string {
   return trimmed;
 }
 
-/** 非 git 目录的文件枚举：跳过 symlink 与依赖/产物目录，路径相对 root */
-function walkPlainDirectory(root: string): string[] {
+/**
+ * 非 git 目录的文件枚举。
+ *
+ * 每一条 `continue` / `return` 都要留下一行 ExclusionEntry。以前这里静默跳过
+ * symlink、依赖/产物目录、读不了的目录，还会在 8000 个文件处悄悄停下并返回一个
+ * 普通数组 —— 于是 NO_VCS 导入会在界面上打出「排除文件 0 个」，而实际上整棵子树都没进来。
+ * git 路径上这些都会被 classifyExclusion 记账，两条路径的诚实度不该有差别。
+ */
+function walkPlainDirectory(root: string): { files: string[]; excluded: ExclusionEntry[] } {
   const out: string[] = [];
+  const excluded: ExclusionEntry[] = [];
+  let truncated = false;
   const skipDir = /^(\.git|node_modules|dist|build|out|coverage|\.next|\.turbo|\.vite|\.cache|\.pnpm-store|vendor|target|__pycache__|\.venv)$/;
 
+  const rel = (prefix: string, name: string): string => (prefix ? `${prefix}/${name}` : name);
+
   const walk = (dir: string, prefix: string): void => {
-    if (out.length >= MAX_FILE_COUNT) return;
+    if (out.length >= MAX_FILE_COUNT) {
+      truncated = true;
+      return;
+    }
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch {
+      // 读不了的目录与空目录必须可区分，否则"没东西"和"没看到"长得一样。
+      excluded.push({ path: prefix || '.', reason: 'UNREADABLE', bytes: 0 });
       return;
     }
     for (const entry of entries) {
-      if (out.length >= MAX_FILE_COUNT) return;
-      if (entry.isSymbolicLink()) continue;
+      if (out.length >= MAX_FILE_COUNT) {
+        truncated = true;
+        return;
+      }
+      if (entry.isSymbolicLink()) {
+        excluded.push({ path: rel(prefix, entry.name), reason: 'SYMLINK', bytes: 0 });
+        continue;
+      }
       if (entry.isDirectory()) {
-        if (skipDir.test(entry.name)) continue;
-        walk(join(dir, entry.name), prefix ? `${prefix}/${entry.name}` : entry.name);
+        if (skipDir.test(entry.name)) {
+          // 目录名决定归类，与 git 路径的 classifyExclusion 保持同一套语义。
+          excluded.push({
+            path: rel(prefix, entry.name),
+            reason: entry.name === '.git'
+              ? 'GIT_INTERNAL'
+              : /^(node_modules|vendor|\.pnpm-store|\.venv)$/.test(entry.name)
+                ? 'DEPENDENCY_DIR'
+                : 'BUILD_OUTPUT',
+            bytes: 0,
+          });
+          continue;
+        }
+        walk(join(dir, entry.name), rel(prefix, entry.name));
       } else if (entry.isFile()) {
-        out.push(prefix ? `${prefix}/${entry.name}` : entry.name);
+        out.push(rel(prefix, entry.name));
       }
     }
   };
 
   walk(root, '');
-  return out;
+  if (truncated) {
+    /*
+     * 截断是整份枚举的属性，不属于某一个路径。用一行 ENUMERATION_TRUNCATED 表达它，
+     * 好过返回一个看起来完整的列表 —— 后者会让 fileCount、treeDigest 和给模型的
+     * 「快照文件数」三处一起说谎。
+     */
+    excluded.push({ path: '.', reason: 'ENUMERATION_TRUNCATED', bytes: 0 });
+  }
+  return { files: out, excluded };
 }
 
 /**

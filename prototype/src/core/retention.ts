@@ -45,12 +45,20 @@ export type PurgeDomain = 'WORKSPACE' | 'SNAPSHOT' | 'RUN_EVIDENCE' | 'ARTIFACT'
 export interface PurgeItemResult {
   readonly domain: PurgeDomain;
   readonly target: string;
-  readonly outcome: 'DELETED' | 'KEPT_REFERENCED' | 'KEPT_NOT_DUE' | 'FAILED';
+  /**
+   * `WOULD_DELETE` 只出现在预演里，且**只**出现在预演里。
+   * 用独立取值而不是复用 DELETED，是为了让"预演结果"在类型层面就不可能
+   * 被下游当成"已经删完了"。
+   */
+  readonly outcome: 'DELETED' | 'WOULD_DELETE' | 'KEPT_REFERENCED' | 'KEPT_NOT_DUE' | 'FAILED';
+  /** 实删时是已释放的字节；预演时是**将会**释放的字节。 */
   readonly bytesFreed: number;
   readonly reason: string | null;
 }
 
 export interface PurgeSummary {
+  /** 这是一次预演还是一次真删。UI 绝不能把两者渲染成同一句话。 */
+  readonly dryRun: boolean;
   readonly startedAt: string;
   readonly finishedAt: string;
   readonly scanned: number;
@@ -103,17 +111,21 @@ export function loadPolicy(): RetentionPolicy {
   };
 }
 
-export function savePolicy(patch: Partial<RetentionPolicy>): RetentionPolicy {
-  const next: RetentionPolicy = {
-    ...loadPolicy(),
-    ...patch,
+/**
+ * 夹紧到安全区间。抽出来是为了让**预演**用上与保存完全相同的夹紧规则 ——
+ * 否则预演的是一份用户填的原始数值，保存的是被夹过的另一份，两者会给出不同的结果。
+ */
+export function clampPolicy(policy: RetentionPolicy): RetentionPolicy {
+  return {
+    ...policy,
     schemaVersion: RETENTION_SCHEMA_VERSION,
+    evidenceDays: clamp(policy.evidenceDays, 1, 365),
+    workspaceGraceMinutes: clamp(policy.workspaceGraceMinutes, 0, 60 * 24 * 30),
   };
-  const clamped: RetentionPolicy = {
-    ...next,
-    evidenceDays: clamp(next.evidenceDays, 1, 365),
-    workspaceGraceMinutes: clamp(next.workspaceGraceMinutes, 0, 60 * 24 * 30),
-  };
+}
+
+export function savePolicy(patch: Partial<RetentionPolicy>): RetentionPolicy {
+  const clamped = clampPolicy({ ...loadPolicy(), ...patch, schemaVersion: RETENTION_SCHEMA_VERSION });
   writeJsonAtomic(POLICY_PATH, clamped);
   return clamped;
 }
@@ -128,7 +140,30 @@ export function loadLastSummary(): PurgeSummary | null {
  * 顺序是有讲究的：先删工作区（最占地方、最没争议），再删过期证据，
  * 最后按引用计数收快照和 artifact —— 因为删证据会让一批快照失去最后的引用者。
  */
-export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.now()): PurgeSummary {
+export interface SweepOptions {
+  /**
+   * 预演：完整走一遍判定与体积统计，但**不调用 rmSync**。
+   *
+   * 这几乎是免费的 —— `remove()` 本来就在删除之前先算 `dirSize`，每个分支本来就产出
+   * 一条 PurgeItemResult。没有它的时候，用户想知道"立即清理会删掉什么"的唯一办法
+   * 就是真的删一次。
+   */
+  readonly dryRun?: boolean;
+}
+
+export function sweep(
+  refs: LiveReferences,
+  policy = loadPolicy(),
+  now = Date.now(),
+  options: SweepOptions = {},
+): PurgeSummary {
+  const dryRun = options.dryRun === true;
+  const remove = (
+    domain: PurgeDomain,
+    target: string,
+    path: string,
+    reason: string,
+  ): PurgeItemResult => removeOrPreview(domain, target, path, reason, dryRun);
   const startedAt = new Date(now).toISOString();
   const t0 = Date.now();
   const items: PurgeItemResult[] = [];
@@ -151,7 +186,9 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
   const workspaceGrace = policy.workspaceGraceMinutes * 60 * 1000;
 
   // ---- 1. 工作区：Run 已终态且过了宽限期 ----
-  for (const runId of listDirs(PATHS.workspaces)) {
+  const workspaceDirs = enumerate(PATHS.workspaces, 'dir');
+  if (workspaceDirs.error) items.push(unreadable('WORKSPACE', PATHS.workspaces, workspaceDirs.error));
+  for (const runId of workspaceDirs.names) {
     if (!budgetLeft()) break;
     scanned += 1;
     const info = refs.runs.get(runId);
@@ -175,7 +212,9 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
 
   // ---- 2. 证据：超过保留天数 ----
   const purgedRuns = new Set<string>();
-  for (const runId of listDirs(PATHS.runs)) {
+  const runDirs = enumerate(PATHS.runs, 'dir');
+  if (runDirs.error) items.push(unreadable('RUN_EVIDENCE', PATHS.runs, runDirs.error));
+  for (const runId of runDirs.names) {
     if (!budgetLeft()) break;
     scanned += 1;
     const info = refs.runs.get(runId);
@@ -192,7 +231,13 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
     }
     const r = remove('RUN_EVIDENCE', runId, runDir(runId), `超过保留期 ${policy.evidenceDays} 天`);
     items.push(r);
-    if (r.outcome === 'DELETED') purgedRuns.add(runId);
+    /*
+     * 预演里这条是 WOULD_DELETE，也必须记进 purgedRuns。
+     * 第 3 步靠它扣减「本轮刚失去最后一个引用者」的快照；只认 DELETED 的话，
+     * 预演会把那些快照报成 KEPT_REFERENCED —— 于是预览说删 3 项、真跑删 4 项。
+     * 一个会少报的预览比没有预览更糟：用户是照着它按下确认的。
+     */
+    if (r.outcome === 'DELETED' || r.outcome === 'WOULD_DELETE') purgedRuns.add(runId);
   }
 
   // ---- 3. 快照：引用计数归零，且要扣掉第 2 步刚删掉证据的那些 Run ----
@@ -222,7 +267,9 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
    * 界面里攥着的 snapshotId 就成了悬空引用，点「开始」时 cloneTree 抛 ENOENT。
    * 复用工作区那条宽限期：新鲜的快照一律留着。
    */
-  for (const snapshotId of listDirs(PATHS.snapshots)) {
+  const snapshotDirs = enumerate(PATHS.snapshots, 'dir');
+  if (snapshotDirs.error) items.push(unreadable('SNAPSHOT', PATHS.snapshots, snapshotDirs.error));
+  for (const snapshotId of snapshotDirs.names) {
     if (!budgetLeft()) break;
     scanned += 1;
     if (liveSnapshots.has(snapshotId)) {
@@ -246,7 +293,9 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
   }
 
   // ---- 4. artifact：无引用的孤儿 ----
-  for (const name of listFiles(PATHS.artifacts)) {
+  const artifactFiles = enumerate(PATHS.artifacts, 'file');
+  if (artifactFiles.error) items.push(unreadable('ARTIFACT', PATHS.artifacts, artifactFiles.error));
+  for (const name of artifactFiles.names) {
     if (!budgetLeft()) break;
     scanned += 1;
     const id = name.replace(/\.(txt|diff)$/, '');
@@ -258,13 +307,15 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
   }
 
   const failed = items.filter((i) => i.outcome === 'FAILED');
-  const deleted = items.filter((i) => i.outcome === 'DELETED');
+  // 预演里 deleted 计的是"将会删掉的项"；`dryRun` 字段负责让调用方分清这一点。
+  const deleted = items.filter((i) => i.outcome === (dryRun ? 'WOULD_DELETE' : 'DELETED'));
   const incompleteReason =
     failed.length > 0
       ? `${failed.length} 项删除失败：${failed.map((f) => f.target).join(', ').slice(0, 200)}`
       : truncated;
 
   const summary: PurgeSummary = {
+    dryRun,
     startedAt,
     finishedAt: new Date().toISOString(),
     scanned,
@@ -276,10 +327,17 @@ export function sweep(refs: LiveReferences, policy = loadPolicy(), now = Date.no
     items,
   };
 
-  try {
-    writeJsonAtomic(LAST_SUMMARY_PATH, summary);
-  } catch {
-    // 写不下汇总不影响清理本身已经发生的事实
+  /*
+   * 预演绝不写盘。这里曾经是无条件写：于是"预览一下会删什么"会把**上一次真实清理**的
+   * 记录覆盖成一份什么都没做的预演 —— 既是预演的副作用，也销毁了真实证据。
+   * 一个号称无副作用的操作，唯一能被信任的方式就是它真的没有副作用。
+   */
+  if (!dryRun) {
+    try {
+      writeJsonAtomic(LAST_SUMMARY_PATH, summary);
+    } catch {
+      // 写不下汇总不影响清理本身已经发生的事实
+    }
   }
   return summary;
 }
@@ -300,8 +358,16 @@ export function diskUsage(): Record<string, { bytes: number; entries: number }> 
 
 // ---------------------------------------------------------------------------
 
-function remove(domain: PurgeDomain, target: string, path: string, reason: string): PurgeItemResult {
+function removeOrPreview(
+  domain: PurgeDomain,
+  target: string,
+  path: string,
+  reason: string,
+  dryRun: boolean,
+): PurgeItemResult {
   const bytes = dirSize(path);
+  // 预演到此为止：体积已经量到了，接下来的 rmSync 是唯一被跳过的那一步。
+  if (dryRun) return { domain, target, outcome: 'WOULD_DELETE', bytesFreed: bytes, reason };
   try {
     rmSync(path, { recursive: true, force: true });
     // 删完再确认一次 —— rmSync 不抛不等于目录真的没了
@@ -314,6 +380,11 @@ function remove(domain: PurgeDomain, target: string, path: string, reason: strin
   }
 }
 
+/** 整个域读不了：作为该域根目录上的一条 FAILED 落账，让 status 只能是 INCOMPLETE。 */
+function unreadable(domain: PurgeDomain, root: string, code: string): PurgeItemResult {
+  return { domain, target: root, outcome: 'FAILED', bytesFreed: 0, reason: `无法枚举该域（${code}），本轮一项都没检查` };
+}
+
 function keep(
   domain: PurgeDomain,
   target: string,
@@ -323,26 +394,37 @@ function keep(
   return { domain, target, outcome, bytesFreed: 0, reason };
 }
 
-function listDirs(dir: string): string[] {
-  if (!existsSync(dir)) return [];
+/**
+ * 目录枚举结果必须把「读不了」和「是空的」分开：
+ * 之前两个函数在 readdir 抛错时一律 `return []`，于是某个域一个字节都没被检查时，
+ * 汇总照样给 COMPLETE + 已释放 X 字节 —— 这正是"无法证明删干净却声称删干净"。
+ * `error` 非空时调用方必须把该域记为 FAILED，让 status 只能落 INCOMPLETE。
+ */
+interface Enumeration {
+  readonly names: string[];
+  readonly error: string | null;
+}
+
+function enumerate(dir: string, kind: 'dir' | 'file'): Enumeration {
+  if (!existsSync(dir)) return { names: [], error: null };
   try {
-    return readdirSync(dir, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name);
-  } catch {
-    return [];
+    return {
+      names: readdirSync(dir, { withFileTypes: true })
+        .filter((e) => (kind === 'dir' ? e.isDirectory() : e.isFile()))
+        .map((e) => e.name),
+      error: null,
+    };
+  } catch (err) {
+    return { names: [], error: (err as NodeJS.ErrnoException).code ?? (err as Error).message };
   }
 }
 
+function listDirs(dir: string): string[] {
+  return enumerate(dir, 'dir').names;
+}
+
 function listFiles(dir: string): string[] {
-  if (!existsSync(dir)) return [];
-  try {
-    return readdirSync(dir, { withFileTypes: true })
-      .filter((e) => e.isFile())
-      .map((e) => e.name);
-  } catch {
-    return [];
-  }
+  return enumerate(dir, 'file').names;
 }
 
 function dirSize(path: string): number {

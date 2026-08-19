@@ -13,10 +13,13 @@ import { buildChildEnv, resolveBinary, runCommand } from '../command';
  * `docs/contracts/external-coding-agent-cross-review.md` 的一个**可丢弃 spike 子集**，
  * 不是那份合同的实现。合同状态仍是 `P1_DEFERRED / FEATURE_DISABLED`，
  * 这里没有 connector 评审流程、没有 terms/版本准入、没有 network manifest、
- * 没有 resource/thermal 治理，也**没有** CANDIDATE_AUTHOR 角色
- * （让外部 CLI 写代码要 disposable candidate workspace + single-writer epoch，
- * 风险高一个量级，不在本切片）。本切片只做 READ_ONLY_REVIEWER：
+ * 没有 resource/thermal 治理。本文件只做 READ_ONLY_REVIEWER：
  * 外部 CLI 只读一段 diff 文本、只吐结构化发现，碰不到工作区、碰不到仓库。
+ *
+ * CANDIDATE_AUTHOR（让外部 CLI 写代码）在 `./author.ts`，仍是同一份合同的 spike 子集，
+ * 边界是 TD-DEC-016 写明的 "disposable candidate workspace → normalized MutationPlan
+ * → canonical CAS"：外部作者只在一次性 candidate 目录里改，平台拿 tree diff 归一化成
+ * MutationPlan 走 applyMutationPlan，主线 generation 从头到尾不对它开放。
  *
  * 合同里被当成硬边界照搬过来的几条（这些没打折）：
  *   - **synthetic HOME**：给一次性临时目录当 HOME/XDG_*，外部 CLI 读不到你真实的
@@ -98,6 +101,13 @@ export interface ExternalConnectorDescriptor {
    * 只允许这一条形态 —— 不接受运行时拼接的任意 argv。
    */
   readonly reviewArgv: readonly string[];
+  /**
+   * 作者入口：同样非交互、prompt 走 stdin，但允许 CLI 在 **cwd（一次性 candidate 目录）**
+   * 内写文件。写权限只到 cwd 为止 —— 各家 CLI 自己的 sandbox/permission 机制负责这一层，
+   * 平台这一层再用 tree diff → MutationPlan 兜底，两道保险互不依赖。
+   * 同样不接受运行时拼接的任意 argv。
+   */
+  readonly authorArgv: readonly string[];
   /** 显式凭据 audience：只注入这一个变量 */
   readonly credentialEnvVar: string;
 }
@@ -116,6 +126,18 @@ const DESCRIPTORS: readonly ExternalConnectorDescriptor[] = [
     versionArgv: ['--version'],
     // -p/--print = 非交互一次性执行，prompt 从 stdin 读
     reviewArgv: ['-p'],
+    /*
+     * acceptEdits：自动接受 cwd 内的文件编辑，cwd 外的编辑在 -p 模式下没人批准 → 被拒。
+     * 只放行读/搜/改文件的工具，**不放行 Bash**：验证由平台跑，作者不需要、也不该
+     * 在这里起进程（它连 node_modules 都只能通过 symlink 看见）。
+     */
+    authorArgv: [
+      '-p',
+      '--permission-mode',
+      'acceptEdits',
+      '--allowedTools',
+      'Read,Glob,Grep,Edit,Write,MultiEdit',
+    ],
     credentialEnvVar: 'ANTHROPIC_API_KEY',
   },
   {
@@ -140,6 +162,19 @@ const DESCRIPTORS: readonly ExternalConnectorDescriptor[] = [
      * 与 synthetic HOME 是同一目的的两道保险。
      */
     reviewArgv: ['exec', '--skip-git-repo-check', '--ignore-user-config', '--ephemeral', '-'],
+    /*
+     * --sandbox workspace-write：codex 自己的 seatbelt 沙箱只允许写 cwd，网络默认关。
+     * exec 模式不交互，不会卡在审批提示上；真卡住了由平台的 timeout 判 TIMED_OUT。
+     */
+    authorArgv: [
+      'exec',
+      '--skip-git-repo-check',
+      '--ignore-user-config',
+      '--ephemeral',
+      '--sandbox',
+      'workspace-write',
+      '-',
+    ],
     credentialEnvVar: 'OPENAI_API_KEY',
   },
 ];
@@ -349,7 +384,7 @@ export interface ExternalInvocationManifest {
   readonly invocationId: string;
   readonly runId: string;
   readonly attemptId: string;
-  readonly role: 'READ_ONLY_REVIEWER';
+  readonly role: 'READ_ONLY_REVIEWER' | 'CANDIDATE_AUTHOR';
   readonly connectorId: string;
   readonly vendor: ExternalVendor;
   readonly identityDigest: string | null;
@@ -425,9 +460,21 @@ export function parseReviewOutput(raw: string): ExternalReviewSubmission | null 
     if (verdict !== 'PASS' && verdict !== 'CHANGES_REQUESTED' && verdict !== 'INCONCLUSIVE') {
       continue;
     }
-    const findings = Array.isArray(obj.findings)
-      ? (obj.findings.filter((f) => f && typeof f === 'object') as Record<string, unknown>[])
-      : [];
+    const raw = Array.isArray(obj.findings) ? obj.findings : [];
+    const findings = raw.filter((f) => f && typeof f === 'object') as Record<string, unknown>[];
+    /*
+     * 读不全的 findings 归零，只有在 verdict 是 PASS 时才是安全的 —— 那时发现清单
+     * 不驱动任何决定。verdict 不是 PASS 时就完全不同：`agent.ts` 判 REVIEWER_PASSED
+     * 的条件是 `verdict === 'PASS' || blocking.length === 0`，所以一个
+     * `CHANGES_REQUESTED` + 读不出来的 findings 会带着"零条阻断"走完循环，
+     * 被判成审核方没提意见 —— 审核方明说要改，平台却当成通过了。
+     *
+     * 静默过滤和静默通过是同一类问题。这里选择整份判为不可解析（返回 null，
+     * 上层记 FAILED 并说明原因），而不是拿一份被悄悄削短的清单去驱动决定。
+     */
+    const findingsUnreadable =
+      (obj.findings !== undefined && !Array.isArray(obj.findings)) || findings.length !== raw.length;
+    if (findingsUnreadable && verdict !== 'PASS') continue;
     return { verdict, findings };
   }
   return null;
@@ -554,8 +601,20 @@ export async function runExternalCliReview(input: {
 
     const submission = parseReviewOutput(outcome.stdoutPreview);
     if (!submission) {
+      /*
+       * 归属要说对。`stdoutPreview` 是**我们**截断到末 4000 字节的结果；
+       * 截断之后解析不出来，那是平台的采集上限造成的，不是审核方没给结论。
+       * 以前两种情况共用一句"输出不含可解析的审核 JSON"，等于把平台的问题
+       * 记在审核方名下 —— 与把平台标注记成模型发言是同一类归属错误。
+       */
       return {
-        manifest: seal('FAILED', outcome.exitCode, '输出不含可解析的审核 JSON —— 不编造发现'),
+        manifest: seal(
+          'FAILED',
+          outcome.exitCode,
+          outcome.outputTruncated
+            ? '输出被平台截断（仅保留末 4000 字节）后无法解析 —— 不是审核方没给结论，也不编造发现'
+            : '输出不含可解析的审核 JSON —— 不编造发现',
+        ),
         submission: null,
       };
     }

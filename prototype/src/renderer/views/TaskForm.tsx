@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type {
   ModelConnectionProfile,
   ProjectRef,
@@ -8,6 +8,7 @@ import type {
   TaskClass,
 } from '@shared/domain';
 import { COMMON_TASK_CLASSES } from '@shared/domain';
+import type { ReviewerOption } from '@shared/protocol';
 import { RequestError, call } from '../bridge';
 
 /** 常见值的中文说明，仅用于 datalist 的提示文案 —— 不是可选项清单 */
@@ -71,6 +72,28 @@ export function Composer({
   const [modelProfileId, setModelProfileId] = useState(enabledModels[0]?.profileId ?? '');
   /** 多行文本原文；空 = 不做交叉审核。解析后**精确匹配** —— 不做模糊匹配是本项目的底线 */
   const [reviewerInput, setReviewerInput] = useState('');
+  /**
+   * 本机检测到的外部编码代理 CLI（Codex / Claude Code）。既可当只读审核方，也可当作者。
+   * 不可用的也保留在列表里并带原因 —— 静默消失等于"我以为能选，其实没有"。
+   */
+  const [externalOptions, setExternalOptions] = useState<readonly ReviewerOption[]>([]);
+  /** 作者：'' = RepoPilot 内部 Agent（默认）；否则是外部 CLI 的 connectorId */
+  const [authorConnectorId, setAuthorConnectorId] = useState('');
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await call('crossreview.reviewers', {});
+        if (!cancelled && res) setExternalOptions(res.reviewers.filter((r) => r.kind === 'EXTERNAL_CLI'));
+      } catch {
+        // 探测失败只意味着"没有外部选项可选"，不阻断建任务
+        if (!cancelled) setExternalOptions([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [submitting, setSubmitting] = useState(false);
   const [customCommand, setCustomCommand] = useState('');
   const [useCustom, setUseCustom] = useState(false);
@@ -99,7 +122,14 @@ export function Composer({
     [reviewerInput],
   );
   const reviewerProfileId = reviewerLines.length === 1 ? reviewerLines[0]! : '';
-  const reviewerResolved = reviewerCandidates.some((m) => m.profileId === reviewerProfileId);
+  /** 可用的外部 CLI 审核方：不能与作者是同一个连接器（同厂商会被 Core 拒绝，这里先不给选） */
+  const reviewerCliCandidates = useMemo(
+    () => externalOptions.filter((o) => o.available && o.id !== authorConnectorId),
+    [externalOptions, authorConnectorId],
+  );
+  const reviewerIsCli = reviewerCliCandidates.some((o) => o.id === reviewerProfileId);
+  const reviewerResolved = reviewerCandidates.some((m) => m.profileId === reviewerProfileId) || reviewerIsCli;
+  const authorOption = externalOptions.find((o) => o.id === authorConnectorId) ?? null;
 
   /**
    * 任务选项里**真正被设置过**的条目。用于让弹层关掉之后仍然看得见 ——
@@ -116,8 +146,9 @@ export function Composer({
     if (reviewerProfileId && reviewerResolved) {
       out.push({ label: '交叉审核', value: reviewerProfileId });
     }
+    if (authorOption) out.push({ label: '作者', value: `${authorOption.label}（外部 CLI）` });
     return out;
-  }, [taskClass, hasCustom, customCommand, allowedPaths, acceptance, reviewerProfileId, reviewerResolved]);
+  }, [taskClass, hasCustom, customCommand, allowedPaths, acceptance, reviewerProfileId, reviewerResolved, authorOption]);
 
   const canSubmit =
     goal.trim().length > 0 &&
@@ -149,7 +180,12 @@ export function Composer({
         ...(hasCustom
           ? { customCommands: [{ label: customCommand.trim(), argv: customArgv }] }
           : {}),
-        ...(reviewerProfileId ? { reviewerModelProfileId: reviewerProfileId } : {}),
+        ...(reviewerProfileId
+          ? reviewerIsCli
+            ? { reviewerConnectorId: reviewerProfileId }
+            : { reviewerModelProfileId: reviewerProfileId }
+          : {}),
+        ...(authorConnectorId ? { authorConnectorId } : {}),
       });
       setGoal('');
       setStaleSnapshot(false);
@@ -185,7 +221,7 @@ export function Composer({
   return (
     <div className="composer">
       {staleSnapshot && (
-        <div className="composer-note" style={{ color: 'var(--warn)' }}>
+        <div className="composer-note" style={{ color: 'var(--state-warning-fg)' }}>
           这个项目的快照已被数据保留清理回收，不能再用它建任务。
           <button
             className="linklike"
@@ -218,6 +254,8 @@ export function Composer({
             key={id}
             type="button"
             className={`chip ${selectedCommands.includes(id) ? 'selected' : ''}`}
+            // chip 是开关，不是链接：选中状态必须进入无障碍树，不能只体现为颜色。
+            aria-pressed={selectedCommands.includes(id)}
             title={profile.commands[id]!.label}
             onClick={() =>
               setSelectedCommands((prev) =>
@@ -236,6 +274,8 @@ export function Composer({
         <button
           type="button"
           className={`chip ${hasCustom ? 'selected' : useCustom ? 'pending' : ''}`}
+          // 按"开关是否打开"播报；填没填由可见文案交代，不混进 pressed 语义。
+          aria-pressed={useCustom}
           title={
             hasCustom
               ? `自定义验证命令：${customCommand}`
@@ -366,6 +406,53 @@ export function Composer({
                 />
               </div>
 
+              <div className="field">
+                <label>实现方（作者）：谁来改代码</label>
+                <div className="suggest-row">
+                  <button
+                    type="button"
+                    className={`chip ${authorConnectorId === '' ? 'selected' : ''}`}
+                    aria-pressed={authorConnectorId === ''}
+                    title="RepoPilot 自己的 Agent Loop：逐条 receipt + exact-span，每个工具调用都经网关"
+                    onClick={() => setAuthorConnectorId('')}
+                  >
+                    RepoPilot 内部 Agent（默认）
+                  </button>
+                  {externalOptions.map((o) => (
+                    <button
+                      key={o.id}
+                      type="button"
+                      className={`chip ${authorConnectorId === o.id ? 'selected' : ''}`}
+                      aria-pressed={authorConnectorId === o.id}
+                      disabled={!o.available}
+                      title={o.available ? o.detail : (o.reason ?? o.detail)}
+                      onClick={() => {
+                        setAuthorConnectorId(o.id);
+                        // 作者与审核方不能是同一个连接器：把撞车的审核选择清掉并明说
+                        if (reviewerProfileId === o.id) setReviewerInput('');
+                      }}
+                    >
+                      {o.label}
+                      {!o.available ? '（不可用）' : ''}
+                    </button>
+                  ))}
+                </div>
+                <div className="help">
+                  外部 CLI 当作者时，它只在一份<b>一次性副本</b>里改，平台把差异归一化后才进主线；
+                  规划、审批、验证、封存仍由平台执行。与审核方必须是不同厂商。
+                  {externalOptions.some((o) => !o.available) && (
+                    <>
+                      {' '}
+                      不可用的原因：
+                      {externalOptions
+                        .filter((o) => !o.available)
+                        .map((o) => `${o.label} — ${o.reason ?? o.detail}`)
+                        .join('；')}
+                    </>
+                  )}
+                </div>
+              </div>
+
               <div className="field" style={{ marginBottom: 4 }}>
                 <label>交叉审核：第二个模型只读审补丁（可留空）</label>
                 <textarea
@@ -375,34 +462,51 @@ export function Composer({
                   onChange={(e) => setReviewerInput(e.target.value)}
                 />
                 <div className="suggest-row">
-                  {reviewerCandidates.length === 0 ? (
+                  {reviewerCandidates.length === 0 && reviewerCliCandidates.length === 0 ? (
                     <span className="help" style={{ padding: 0 }}>
                       没有可用的第二个审核方 —— 再配一个供应商的 API Key 就有了。
                     </span>
                   ) : (
-                    reviewerCandidates.map((m) => (
-                      <button
-                        key={m.profileId}
-                        type="button"
-                        className={`chip ${reviewerProfileId === m.profileId ? 'selected' : ''}`}
-                        title={`${m.label} · ${m.modelId}`}
-                        onClick={() => setReviewerInput(m.profileId)}
-                      >
-                        {m.label}
-                      </button>
-                    ))
+                    <>
+                      {reviewerCandidates.map((m) => (
+                        <button
+                          key={m.profileId}
+                          type="button"
+                          className={`chip ${reviewerProfileId === m.profileId ? 'selected' : ''}`}
+                          aria-pressed={reviewerProfileId === m.profileId}
+                          title={`${m.label} · ${m.modelId}`}
+                          onClick={() => setReviewerInput(m.profileId)}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                      {reviewerCliCandidates.map((o) => (
+                        <button
+                          key={o.id}
+                          type="button"
+                          className={`chip ${reviewerProfileId === o.id ? 'selected' : ''}`}
+                          aria-pressed={reviewerProfileId === o.id}
+                          title={`${o.detail}（外部 CLI，只读审核）`}
+                          onClick={() => setReviewerInput(o.id)}
+                        >
+                          {o.label}（CLI）
+                        </button>
+                      ))}
+                    </>
                   )}
                 </div>
                 {reviewerLines.length > 1 && (
                   // 多行是输入形态，不是"支持多个审核方"—— 别静默只取第一行
-                  <div className="help" style={{ color: 'var(--err)' }}>
+                  <div className="help" style={{ color: 'var(--state-failed-fg)' }}>
                     目前只支持一个审核方，这里填了 {reviewerLines.length} 个。
                   </div>
                 )}
                 {reviewerLines.length === 1 && !reviewerResolved && (
                   // 不做模糊匹配：填错就明说，并列出可用的，不静默忽略
-                  <div className="help" style={{ color: 'var(--err)' }}>
-                    没有这个审核方。可用：{reviewerCandidates.map((m) => m.profileId).join('、') || '（无）'}
+                  <div className="help" style={{ color: 'var(--state-failed-fg)' }}>
+                    没有这个审核方。可用：
+                    {[...reviewerCandidates.map((m) => m.profileId), ...reviewerCliCandidates.map((o) => o.id)].join('、') ||
+                      '（无）'}
                   </div>
                 )}
                 <div className="help">
@@ -447,11 +551,71 @@ export function Composer({
  * 前者靠 ✕ / 点击外部 / 再点按钮三条路；后者改名：里面装的是
  * 有默认值的任务配置，不是什么高级功能，名字不该端着。
  */
+/** 能接收焦点的元素；`:not([disabled])` 排除被禁用控件，它们不该出现在环里。 */
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 function AdvancedPopover({ onClose, children }: { onClose: () => void; children: ReactNode }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  /*
+   * 一个弹层要能被键盘用户用完整，需要四件事，缺一件就会把人困住：
+   * Escape 能关、打开时焦点进得去、Tab 不会跑到背后的页面上、关闭后焦点回到原处。
+   * 之前四件都没有：打开后焦点还留在触发按钮，Tab 直接穿到底下的表单里。
+   */
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const restoreTo = document.activeElement as HTMLElement | null;
+
+    const focusables = () => [...dialog.querySelectorAll<HTMLElement>(FOCUSABLE)];
+    focusables()[0]?.focus();
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const items = focusables();
+      if (items.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = items[0]!;
+      const last = items[items.length - 1]!;
+      const active = document.activeElement;
+      // 到边界就绕回去；焦点离开弹层等于用户在操作被弹层遮住的东西。
+      if (event.shiftKey && (active === first || !dialog.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      // 关闭后焦点必须回到触发它的地方，否则键盘用户会被丢回文档开头。
+      restoreTo?.focus?.();
+    };
+  }, []);
+
   return (
     <>
       <div className="popover-backdrop" onClick={onClose} />
-      <div className="composer-advanced" role="dialog" aria-label="任务选项">
+      <div
+        className="composer-advanced rp-enter"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="任务选项"
+      >
         <div className="composer-advanced-head">
           <strong>任务选项</strong>
           <span className="composer-advanced-hint">都有能直接开跑的默认值</span>

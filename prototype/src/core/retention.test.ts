@@ -44,6 +44,7 @@ import {
   DEFAULT_RETENTION,
   type LiveReferences,
   type RetentionPolicy,
+  loadLastSummary,
   sweep,
 } from './retention';
 import { PATHS, ensureDataRoot, runDir, snapshotDir, workspaceDir } from './paths';
@@ -326,6 +327,34 @@ describe('删除结果必须诚实', () => {
     expect(s.incompleteReason).toBeNull();
   });
 
+  it('某个域整个读不了 → 该域记 FAILED、整体 INCOMPLETE，绝不当成"这个域是空的"', async () => {
+    /*
+     * 把 artifacts 目录换成一个普通文件：readdir 会抛 ENOTDIR。
+     * 之前 listFiles 在这里 `catch { return [] }`，于是 artifacts 一项都没检查，
+     * 汇总照样 COMPLETE —— 与 README 自述的"任一失败整体只能 INCOMPLETE"直接矛盾。
+     */
+    const { rmSync } = await import('node:fs');
+    rmSync(PATHS.artifacts, { recursive: true, force: true });
+    writeFileSync(PATHS.artifacts, 'not a directory');
+    made.push(PATHS.artifacts);
+    const id = mkRun(newId('run'));
+
+    const s = sweep(refs({ [id]: { terminal: true, ageDays: 1 } }), POLICY, NOW);
+
+    expect(s.status).toBe('INCOMPLETE');
+    expect(s.incompleteReason).toMatch(/删除失败/);
+    const failed = s.items.filter((i) => i.outcome === 'FAILED');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ domain: 'ARTIFACT', target: PATHS.artifacts });
+    expect(failed[0]!.reason).toMatch(/无法枚举该域（ENOTDIR）/);
+    // 其他域照常处理：读不了的只是 artifacts，不能连累别的域被跳过
+    expect(s.items.some((i) => i.domain === 'RUN_EVIDENCE')).toBe(true);
+    // 预演同样如实：读不了就是读不了，不因为"没真删"就假装检查过
+    const dry = sweep(refs({ [id]: { terminal: true, ageDays: 1 } }), POLICY, NOW, { dryRun: true });
+    expect(dry.status).toBe('INCOMPLETE');
+    expect(dry.items.filter((i) => i.outcome === 'FAILED')).toHaveLength(1);
+  });
+
   it('被数量上限截断 → INCOMPLETE 且说明原因', () => {
     for (let i = 0; i < 5; i += 1) mkWorkspace(mkRun(newId('run')));
     const tiny = { ...POLICY, maxItemsPerSweep: 2 };
@@ -373,5 +402,134 @@ describe('策略夹紧', () => {
     } finally {
       writeJsonAtomic(join(PATHS.root, 'retention.json'), backup);
     }
+  });
+});
+
+/**
+ * 预演（dry run）。
+ *
+ * 在此之前，想知道「立即清理」会删掉什么的唯一办法是**真的删一次**。
+ * 预演走的是与真删完全相同的判定路径，只跳过 rmSync —— 所以它给出的不是估算。
+ * 这里的每一条都在钉同一件事：判定一致、磁盘不动、结果不可被误当成已执行。
+ */
+describe('清理预演：算得准，且一个字节都不删', () => {
+  /** 造一组必然会被删的东西：终态且过期的 Run + 它的工作区 + 无引用 artifact。 */
+  function seedDeletable(): { runId: string; artifactId: string } {
+    const runId = mkRun(newId('run'));
+    mkWorkspace(runId);
+    const artifactId = mkArtifact(newId('art'));
+    return { runId, artifactId };
+  }
+
+  it('预演不删除任何东西，磁盘保持原样', () => {
+    const { runId, artifactId } = seedDeletable();
+    const live = refs({ [runId]: { terminal: true, ageDays: 90 } });
+
+    const preview = sweep(live, POLICY, NOW, { dryRun: true });
+
+    expect(preview.dryRun).toBe(true);
+    expect(preview.items.some((i) => i.outcome === 'WOULD_DELETE')).toBe(true);
+    // 负向断言，也是这条测试的全部意义：预演之后磁盘上的东西一个都不能少。
+    expect(existsSync(workspaceDir(runId))).toBe(true);
+    expect(existsSync(runDir(runId))).toBe(true);
+    expect(existsSync(join(PATHS.artifacts, `${artifactId}.txt`))).toBe(true);
+  });
+
+  it('预演里没有 DELETED，真删里没有 WOULD_DELETE —— 两者不可能被混淆', () => {
+    const { runId } = seedDeletable();
+    const live = refs({ [runId]: { terminal: true, ageDays: 90 } });
+
+    const preview = sweep(live, POLICY, NOW, { dryRun: true });
+    expect(preview.items.some((i) => i.outcome === 'DELETED')).toBe(false);
+
+    const real = sweep(live, POLICY, NOW);
+    expect(real.dryRun).toBe(false);
+    expect(real.items.some((i) => i.outcome === 'WOULD_DELETE')).toBe(false);
+  });
+
+  it('预演的判定与真删逐项一致 —— 它不是另一套规则', () => {
+    const { runId } = seedDeletable();
+    const live = refs({ [runId]: { terminal: true, ageDays: 90 } });
+
+    const preview = sweep(live, POLICY, NOW, { dryRun: true });
+    const real = sweep(live, POLICY, NOW);
+
+    const shape = (s: typeof preview) =>
+      s.items
+        .map((i) => `${i.domain}:${i.target}:${i.outcome === 'WOULD_DELETE' ? 'DELETED' : i.outcome}`)
+        .sort();
+    expect(shape(preview)).toEqual(shape(real));
+    // 体积也要对得上：预演报的"将释放"就是真删释放的那些字节。
+    expect(preview.bytesFreed).toBe(real.bytesFreed);
+    expect(preview.deleted).toBe(real.deleted);
+  });
+
+  /*
+   * 级联回收：删掉 Run 证据会让「只被它引用的快照」在同一轮里失去最后一个引用者。
+   * 预演必须把这一级也算进去 —— 只认 DELETED 的话，预演会把那些快照报成
+   * KEPT_REFERENCED，于是预览说删 N 项、真跑删 N+1 项。
+   * 一个会少报的预览比没有预览更糟：用户是照着它按下确认的。
+   */
+  it('预演算得出级联删除的快照，不会少报', () => {
+    const runId = mkRun(newId('run'));
+    const snapId = mkSnapshot(newId('snap'), 10_000); // 远超宽限期
+    const live: LiveReferences = {
+      runs: new Map([
+        [runId, { terminal: true, terminalAt: NOW - 90 * DAY, updatedAt: NOW - 90 * DAY, snapshotId: snapId }],
+      ]),
+      snapshots: new Set([snapId]),
+      artifacts: new Set<string>(),
+    };
+
+    const preview = sweep(live, POLICY, NOW, { dryRun: true });
+    const snapshotItem = preview.items.find((i) => i.domain === 'SNAPSHOT' && i.target === snapId)!;
+    expect(snapshotItem.outcome).toBe('WOULD_DELETE');
+
+    const real = sweep(live, POLICY, NOW);
+    expect(preview.deleted).toBe(real.deleted);
+    expect(preview.bytesFreed).toBe(real.bytesFreed);
+  });
+
+  it('预演不覆盖上一次真实清理的记录', () => {
+    const { runId } = seedDeletable();
+    const live = refs({ [runId]: { terminal: true, ageDays: 90 } });
+
+    // 先跑一次真删，它会把汇总写进 last-purge.json。
+    const real = sweep(live, POLICY, NOW);
+    const stored = loadLastSummary();
+    expect(stored?.dryRun).toBe(false);
+    expect(stored?.deleted).toBe(real.deleted);
+
+    // 再预演一次：last-purge.json 必须原封不动。
+    sweep(refs({}), POLICY, NOW, { dryRun: true });
+
+    const after = loadLastSummary();
+    /*
+     * 负向断言：无条件写 last-purge.json 时，这里会读到一份 dryRun 的空汇总 ——
+     * 既是预演的副作用，也把用户真实的上一次清理记录销毁了。
+     */
+    expect(after?.dryRun).toBe(false);
+    expect(after?.startedAt).toBe(stored?.startedAt);
+    expect(after?.deleted).toBe(real.deleted);
+  });
+
+  it('预演可以用一份尚未保存的策略，且不写盘', () => {
+    const runId = mkRun(newId('run'));
+    mkWorkspace(runId);
+    // 10 天前进入终态：默认 30 天保留期下不该删。
+    const live = refs({ [runId]: { terminal: true, ageDays: 10 } });
+
+    const kept = sweep(live, POLICY, NOW, { dryRun: true });
+    expect(
+      kept.items.find((i) => i.domain === 'RUN_EVIDENCE' && i.target === runId)!.outcome,
+    ).toBe('KEPT_NOT_DUE');
+
+    // 把保留期收紧到 5 天来预演：同一份数据，结论应当变成"会删"。
+    const tightened = sweep(live, { ...POLICY, evidenceDays: 5 }, NOW, { dryRun: true });
+    expect(
+      tightened.items.find((i) => i.domain === 'RUN_EVIDENCE' && i.target === runId)!.outcome,
+    ).toBe('WOULD_DELETE');
+    // 预演一个还没决定要不要保存的策略，不该产生任何持久化后果。
+    expect(existsSync(runDir(runId))).toBe(true);
   });
 });

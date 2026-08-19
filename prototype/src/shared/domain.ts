@@ -57,11 +57,24 @@ export interface RepositorySnapshot {
   readonly baseSha: string;
   readonly branch: string;
   readonly baseKind: SnapshotBaseKind;
-  /** `DIRTY_WORKTREE` 时为被本地改动覆盖的文件数；否则为 0 */
+  /**
+   * 被本地改动覆盖的 **tracked** 文件数。
+   *
+   * 只数 tracked：untracked 文件根本不在快照里，把它算作"改动"等于说
+   * "你的新文件在里面并且被改过了" —— 两句都不成立。它由 `untrackedCount` 单独报。
+   */
   readonly dirtyFileCount: number;
+  /**
+   * 导入范围内的 untracked 文件数 —— 它们**一个都没进快照**。
+   *
+   * 这是一次真正的排除，必须报数：只加了新文件的仓库，快照内容与 HEAD 逐字节相同，
+   * 而用户以为自己那个新文件正在被修。此前这个数被并进 dirtyFileCount，
+   * 于是"完全没进来"被显示成了"进来了而且是改动过的"。
+   */
+  readonly untrackedCount: number;
   /** 仅快照仓库的这个子目录（monorepo 子包）；整仓为 '' */
   readonly subPath: string;
-  /** tracked-only；untracked 文件永远不进快照 */
+  /** tracked-only；untracked 文件永远不进快照（数量见 untrackedCount） */
   readonly fileCount: number;
   readonly totalBytes: number;
   readonly treeDigest: Digest;
@@ -88,7 +101,13 @@ export interface ExclusionEntry {
     | 'BUILD_OUTPUT'
     | 'BINARY'
     | 'OVERSIZE'
-    | 'SECRET_SUSPECT';
+    | 'SECRET_SUSPECT'
+    /** 软链接不跟随：以前被误记成 BINARY，那是分类撒谎，不是省略报数。 */
+    | 'SYMLINK'
+    /** 存在但读不了（EACCES/ELOOP/竞态删除）。与"不存在"必须可区分。 */
+    | 'UNREADABLE'
+    /** 枚举本身被上限截断；`path` 是被截断的目录，`bytes` 为 0。 */
+    | 'ENUMERATION_TRUNCATED';
   readonly bytes: number;
 }
 
@@ -321,6 +340,17 @@ export interface RunView {
   readonly taskId: string;
   /** 让侧栏能把运行挂到所属项目下 */
   readonly projectId: string;
+  /**
+   * 创建这个 Run 的快照。
+   *
+   * 必须由 RunView 自己携带，不能让 Renderer 从 Plan 里推：Plan 要到规划完成才存在，
+   * 而"这个 Run 属于哪份快照"从创建那一刻起就是确定的。之前靠 `plan.snapshotId` 推导，
+   * 结果是 PLANNING 阶段的 Run 根本无法打开文件树。
+   *
+   * `null` 只出现在证据损坏的 Run 上 —— 那时快照归属确实不可知，必须如实说不知道，
+   * 而不是拿"当前项目最近一次导入"顶上。
+   */
+  readonly snapshotId: string | null;
   /** 供列表展示的短标题，取自 TaskSpec.goal */
   readonly title: string;
   readonly attemptId: string;
@@ -787,8 +817,26 @@ export interface ModelConnectionProfile {
   readonly modelId: string;
   /** 可选模型清单，让 UI 给下拉而不是逼用户手打 id */
   readonly availableModels: readonly string[];
+  /**
+   * 当前**实际生效**的环境变量名（source 为 ENV 时）；否则是第一个候选。
+   *
+   * 以前无条件取 `d.env[0]`，而 provider 常有别名（zhipu 有 ZHIPU_API_KEY 与
+   * ZHIPUAI_API_KEY）。只设了第二个时，界面会点名第一个 —— 用户照着去 unset
+   * 那个变量，什么也不会改变。
+   */
   readonly credentialEnvVar: string;
+  /** 该 provider 认得的**全部**环境变量名。"没有变量能接手"这句话必须把它们都列出来。 */
+  readonly credentialEnvVars: readonly string[];
   readonly credentialSource: CredentialSource;
+  /**
+   * 删掉应用内凭据之后会接手的来源。
+   *
+   * 这是「删除」按钮唯一真正重要的事实：掉到 `ENV`（还能用，但换成另一把 key ——
+   * 可能是另一个账号、另一份账单）还是掉到 `NONE`（这个 provider 直接不可用）。
+   * 不给这个字段，界面就只能让用户点下去才知道结果。
+   */
+  readonly fallbackSource: 'ENV' | 'NONE';
+  readonly fallbackEnvVar: string | null;
   /** 凭据尾部若干位，用于确认"配的是哪把 key"；永远不回传完整值 */
   readonly credentialHint: string | null;
   readonly docUrl: string;

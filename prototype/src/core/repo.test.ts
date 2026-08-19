@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -47,11 +47,15 @@ import { snapshotDir } from './paths';
 import { ensureDataRoot } from './paths';
 
 /**
- * 导入门禁的行为契约。
+ * 导入的行为契约。
  *
- * 核心区分：**默认阻断** ≠ **永远不给走**。
- *   - dirty worktree：默认阻断，但可由显式选择越过，越过后如实标记 baseKind。
- *   - 没有验证命令：硬阻断，因为没有任何东西能判定成功。
+ * 现在的语义是**导入不设门禁**：选中目录就是信任手势，dirty worktree、非 git 目录、
+ * 检测不出命令全都直接导入，如实标记 `baseKind` / `dirtyFileCount` / `supportStatus`，
+ * 由用户带着这些事实决定要不要继续。只在物理上做不到时才失败
+ * （`PATH_UNREADABLE` / `EMPTY_TREE` / `CAPACITY_EXCEEDED`）。
+ *
+ * 这段注释此前还写着"dirty 默认阻断、可显式越过"，而下面的用例断言的是直接导入成功 ——
+ * 断言早就改了，注释没跟上。过期的注释和过期的断言是同一类问题。
  */
 
 let repo: string;
@@ -121,6 +125,93 @@ describe('导入不设业务门禁，只如实标注', () => {
     const snap = importSnapshot('p', repo);
     const paths = listTree(snapshotDir(snap.snapshotId)).map((f) => f.path);
     expect(paths).not.toContain('apps/web/src/secret-scratch.ts');
+  });
+
+  /*
+   * 以下两条钉的是同一件事的两面：untracked 文件是**排除**，不是**改动**。
+   * 以前 `git status --porcelain` 的 `??` 行被并进 dirtyFileCount，于是
+   * "只新建了一个文件"的仓库会被标成「工作区基线 · 1 项改动」——
+   * 而快照内容与 HEAD 逐字节相同，那个新文件根本没进来。
+   * 界面说"进来了而且改过了"，事实是"完全没进来"：这是分类撒谎，比不报数更糟。
+   */
+  it('只有 untracked 文件时基线仍是 CLEAN_COMMIT，untracked 单独报数', () => {
+    write('apps/web/src/scratch.ts', 'const scratch = 1;\n');
+    const snap = importSnapshot('p', repo);
+
+    expect(snap.baseKind).toBe('CLEAN_COMMIT');
+    // 负向断言：这个 1 绝不能出现在 dirtyFileCount 上。
+    expect(snap.dirtyFileCount).toBe(0);
+    expect(snap.untrackedCount).toBe(1);
+
+    // 快照内容确实与干净 commit 一致 —— 所以 CLEAN_COMMIT 是诚实的。
+    const clean = importSnapshot('p', repo);
+    expect(snap.treeDigest).toBe(clean.treeDigest);
+  });
+
+  it('tracked 改动与 untracked 新增同时存在时，两个数各归各的', () => {
+    write('apps/web/src/App.tsx', 'export const App = () => 1;\n'); // tracked 改动
+    write('apps/web/src/a.ts', 'export const a = 1;\n'); // untracked
+    write('apps/web/src/b.ts', 'export const b = 2;\n'); // untracked
+    const snap = importSnapshot('p', repo);
+
+    expect(snap.baseKind).toBe('DIRTY_WORKTREE');
+    expect(snap.dirtyFileCount).toBe(1);
+    expect(snap.untrackedCount).toBe(2);
+  });
+
+  it('untracked 计数与 dirty 一样只看导入范围', () => {
+    write('apps/api/src/scratch.ts', 'const scratch = 1;\n');
+    expect(importSnapshot('p', repo).untrackedCount).toBe(1);
+    expect(importSnapshot('p', repo, { subPath: 'apps/web' }).untrackedCount).toBe(0);
+  });
+
+  it('软链接记为 SYMLINK 而不是 BINARY —— 分类要说实话', () => {
+    symlinkSync(join(repo, 'apps/web/src/App.tsx'), join(repo, 'apps/web/src/alias.tsx'));
+    commitAll('add symlink');
+    const snap = importSnapshot('p', repo);
+
+    const entry = snap.excludedPaths.find((e) => e.path === 'apps/web/src/alias.tsx');
+    expect(entry).toBeTruthy();
+    expect(entry!.reason).toBe('SYMLINK');
+    // 负向断言：以前这里是 BINARY，一个软链接被说成了二进制文件。
+    expect(entry!.reason).not.toBe('BINARY');
+    expect(listTree(snapshotDir(snap.snapshotId)).map((f) => f.path)).not.toContain(
+      'apps/web/src/alias.tsx',
+    );
+  });
+});
+
+describe('非 git 目录的枚举同样报数', () => {
+  let plain: string;
+
+  beforeEach(() => {
+    plain = mkdtempSync(join(tmpdir(), 'repopilot-plain-'));
+    mkdirSync(join(plain, 'src'), { recursive: true });
+    writeFileSync(join(plain, 'src/index.ts'), 'export const a = 1;\n');
+    mkdirSync(join(plain, 'node_modules/pkg'), { recursive: true });
+    writeFileSync(join(plain, 'node_modules/pkg/index.js'), 'module.exports = 1;\n');
+    mkdirSync(join(plain, 'dist'), { recursive: true });
+    writeFileSync(join(plain, 'dist/bundle.js'), 'var x=1;\n');
+    symlinkSync(join(plain, 'src/index.ts'), join(plain, 'src/alias.ts'));
+    ensureDataRoot();
+  });
+
+  afterEach(() => rmSync(plain, { recursive: true, force: true }));
+
+  it('跳过的依赖目录、产物目录与软链接都留下 ExclusionEntry', () => {
+    const snap = importSnapshot('p', plain);
+    expect(snap.baseKind).toBe('NO_VCS');
+
+    const byReason = (reason: string) => snap.excludedPaths.filter((e) => e.reason === reason);
+    // 以前 NO_VCS 路径在界面上打印「排除文件 0 个」，而整棵 node_modules 都没进来。
+    expect(snap.excludedPaths.length).toBeGreaterThan(0);
+    expect(byReason('DEPENDENCY_DIR').map((e) => e.path)).toContain('node_modules');
+    expect(byReason('BUILD_OUTPUT').map((e) => e.path)).toContain('dist');
+    expect(byReason('SYMLINK').map((e) => e.path)).toContain('src/alias.ts');
+
+    // 真正进来的只有那一个源文件。
+    expect(snap.fileCount).toBe(1);
+    expect(listTree(snapshotDir(snap.snapshotId)).map((f) => f.path)).toEqual(['src/index.ts']);
   });
 
   it('dirty 计数只看导入范围', () => {

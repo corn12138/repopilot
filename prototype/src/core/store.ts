@@ -16,10 +16,21 @@ import { runDir } from './paths';
  * 注意这里**没有**采纳 Neovate 的做法：不逐 chunk 同步重写整份日志，
  * 不把配置变更写成整文件 rewrite（见 overlay §7.2 Reject 行）。
  */
+/** 日志读取时发现的损坏。null = 完好。 */
+export interface EventStoreDamage {
+  /** 无法解析的行数。 */
+  readonly unparseableLines: number;
+  /** 第一条坏行的行号（1 起）。 */
+  readonly firstBadLine: number;
+}
+
 export class EventStore {
   private readonly file: string;
   private cache: RunEvent[] = [];
   private loaded = false;
+  private damage: EventStoreDamage | null = null;
+  /** 磁盘上见过的最大 seq —— 包括坏行之后那些仍然读得出来的事件。 */
+  private maxSeqSeen = 0;
 
   constructor(private readonly runId: string) {
     const dir = runDir(runId);
@@ -32,16 +43,40 @@ export class EventStore {
     this.loaded = true;
     if (!existsSync(this.file)) return;
     const raw = readFileSync(this.file, 'utf8');
+    let unparseable = 0;
+    let firstBadLine = 0;
+    let lineNo = 0;
+
     for (const line of raw.split('\n')) {
+      lineNo += 1;
       const trimmed = line.trim();
       if (!trimmed) continue;
+      let event: RunEvent;
       try {
-        this.cache.push(JSON.parse(trimmed) as RunEvent);
+        event = JSON.parse(trimmed) as RunEvent;
       } catch {
-        // 尾部损坏只丢弃最后一条，不破坏已有 lineage
-        break;
+        /*
+         * 以前这里是 `break`，注释写着"尾部损坏只丢弃最后一条"。
+         * 崩在写一半时确实只坏最后一行，但**中间**坏一行时 `break` 会把它之后
+         * 全部完好的事件一起扔掉，而且一个数都不报 —— 时间线短了一截，
+         * 界面上与"这个 Run 本来就只跑到这里"完全无法区分。
+         * 现在继续读，把坏行计数留下来，由 authority 投影成 evidence 损坏。
+         */
+        unparseable += 1;
+        if (firstBadLine === 0) firstBadLine = lineNo;
+        continue;
       }
+      this.cache.push(event);
+      if (typeof event.seq === 'number' && event.seq > this.maxSeqSeen) this.maxSeqSeen = event.seq;
     }
+
+    if (unparseable > 0) this.damage = { unparseableLines: unparseable, firstBadLine };
+  }
+
+  /** 供 authority 投影成 RunView.evidence；调用前会确保日志已读。 */
+  damageReport(): EventStoreDamage | null {
+    this.load();
+    return this.damage;
   }
 
   append(
@@ -51,8 +86,14 @@ export class EventStore {
     payload: Record<string, unknown> = {},
   ): RunEvent {
     this.load();
+    /*
+     * seq 必须从**磁盘上见过的最大 seq**推，不能用 cache.length。
+     * 日志里有坏行时 cache 比实际短，用长度推会把新事件写成一个已经用过的 seq ——
+     * 于是 `after(afterSeq)` 的游标语义失效，Renderer 会漏掉或重复一段时间线。
+     */
+    this.maxSeqSeen += 1;
     const event: RunEvent = {
-      seq: this.cache.length + 1,
+      seq: this.maxSeqSeen,
       runId: this.runId,
       attemptId,
       kind,

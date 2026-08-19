@@ -2,12 +2,14 @@ import { useEffect, useRef, useState } from 'react';
 import type { DoctorCheck, ModelConnectionProfile } from '@shared/domain';
 import type { DiskUsage, PurgeSummaryView, RetentionPolicyView } from '@shared/protocol';
 import { call } from '../bridge';
-import { Badge, Banner, Card, DoctorBadge } from '../components/common';
+import { Badge, Banner, Card, ConfirmAction, DoctorBadge } from '../components/common';
 
 export function SettingsView({
   checks,
   profiles,
   secureStorage,
+  credentialStore,
+  credentialStoreDetail,
   onProfilesChanged,
   onRefresh,
   onError,
@@ -15,6 +17,8 @@ export function SettingsView({
   checks: DoctorCheck[];
   profiles: ModelConnectionProfile[];
   secureStorage: boolean;
+  credentialStore: 'ABSENT' | 'OK' | 'UNREADABLE';
+  credentialStoreDetail: string | null;
   onProfilesChanged: (profiles: ModelConnectionProfile[]) => void;
   onRefresh: () => Promise<void>;
   onError: (err: unknown) => void;
@@ -34,7 +38,7 @@ export function SettingsView({
             {c.remediation && (
               <>
                 <span className="spacer" />
-                <span style={{ color: 'var(--warn)', fontSize: 11 }}>{c.remediation}</span>
+                <span style={{ color: 'var(--state-warning-fg)', fontSize: 11 }}>{c.remediation}</span>
               </>
             )}
           </div>
@@ -46,6 +50,26 @@ export function SettingsView({
           <Banner tone="warn">
             系统钥匙串不可用，应用内保存凭据已禁用。可以改用环境变量提供 API Key。
           </Banner>
+        )}
+
+        {/*
+          "读不出来"与"没配过"必须分开说。两者都会让下面每个 provider 显示成
+          没有凭据，但一个要你去填，另一个是你填过的东西现在解不开 —— 而且这种状态下
+          保存新 key 会覆盖掉那份其实还在的密文，所以写入被 Main 拒绝了。
+        */}
+        {credentialStore === 'UNREADABLE' && (
+          <div role="alert">
+            <Banner tone="err">
+              <strong>凭据文件存在，但读不出来 —— 这不等于你没配过。</strong>
+              {credentialStoreDetail && (
+                <div style={{ marginTop: 4 }}>{credentialStoreDetail}</div>
+              )}
+              <div style={{ marginTop: 6 }}>
+                为避免用一把新 key 覆盖掉其余仍在文件里的凭据，保存与删除都已被拒绝。
+                常见原因是换了机器或钥匙串被清空；确认旧凭据不再需要后，删除该文件即可重新开始。
+              </div>
+            </Banner>
+          </div>
         )}
 
         <ProviderGroup
@@ -95,12 +119,95 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+/** `diskUsage()` 的域名（小写目录名）。 */
 const DOMAIN_LABEL: Record<string, string> = {
   runs: 'Run 证据（事件/状态/补丁）',
   snapshots: '导入快照',
   workspaces: '隔离工作区',
   artifacts: '导出产物',
 };
+
+/**
+ * `PurgeItemView.domain` 的域名（大写枚举）—— 与上面那张表的键空间**不相交**。
+ * 用错一张，确认框里就会打出裸的 RUN_EVIDENCE，而它上方几行的用量徽章
+ * 对同一批数据写的是「Run 证据（事件/状态/补丁）」。删除前必须读的那段话，
+ * 不该是两套词汇。
+ */
+const PURGE_DOMAIN_LABEL: Record<string, string> = {
+  RUN_EVIDENCE: 'Run 证据（事件/状态/补丁）',
+  SNAPSHOT: '导入快照',
+  WORKSPACE: '隔离工作区',
+  ARTIFACT: '导出产物',
+};
+
+/**
+ * 清理预演的渲染。
+ *
+ * 只显示 Core 真的算出来的东西：条数、字节数、逐项目标。
+ * 一个字的估算都没有 —— 猜出来的影响预览比没有更糟，因为它同样会被当成承诺。
+ */
+function SweepPreview({ summary }: { summary: PurgeSummaryView }) {
+  const willDelete = summary.items.filter((i) => i.outcome === 'WOULD_DELETE');
+  const byDomain = new Map<string, number>();
+  for (const item of willDelete) byDomain.set(item.domain, (byDomain.get(item.domain) ?? 0) + 1);
+
+  if (willDelete.length === 0) {
+    return (
+      <>
+        <strong>
+          {summary.status === 'INCOMPLETE'
+            ? '在预演扫到的范围内没有要删除的东西 —— 但这次预演没有扫完。'
+            : '按当前策略，这次清理不会删除任何东西。'}
+        </strong>
+        <div style={{ marginTop: 4 }}>
+          已扫描 {summary.scanned} 项，其中没有到期或失去引用的项。
+        </div>
+        {/*
+          截断必须报数。少了这一句，一次被预算截断、根本没扫到快照与 artifact 的预演，
+          会被读成"全部检查过，什么都不用删" —— 然后确认键下去真的删掉没预演到的东西。
+        */}
+        {summary.status === 'INCOMPLETE' && (
+          <div style={{ marginTop: 4 }}>
+            预演在扫完之前就停了（{summary.incompleteReason}）：**未被扫到的部分没有结论**，
+            实际清理仍可能删除它们。
+          </div>
+        )}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <strong>
+        将删除 {willDelete.length} 项，释放 {formatBytes(summary.bytesFreed)}。此操作不可撤销。
+      </strong>
+      <div style={{ marginTop: 4 }}>
+        已扫描 {summary.scanned} 项 ·{' '}
+        {[...byDomain.entries()]
+          .map(([domain, count]) => `${PURGE_DOMAIN_LABEL[domain] ?? domain} ${count}`)
+          .join('、')}
+      </div>
+      {summary.status === 'INCOMPLETE' && (
+        <div style={{ marginTop: 4 }}>
+          预演本身不完整（{summary.incompleteReason}）—— 实际清理可能与这份清单不同。
+        </div>
+      )}
+      {byDomain.has('RUN_EVIDENCE') && (
+        <div style={{ marginTop: 4 }}>
+          其中 {byDomain.get('RUN_EVIDENCE')} 个 Run 的证据会被删除，它们将从运行列表里消失。
+        </div>
+      )}
+      <ul className="preview-list">
+        {willDelete.map((item) => (
+          <li key={`${item.domain}-${item.target}`}>
+            {PURGE_DOMAIN_LABEL[item.domain] ?? item.domain} {item.target} ·{' '}
+            {formatBytes(item.bytesFreed)}
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
 
 /**
  * 保留策略此前只有 Core 侧的 policy + sweep，没有任何界面出口 ——
@@ -167,12 +274,33 @@ function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
 
   const sweepNow = async () => {
     setBusy(true);
+    setPreview(null);
     try {
       adopt(await call('retention.sweepNow', {}));
     } catch (err) {
       onError(err);
     } finally {
       setBusy(false);
+    }
+  };
+
+  /*
+   * 清理预演。在此之前，想知道「立即清理」会删掉什么的唯一办法是**真的删一次**。
+   * 预演走的是与真删完全相同的判定路径，只跳过 rmSync —— 所以这里显示的不是估算，
+   * 是"按当前事实，这一次会删掉这些"。
+   */
+  const [preview, setPreview] = useState<PurgeSummaryView | null>(null);
+  const [previewFailed, setPreviewFailed] = useState<string | null>(null);
+
+  const loadPreview = async (overrides: { evidenceDays?: number; workspaceGraceMinutes?: number } = {}) => {
+    setPreview(null);
+    setPreviewFailed(null);
+    try {
+      const r = await call('retention.preview', overrides);
+      setPreview(r.summary);
+    } catch (err) {
+      // 预演失败时**不能**让确认按钮可用：那等于让用户在不知道后果的情况下按下去。
+      setPreviewFailed(err instanceof Error ? err.message : '预演失败');
     }
   };
 
@@ -186,9 +314,36 @@ function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
       title="数据保留"
       hint="Retention"
       right={
-        <button disabled={busy || !policy} onClick={() => void sweepNow()}>
-          {busy ? '…' : '立即清理'}
-        </button>
+        <ConfirmAction
+          label="立即清理…"
+          confirmLabel="确认删除"
+          busyLabel="清理中…"
+          busy={busy}
+          disabled={!policy}
+          tone="err"
+          /*
+           * 三态。以前这里用「非空即可确认」，于是预演失败返回的错误节点让守卫失效 ——
+           * 横幅写着"已阻止执行"，底下的确认按钮却是活的。
+           */
+          consequence={
+            previewFailed !== null
+              ? {
+                  kind: 'blocked',
+                  reason: (
+                    <strong>
+                      无法预演这次清理：{previewFailed} —— 已阻止在不知道后果的情况下执行。
+                    </strong>
+                  ),
+                }
+              : preview === null
+                ? { kind: 'pending' }
+                : { kind: 'ready', detail: <SweepPreview summary={preview} /> }
+          }
+          // 策略一变，已展开的后果就作废：不能拿旧策略算出来的清单去确认新策略的清理。
+          armKey={policy ? `${policy.evidenceDays}:${policy.workspaceGraceMinutes}` : 'no-policy'}
+          onArm={() => void loadPreview()}
+          onConfirm={() => void sweepNow()}
+        />
       }
     >
       {loadFailed && <Banner tone="err">保留策略读取失败 —— 这块功能当前不可用，不是没有数据。</Banner>}
@@ -213,7 +368,7 @@ function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
                 disabled={busy}
                 onChange={(e) => setEvidenceDays(e.target.value)}
               />
-              <span style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>天</span>
+              <span style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>天</span>
             </div>
           </div>
 
@@ -226,7 +381,7 @@ function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
                 disabled={busy}
                 onChange={(e) => setGraceMinutes(e.target.value)}
               />
-              <span style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>分钟</span>
+              <span style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>分钟</span>
               <span className="spacer" />
               {dirty && (
                 <button className="primary" disabled={busy} onClick={() => void savePolicy()}>
@@ -262,7 +417,7 @@ function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
               {summary.items.length > 0 && (
                 <details className="toolcall" style={{ marginTop: 8 }}>
                   <summary>
-                    <span style={{ color: 'var(--text-dim)' }}>逐项结果（{summary.items.length}）</span>
+                    <span style={{ color: 'var(--text-secondary)' }}>逐项结果（{summary.items.length}）</span>
                   </summary>
                   <div className="body">
                     <pre className="output" style={{ maxHeight: 220 }}>
@@ -310,7 +465,7 @@ function ProviderGroup({
         {hint && <span style={{ textTransform: 'none', marginLeft: 8, fontWeight: 400 }}>{hint}</span>}
       </div>
       {profiles.length === 0 ? (
-        <div style={{ color: 'var(--text-faint)', fontSize: 11.5, padding: '2px 4px 6px' }}>{empty}</div>
+        <div style={{ color: 'var(--text-tertiary)', fontSize: 11.5, padding: '2px 4px 6px' }}>{empty}</div>
       ) : (
         profiles.map((p) => (
           <ProviderRow
@@ -369,7 +524,7 @@ function AddProviderForm({
 
   if (!open) {
     return (
-      <button style={{ marginTop: 12, color: 'var(--accent)' }} onClick={() => setOpen(true)}>
+      <button style={{ marginTop: 12, color: 'var(--accent-interactive)' }} onClick={() => setOpen(true)}>
         + 添加自定义 Provider
       </button>
     );
@@ -546,28 +701,42 @@ function ProviderRow({
 
   return (
     <div className="provider">
-      <div className="provider-head" onClick={() => setOpen((v) => !v)}>
-        <span className="tree-caret">{open ? '▾' : '▸'}</span>
-        {sourceBadge}
-        <strong style={{ fontSize: 12.5, minWidth: 110 }}>{profile.label}</strong>
-        <code style={{ fontSize: 11, color: 'var(--text-dim)' }}>{profile.modelId || '未选模型'}</code>
-        <Badge>{profile.wire}</Badge>
-        {profile.kind === 'CUSTOM' && <Badge tone="purple">自定义</Badge>}
-        {profile.isRelay && <Badge tone="warn">经第三方</Badge>}
-        {profile.credentialHint && (
-          <span style={{ fontSize: 10.5, color: 'var(--text-faint)', fontFamily: 'var(--mono)' }}>
-            {profile.credentialHint}
-          </span>
-        )}
-        <span className="spacer" />
+      {/*
+        展开头以前是 `div onClick` —— 鼠标能用，Tab 到不了，读屏也不知道这里能展开。
+        改成真 button + aria-expanded/aria-controls 后，键盘与辅助技术走的是同一条路径。
+        「测试连接」必须是它的兄弟节点而不是子节点：button 里嵌 button 是非法结构，
+        之前靠 stopPropagation 掩盖的正是这个问题。
+      */}
+      <div className="provider-head">
+        <button
+          type="button"
+          className="provider-toggle"
+          aria-expanded={open}
+          aria-controls={`provider-body-${profile.profileId}`}
+          onClick={() => setOpen((v) => !v)}
+        >
+          <span className="tree-caret">{open ? '▾' : '▸'}</span>
+          {sourceBadge}
+          <strong style={{ fontSize: 12.5, minWidth: 110 }}>{profile.label}</strong>
+          <code style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+            {profile.modelId || '未选模型'}
+          </code>
+          <Badge>{profile.wire}</Badge>
+          {profile.kind === 'CUSTOM' && <Badge tone="purple">自定义</Badge>}
+          {profile.isRelay && <Badge tone="warn">经第三方</Badge>}
+          {profile.credentialHint && (
+            <span style={{ fontSize: 11.5, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>
+              {profile.credentialHint}
+            </span>
+          )}
+          <span className="spacer" />
+        </button>
         <button
           disabled={!profile.enabled || busy}
-          onClick={(e) => {
-            e.stopPropagation();
-            void test();
-          }}
+          aria-busy={busy}
+          onClick={() => void test()}
         >
-          {busy ? '…' : '测试连接'}
+          {busy ? '测试中…' : '测试连接'}
         </button>
       </div>
 
@@ -575,9 +744,9 @@ function ProviderRow({
         <div
           style={{
             fontSize: 11.5,
-            fontFamily: 'var(--mono)',
+            fontFamily: 'var(--font-mono)',
             padding: '4px 12px 6px 30px',
-            color: result.ok ? 'var(--ok)' : 'var(--err)',
+            color: result.ok ? 'var(--state-verified-fg)' : 'var(--state-failed-fg)',
             wordBreak: 'break-word',
           }}
         >
@@ -586,12 +755,12 @@ function ProviderRow({
       )}
 
       {open && (
-        <div className="provider-body">
+        <div className="provider-body" id={`provider-body-${profile.profileId}`}>
           <div className="field">
             <label>
               API Key
               {profile.credentialSource === 'ENV' && (
-                <span style={{ color: 'var(--text-faint)' }}>
+                <span style={{ color: 'var(--text-tertiary)' }}>
                   {' '}
                   · 当前用的是环境变量 {profile.credentialEnvVar}，在这里填会覆盖它
                 </span>
@@ -616,15 +785,52 @@ function ProviderRow({
                 保存
               </button>
               {profile.credentialSource === 'APP' && (
-                <button className="danger" disabled={busy} onClick={() => void saveKey('')}>
-                  删除
-                </button>
+                <ConfirmAction
+                  label="删除…"
+                  confirmLabel="确认删除凭据"
+                  busyLabel="删除中…"
+                  busy={busy}
+                  tone={profile.fallbackSource === 'ENV' ? 'warn' : 'err'}
+                  /*
+                   * 唯一真正重要的事实：删完之后掉到哪。这不是猜的 ——
+                   * Core 的 resolveKeySource 会无副作用地把 fallback 一起算出来。
+                   */
+                  armKey={`${profile.providerId}:${profile.credentialHint ?? ''}`}
+                  consequence={{
+                    kind: 'ready',
+                    detail:
+                      profile.fallbackSource === 'ENV' ? (
+                      <>
+                        <strong>
+                          删除后 {profile.label} 会改用环境变量 {profile.fallbackEnvVar} 里的 Key。
+                        </strong>
+                          <div style={{ marginTop: 4 }}>
+                            连接仍然可用，但换成了**另一把** Key —— 可能对应另一个账号与另一份账单。
+                            应用内这一份（{profile.credentialHint}）删掉后需要重新粘贴才能找回。
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <strong>删除后 {profile.label} 将没有任何可用凭据，连接会被禁用。</strong>
+                          <div style={{ marginTop: 4 }}>
+                            没有环境变量可以接手（
+                            {profile.credentialEnvVars.length > 0
+                              ? `${profile.credentialEnvVars.join(' / ')} 都未设置`
+                              : '该 provider 没有可用的环境变量入口'}
+                            ）。 正在使用这个 provider 的运行会在下一次模型调用时失败 ——
+                            路由在任务创建时就已冻结，不会自动换到别的 provider。删掉的明文需要重新粘贴才能找回。
+                          </div>
+                        </>
+                      ),
+                  }}
+                  onConfirm={() => void saveKey('')}
+                />
               )}
             </div>
             <div className="help">
               {profile.docUrl ? (
                 <>
-                  去 <span style={{ color: 'var(--accent)' }}>{safeHost(profile.docUrl)}</span> 获取。
+                  去 <span style={{ color: 'var(--accent-interactive)' }}>{safeHost(profile.docUrl)}</span> 获取。
                 </>
               ) : null}
               保存后立即生效，不用重启。
@@ -675,7 +881,7 @@ function ProviderRow({
             <div className="help">
               下拉里只是常见值，右边可以填任意 model id —— 中转站的模型名经常和官方对不上。
               {dirtyModel ? (
-                <span style={{ color: 'var(--warn)' }}> 未保存：回车或点开别处生效。</span>
+                <span style={{ color: 'var(--state-warning-fg)' }}> 未保存：回车或点开别处生效。</span>
               ) : (
                 <>
                   {' '}
@@ -715,7 +921,7 @@ function ProviderRow({
             <div className="help">
               填中转站地址即可走中转。当前生效：<code>{profile.origin}</code>
               {profile.isRelay && (
-                <span style={{ color: 'var(--warn)' }}>
+                <span style={{ color: 'var(--state-warning-fg)' }}>
                   {' '}
                   —— 你的代码上下文会经过这个第三方。
                 </span>
@@ -726,10 +932,34 @@ function ProviderRow({
           {!profile.builtIn && (
             <div className="row">
               <span className="spacer" />
-              <button
-                className="danger"
-                disabled={busy}
-                onClick={async () => {
+              <ConfirmAction
+                label="删除此 Provider…"
+                confirmLabel="确认删除 Provider"
+                busyLabel="删除中…"
+                busy={busy}
+                tone="err"
+                armKey={profile.providerId}
+                consequence={{
+                  kind: 'ready',
+                  detail: (
+                  <>
+                    <strong>删除 {profile.label} 会连同下列内容一起消失：</strong>
+                    <ul className="preview-list" style={{ fontFamily: 'inherit' }}>
+                      <li>这个 provider 的描述符（地址 {profile.origin}、协议 {profile.wire}）</li>
+                      <li>保存的模型选择（{profile.modelId || '未选'}）与自定义地址</li>
+                      <li>
+                        {profile.credentialSource === 'APP'
+                          ? `应用内保存的 API Key（${profile.credentialHint}）—— 一并删除，不会在磁盘上留下孤儿密文`
+                          : '（没有应用内 API Key 需要删除）'}
+                      </li>
+                    </ul>
+                    <div style={{ marginTop: 4 }}>
+                      正在使用它的运行会在下一次模型调用时失败：路由在任务创建时冻结，不会自动换 provider。
+                    </div>
+                  </>
+                  ),
+                }}
+                onConfirm={async () => {
                   setBusy(true);
                   try {
                     const r = await call('model.removeProvider', {
@@ -742,9 +972,7 @@ function ProviderRow({
                     setBusy(false);
                   }
                 }}
-              >
-                删除此 Provider
-              </button>
+              />
             </div>
           )}
         </div>

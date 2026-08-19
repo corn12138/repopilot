@@ -66,6 +66,7 @@ function makeView(status: RunStatus, runId = newId('run')): RunView {
     runId,
     taskId: newId('task'),
     projectId: 'proj_x',
+    snapshotId: 'snap_x',
     title: '修复构建失败',
     attemptId: newId('att'),
     attemptNo: 1,
@@ -390,6 +391,63 @@ describe('事件流与状态快照的一致性', () => {
     expect(all).toHaveLength(2);
     expect(all[0]!.summary).toContain('修复构建失败');
     expect(reader.after(1)).toHaveLength(1);
+  });
+});
+
+/**
+ * 日志中间坏一行，以前会让**它之后的全部事件**一起消失，而且一个数都不报。
+ * 缺口在界面上与"这个 Run 本来就只跑到这里"完全无法区分 ——
+ * 一份读不回来的日志不叫证据。
+ */
+describe('事件日志损坏要报数，不能静默截断', () => {
+  function corruptMiddleLine(runId: string): void {
+    const file = join(runDir(runId), 'events.jsonl');
+    const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    lines[1] = '{ this is not json';
+    writeFileSync(file, `${lines.join('\n')}\n`, 'utf8');
+  }
+
+  function seed(runId: string, count: number): void {
+    const writer = new EventStore(runId);
+    for (let i = 1; i <= count; i += 1) writer.append('att_1', 'NOTE', `事件 ${i}`);
+  }
+
+  it('坏行之后的事件仍被读出，损坏行数与首个坏行号可查', () => {
+    const runId = track(newId('run'));
+    seed(runId, 4);
+    corruptMiddleLine(runId);
+
+    const reader = new EventStore(runId);
+    const all = reader.all();
+    // 负向断言：以前 `break` 会让这里只剩 1 条。
+    expect(all).toHaveLength(3);
+    expect(all.map((e) => e.summary)).toEqual(['事件 1', '事件 3', '事件 4']);
+
+    const damage = reader.damageReport();
+    expect(damage).toEqual({ unparseableLines: 1, firstBadLine: 2 });
+  });
+
+  it('完好的日志报告 null，不制造假的损坏', () => {
+    const runId = track(newId('run'));
+    seed(runId, 3);
+    expect(new EventStore(runId).damageReport()).toBeNull();
+  });
+
+  it('损坏之后追加的事件不会复用已用过的 seq', () => {
+    const runId = track(newId('run'));
+    seed(runId, 4); // seq 1..4
+    corruptMiddleLine(runId); // seq 2 读不出来了
+
+    const writer = new EventStore(runId);
+    const appended = writer.append('att_1', 'NOTE', '损坏之后的新事件');
+
+    /*
+     * 负向断言：`seq: cache.length + 1` 会算出 4 —— 一个磁盘上已经存在的 seq。
+     * 那会让 after(3) 这样的游标查询漏掉或重复一段时间线。
+     */
+    expect(appended.seq).toBe(5);
+    expect(appended.seq).toBeGreaterThan(4);
+    expect(new EventStore(runId).after(4).map((e) => e.summary)).toEqual(['损坏之后的新事件']);
   });
 });
 

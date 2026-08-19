@@ -1,17 +1,153 @@
 :root {
-  --bg: #0e1116;
-  --bg-panel: #151a21;
-  --bg-elev: #1b222b;
-  --border: #262e3a;
-  --text: #dce3ec;
-  --text-dim: #8b97a8;
-  --text-faint: #5c6878;
-  --accent: #4c8dff;
-  --ok: #3fb950;
-  --warn: #d29922;
-  --err: #f85149;
-  --purple: #a371f7;
-  --mono: ui-monospace, 'SF Mono', Menlo, Monaco, monospace;
+  /*
+   * ═══ 三层 token ═══
+   * 第 1 层 palette：具体颜色值，每套主题一份。批 2 末已整体换成 warm（基线 v1.1）。
+   * 第 2 层 role：按用途命名（surface / text / state / accent…），换主题只重绑这一层。
+   *   组件**只许**引用第 2 层，不许直接引用第 1 层，更不许写裸 hex。
+   * 批 1 已把全部引用迁到角色名并删掉了旧名别名；组件里不再出现 --bg / --text-dim 这类名字。
+   * 批 2 把 :root 之外剩下的 45 处硬编码颜色收干净了 —— 换 warm 因此只改了这一段。
+   *
+   * border-control / stale 目前仍无消费者：定义它们不改变一像素，是给批 V 的落点。
+   *   border-control(#484542) 与 hairline(#2b2723) **值不同** —— 按钮/输入框现在用的是
+   *   hairline，改成 control 会真的改像素，属批 V 的决定。
+   *
+   * 设计基线：docs/design/design-baseline-v1.0-frozen.md §2.2 与 v1.1 增补。
+   * 对基线的两处有意偏离（tint α 的基底、warm tertiary 的亮度）各自写在下面，带数字。
+   */
+
+  /*
+   * ── 第 1 层 · palette · warm ──
+   * 值来自 design-baseline-v1.0-frozen.md v1.1「warm 色板」表。基线没给的几个，
+   * 沿基线自己的 ramp 外推 —— 反解 canvas→ink-1 这条线，基线给的三个面落在
+   * 6.1–6.8% / 10.4–11.8% / 12.7–14.1%，说明它本来就是同一条线上的三站，
+   * 所以 17% / 20% / 25% 是续这条线，不是另挑三个颜色。每个外推值下面标了它的用途。
+   */
+  --palette-canvas: #110f0d;
+  --palette-panel: #201d1a;
+  --palette-raised: #302c28;
+  --palette-hairline: #2b2723;
+  --palette-control-hover: #363431; /* ramp 17% · 控件 hover 面 */
+  --palette-overlay: #3d3a37; /* ramp 20% · popover / 弹层面 */
+  --palette-stroke-strong: #484542; /* ramp 25% · 强描边（批 V 才有消费者）*/
+  --palette-canvas-deep: #0b0a08; /* canvas 再压一档 · 终端与代码面 */
+
+  --palette-ink-1: #ede8e1;
+  --palette-ink-2: #b3aaa0;
+  /*
+   * 基线的 warm tertiary 是 #928a80，它在 raised 上只有 4.07 —— 基线用「禁入 raised」
+   * 这条用法规则兜住，但今天的组件确实把三级字放在 raised 上（renderProbe 每次都量）。
+   * 所以这里朝 ink-1 提亮 10%：#9b938a，canvas 6.32 / panel 5.54 / raised 4.57。
+   * 这是对基线的**有意偏离**，理由和批 2 偏离淡底 α 是同一条 —— 用法规则改不动的东西，
+   * 只能由颜色让步；等批 V 真把三级字从 raised 上撤掉，再把这个值放回 #928a80。
+   */
+  --palette-ink-3: #9b938a;
+  --palette-ink-code: #d3ccc4; /* ink-1 与 ink-2 之间 */
+  --palette-ink-on-solid: #1c1512; /* 基线 accent.fg-on-accent (dark) */
+
+  /*
+   * accent 从 blocked 里分出来了。v1.0 §2.1 让 blocked 和交互色同源（"可点、轮到你"），
+   * 但 v1.1 给了 accent 一个独立的角色和一个独立的色（铜 17°），并把 accent × 六语义色
+   * 的 ΔE₀₀ 加进门禁（14.3–45.9）—— 同源就没法过这一关。
+   */
+  --palette-accent: #c97a5b;
+  --palette-green: #6dbe93;
+  --palette-amber: #c9a05f;
+  --palette-red: #ed8b93;
+  --palette-blue: #77a9da;
+  --palette-purple: #a991d6;
+  --palette-copper: #bfa093;
+
+  /*
+   * ── 三个派生参数（第 1 层只出参数，值由第 2 层合成）──
+   *
+   * tint α：淡底 8% / 淡边 26%，基底是 canvas。这是对基线「mix(fg 14%, panel)」的
+   *   有意偏离，见批 2 记录 —— 基线那组数对应的是"淡底只给服务带、正文用中性字"的
+   *   v2 用法；今天正文用的还是语义色，panel@14% 会把对比度压到 4.5 以下。
+   *
+   * text α：淡底上的正文 = mix(语义色 85%, ink-1)。这个 85% 不是挑的，是**门槛倒推**的：
+   *   要求五个语义在自己淡底上全部 ≥7.0（WCAG AAA 正文），能过的最大 α 是 88%，
+   *   取整到 85%（最紧的 unknown 7.28）。cool 时代这四个值是手挑的、反解不出任何 α；
+   *   warm 没有历史包袱，所以直接按门槛定义，让门禁而不是眼睛来决定它。
+   */
+  --palette-tint-alpha-bg: 8%;
+  --palette-tint-alpha-border: 26%;
+  --palette-tint-text-alpha: 85%;
+
+  /* ── 第 2 层 · role（组件只引用这一层）── */
+  --surface-canvas: var(--palette-canvas);
+  --surface-panel: var(--palette-panel);
+  --surface-raised: var(--palette-raised);
+  --surface-overlay: var(--palette-overlay);
+  --border-hairline: var(--palette-hairline);
+  --border-control: var(--palette-stroke-strong);
+  /* 4px 进度轨道底 —— 用的是 hairline 的颜色，但它是面不是线，独立成角色便于批 V 单独调 */
+  --surface-track: var(--palette-hairline);
+  --text-primary: var(--palette-ink-1);
+  --text-secondary: var(--palette-ink-2);
+  --text-tertiary: var(--palette-ink-3);
+  --accent-interactive: var(--palette-accent);
+  --focus-ring: var(--palette-accent);
+  --state-verified-fg: var(--palette-green);
+  --state-warning-fg: var(--palette-amber);
+  --state-failed-fg: var(--palette-red);
+  /*
+   * blocked 不再与交互色同源。v1.0 §2.1 让它们共用一个蓝，理由是"blocked 是可点、
+   * 轮到你"；v1.1 把 accent 独立成铜色并把 accent × 六语义 ΔE₀₀ 写进门禁，同源必挂。
+   * "轮到你"改由形状轴（锁/斜切）与闸门位置承担 —— 那本来就是它该待的地方。
+   */
+  --state-blocked-fg: var(--palette-blue);
+  --state-unknown-fg: var(--palette-purple);
+  --state-stale-fg: var(--palette-copper);
+  --state-verified-fill: var(--palette-green);
+  --state-failed-fill: var(--palette-red);
+  --state-solid-ink: var(--palette-ink-on-solid);
+  --accent-interactive-hover: color-mix(in srgb, var(--palette-accent) var(--palette-tint-text-alpha), var(--palette-ink-1));
+  /*
+   * accent 底上的字用深墨，不是白字。
+   * 白字（#fff）在 --accent-interactive(#4c8dff) 上只有 3.20:1 —— 本来就不达标，
+   * 是批 2 把它算出来才暴露的。深墨 5.87:1，且与设计基线 v1.1 的 warm accent
+   * 用深墨(#1C1512 → 5.51)是同一个决定。
+   */
+  --accent-fg-on-accent: var(--palette-ink-on-solid);
+  --surface-control-hover: var(--palette-control-hover);
+  --surface-code: var(--palette-canvas-deep);
+  --text-code: var(--palette-ink-code);
+  /* 列表行分隔线：比卡片描边更弱，值等于 raised 面 */
+  --border-row: var(--palette-raised);
+
+  /*
+   * 语义色在淡底上的正文：由 --palette-tint-text-alpha 从语义色朝 ink-1 合成，
+   * 不再是四个手挑值。unknown 从前没有 strong（正文直接用 fg，只有 5.16），
+   * 这里补齐 —— 五个语义走同一条规则，才谈得上"换色板只改第 1 层"。
+   */
+  --state-verified-fg-strong: color-mix(in srgb, var(--state-verified-fg) var(--palette-tint-text-alpha), var(--palette-ink-1));
+  --state-warning-fg-strong: color-mix(in srgb, var(--state-warning-fg) var(--palette-tint-text-alpha), var(--palette-ink-1));
+  --state-failed-fg-strong: color-mix(in srgb, var(--state-failed-fg) var(--palette-tint-text-alpha), var(--palette-ink-1));
+  --state-blocked-fg-strong: color-mix(in srgb, var(--state-blocked-fg) var(--palette-tint-text-alpha), var(--palette-ink-1));
+  --state-unknown-fg-strong: color-mix(in srgb, var(--state-unknown-fg) var(--palette-tint-text-alpha), var(--palette-ink-1));
+
+  /*
+   * 淡底 / 淡边：由 α 与语义色**实时合成**，不是预算好的字面值。
+   * 用 color-mix 而不是硬编码，是为了让换色板这件事真的只改第 1 层 ——
+   * 预算值会在换 warm 时集体过期，而过期的派生值就是下一批硬编码。
+   */
+  --state-verified-tint-bg: color-mix(in srgb, var(--state-verified-fg) var(--palette-tint-alpha-bg), var(--surface-canvas));
+  --state-warning-tint-bg: color-mix(in srgb, var(--state-warning-fg) var(--palette-tint-alpha-bg), var(--surface-canvas));
+  --state-failed-tint-bg: color-mix(in srgb, var(--state-failed-fg) var(--palette-tint-alpha-bg), var(--surface-canvas));
+  --state-blocked-tint-bg: color-mix(in srgb, var(--state-blocked-fg) var(--palette-tint-alpha-bg), var(--surface-canvas));
+  --state-unknown-tint-bg: color-mix(in srgb, var(--state-unknown-fg) var(--palette-tint-alpha-bg), var(--surface-canvas));
+  --state-warning-tint-overlay: color-mix(in srgb, var(--state-warning-fg) 10%, transparent);
+  --state-verified-tint-border: color-mix(in srgb, var(--state-verified-fg) var(--palette-tint-alpha-border), var(--surface-canvas));
+  --state-warning-tint-border: color-mix(in srgb, var(--state-warning-fg) var(--palette-tint-alpha-border), var(--surface-canvas));
+  --state-failed-tint-border: color-mix(in srgb, var(--state-failed-fg) var(--palette-tint-alpha-border), var(--surface-canvas));
+  --state-blocked-tint-border: color-mix(in srgb, var(--state-blocked-fg) var(--palette-tint-alpha-border), var(--surface-canvas));
+  --state-unknown-tint-border: color-mix(in srgb, var(--state-unknown-fg) var(--palette-tint-alpha-border), var(--surface-canvas));
+
+  --shadow-popover: 0 8px 28px rgb(0 0 0 / 45%);
+  --shadow-overlay: 0 10px 34px rgb(0 0 0 / 50%);
+  --shadow-lift: 0 4px 14px rgb(0 0 0 / 45%);
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Monaco, monospace;
+
 }
 
 * {
@@ -26,8 +162,8 @@ body,
 }
 
 body {
-  background: var(--bg);
-  color: var(--text);
+  background: var(--surface-canvas);
+  color: var(--text-primary);
   font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
@@ -37,36 +173,36 @@ button {
   font: inherit;
   cursor: pointer;
   border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg-elev);
-  color: var(--text);
+  border: 1px solid var(--border-hairline);
+  background: var(--surface-raised);
+  color: var(--text-primary);
   padding: 6px 12px;
   transition: background 0.12s, border-color 0.12s;
 }
 button:hover:not(:disabled) {
-  background: #232c37;
-  border-color: #37414f;
+  background: var(--surface-control-hover);
+  border-color: var(--border-control);
 }
 button:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
+  background: var(--accent-interactive);
+  border-color: var(--accent-interactive);
+  color: var(--accent-fg-on-accent);
   font-weight: 500;
 }
 button.primary:hover:not(:disabled) {
-  background: #5d99ff;
-  border-color: #5d99ff;
+  background: var(--accent-interactive-hover);
+  border-color: var(--accent-interactive-hover);
 }
 button.danger {
-  color: var(--err);
-  border-color: #46262a;
+  color: var(--state-failed-fg);
+  border-color: var(--state-failed-tint-border);
 }
 button.danger:hover:not(:disabled) {
-  background: #2a1a1d;
+  background: var(--state-failed-tint-bg);
 }
 
 input,
@@ -74,17 +210,17 @@ textarea,
 select {
   font: inherit;
   width: 100%;
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: var(--surface-canvas);
+  border: 1px solid var(--border-hairline);
   border-radius: 6px;
-  color: var(--text);
+  color: var(--text-primary);
   padding: 7px 10px;
 }
 input:focus,
 textarea:focus,
 select:focus {
   outline: none;
-  border-color: var(--accent);
+  border-color: var(--focus-ring);
 }
 textarea {
   resize: vertical;
@@ -104,8 +240,8 @@ textarea {
 }
 
 .sidebar {
-  background: var(--bg-panel);
-  border-right: 1px solid var(--border);
+  background: var(--surface-panel);
+  border-right: 1px solid var(--border-hairline);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -121,7 +257,7 @@ textarea {
   letter-spacing: 0.3px;
 }
 .sidebar-head .sub {
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   font-size: 11px;
   margin-top: 2px;
 }
@@ -133,7 +269,7 @@ textarea {
 }
 
 .section-label {
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.8px;
@@ -152,20 +288,20 @@ textarea {
   margin-bottom: 2px;
 }
 .list-item:hover {
-  background: var(--bg-elev);
+  background: var(--surface-raised);
   border-color: transparent;
 }
 .list-item.active {
-  background: var(--bg-elev);
-  border-color: var(--border);
+  background: var(--surface-raised);
+  border-color: var(--border-hairline);
 }
 .list-item .name {
   font-size: 12.5px;
 }
 .list-item .meta {
-  color: var(--text-faint);
-  font-size: 10.5px;
-  font-family: var(--mono);
+  color: var(--text-tertiary);
+  font-size: 11.5px;
+  font-family: var(--font-mono);
   margin-top: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -184,8 +320,8 @@ textarea {
 /* ---------------------------------------------------------------- cards */
 
 .card {
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
+  background: var(--surface-panel);
+  border: 1px solid var(--border-hairline);
   border-radius: 10px;
   padding: 16px 18px;
   margin-bottom: 16px;
@@ -197,7 +333,7 @@ textarea {
 }
 .card h2 .hint {
   font-weight: 400;
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   margin-left: 8px;
   font-size: 11.5px;
 }
@@ -208,12 +344,12 @@ textarea {
 .field label {
   display: block;
   font-size: 11.5px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
   margin-bottom: 5px;
 }
 .field .help {
   font-size: 11px;
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   margin-top: 4px;
 }
 
@@ -235,45 +371,45 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 10.5px;
+  font-size: 11.5px;
   font-weight: 600;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   padding: 2px 7px;
   border-radius: 20px;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
+  border: 1px solid var(--border-hairline);
+  color: var(--text-secondary);
   white-space: nowrap;
 }
 .badge.ok {
-  color: var(--ok);
-  border-color: #1c3a24;
-  background: #101f14;
+  color: var(--state-verified-fg);
+  border-color: var(--state-verified-tint-border);
+  background: var(--state-verified-tint-bg);
 }
 .badge.warn {
-  color: var(--warn);
-  border-color: #3d3117;
-  background: #1f1a0c;
+  color: var(--state-warning-fg);
+  border-color: var(--state-warning-tint-border);
+  background: var(--state-warning-tint-bg);
 }
 .badge.err {
-  color: var(--err);
-  border-color: #46262a;
-  background: #211315;
+  color: var(--state-failed-fg);
+  border-color: var(--state-failed-tint-border);
+  background: var(--state-failed-tint-bg);
 }
 .badge.info {
-  color: var(--accent);
-  border-color: #1e3358;
-  background: #101a2b;
+  color: var(--accent-interactive);
+  border-color: var(--state-blocked-tint-border);
+  background: var(--state-blocked-tint-bg);
 }
 .badge.purple {
-  color: var(--purple);
-  border-color: #34275a;
-  background: #17122b;
+  color: var(--state-unknown-fg);
+  border-color: var(--state-unknown-tint-border);
+  background: var(--state-unknown-tint-bg);
 }
 
 /* ------------------------------------------------------------- timeline */
 
 .timeline {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11.5px;
 }
 .event {
@@ -281,36 +417,36 @@ textarea {
   grid-template-columns: 62px 150px 1fr;
   gap: 10px;
   padding: 4px 0;
-  border-bottom: 1px solid #1c222b;
+  border-bottom: 1px solid var(--border-row);
   align-items: baseline;
 }
 .event:last-child {
   border-bottom: none;
 }
 .event .time {
-  color: var(--text-faint);
+  color: var(--text-tertiary);
 }
 .event .kind {
-  color: var(--text-dim);
-  font-size: 10.5px;
+  color: var(--text-secondary);
+  font-size: 11.5px;
 }
 .event .summary {
   white-space: pre-wrap;
   word-break: break-word;
 }
 .event.err .summary {
-  color: var(--err);
+  color: var(--state-failed-fg);
 }
 .event.ok .summary {
-  color: var(--ok);
+  color: var(--state-verified-fg);
 }
 
 pre.output {
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: var(--surface-canvas);
+  border: 1px solid var(--border-hairline);
   border-radius: 6px;
   padding: 10px 12px;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.55;
   overflow-x: auto;
@@ -320,12 +456,12 @@ pre.output {
 }
 
 .diff {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.55;
   overflow-x: auto;
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: var(--surface-canvas);
+  border: 1px solid var(--border-hairline);
   border-radius: 6px;
   padding: 8px 0;
   max-height: 460px;
@@ -335,23 +471,23 @@ pre.output {
   white-space: pre;
 }
 .diff .line.add {
-  background: #0d2417;
-  color: #6fd48a;
+  background: var(--state-verified-tint-bg);
+  color: var(--state-verified-fg-strong);
 }
 .diff .line.del {
-  background: #2a1417;
-  color: #f08a86;
+  background: var(--state-failed-tint-bg);
+  color: var(--state-failed-fg-strong);
 }
 .diff .line.hunk {
-  color: var(--purple);
-  background: #17122b;
+  color: var(--state-unknown-fg-strong);
+  background: var(--state-unknown-tint-bg);
 }
 .diff .line.meta {
-  color: var(--text-faint);
+  color: var(--text-tertiary);
 }
 
 .toolcall {
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-hairline);
   border-radius: 7px;
   margin-bottom: 6px;
   overflow: hidden;
@@ -369,19 +505,19 @@ pre.output {
   display: none;
 }
 .toolcall summary:hover {
-  background: var(--bg-elev);
+  background: var(--surface-raised);
 }
 .toolcall .body {
   padding: 0 11px 11px;
 }
 .toolcall code {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11.5px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
 }
 
 .empty {
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   text-align: center;
   padding: 40px 20px;
   font-size: 12.5px;
@@ -395,19 +531,19 @@ pre.output {
   font-size: 12.5px;
 }
 .banner.err {
-  border-color: #46262a;
-  background: #1c1315;
-  color: #ffa198;
+  border-color: var(--state-failed-tint-border);
+  background: var(--state-failed-tint-bg);
+  color: var(--state-failed-fg-strong);
 }
 .banner.warn {
-  border-color: #3d3117;
-  background: #1c180e;
-  color: #e3b341;
+  border-color: var(--state-warning-tint-border);
+  background: var(--state-warning-tint-bg);
+  color: var(--state-warning-fg-strong);
 }
 .banner.info {
-  border-color: #1e3358;
-  background: #0f1724;
-  color: #9dc0ff;
+  border-color: var(--state-blocked-tint-border);
+  background: var(--state-blocked-tint-bg);
+  color: var(--state-blocked-fg-strong);
 }
 
 .kv {
@@ -417,11 +553,11 @@ pre.output {
   font-size: 12px;
 }
 .kv dt {
-  color: var(--text-faint);
+  color: var(--text-tertiary);
 }
 .kv dd {
   margin: 0;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11.5px;
   word-break: break-all;
 }
@@ -430,7 +566,7 @@ ul.plain {
   margin: 6px 0 0;
   padding-left: 18px;
   font-size: 12px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
 }
 ul.plain li {
   margin-bottom: 3px;
@@ -441,31 +577,31 @@ ul.plain li {
   align-items: center;
   gap: 9px;
   padding: 6px 0;
-  border-bottom: 1px solid #1c222b;
+  border-bottom: 1px solid var(--border-row);
   font-size: 12px;
 }
 .checkline:last-child {
   border-bottom: none;
 }
 .checkline .detail {
-  color: var(--text-faint);
-  font-family: var(--mono);
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
   font-size: 11px;
 }
 
 .chip {
   display: inline-block;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-hairline);
   border-radius: 5px;
   padding: 2px 7px;
   margin: 0 5px 5px 0;
 }
 .chip.selected {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--accent-interactive);
+  color: var(--accent-interactive);
 }
 
 /* --------------------------------------------------------- sidebar tree */
@@ -491,28 +627,28 @@ ul.plain li {
   top: 0;
   bottom: 0;
   width: 1px;
-  background: var(--border);
+  background: var(--border-hairline);
 }
 .run-item:hover {
-  background: var(--bg-elev);
+  background: var(--surface-raised);
 }
 .run-item.active {
-  background: var(--bg-elev);
-  border-color: var(--border);
+  background: var(--surface-raised);
+  border-color: var(--border-hairline);
 }
 .run-item .title {
   font-size: 11.5px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-dim);
+  color: var(--text-secondary);
 }
 .run-item.active .title {
-  color: var(--text);
+  color: var(--text-primary);
 }
 
 .sidebar-foot {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-hairline);
   padding: 8px 10px;
   display: flex;
   gap: 6px;
@@ -541,16 +677,16 @@ ul.plain li {
 .msg-gutter {
   font-size: 10px;
   font-weight: 600;
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   text-align: right;
   padding-top: 2px;
   letter-spacing: 0.3px;
 }
 .msg.user .msg-gutter {
-  color: var(--accent);
+  color: var(--accent-interactive);
 }
 .msg.agent .msg-gutter {
-  color: var(--purple);
+  color: var(--state-unknown-fg);
 }
 .msg-body {
   font-size: 12.5px;
@@ -559,9 +695,9 @@ ul.plain li {
   word-break: break-word;
 }
 .msg-time {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 10px;
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   text-align: right;
   padding-top: 3px;
   white-space: nowrap;
@@ -571,7 +707,7 @@ ul.plain li {
   margin: 4px 0 0;
   padding-left: 18px;
   font-size: 12px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
 }
 .plan-steps li {
   margin-bottom: 3px;
@@ -581,82 +717,82 @@ ul.plain li {
   display: flex;
   gap: 10px;
   align-items: baseline;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   padding: 3px 0 3px 44px;
 }
 .trace-line .msg-time {
   margin-left: auto;
 }
 .trace-line.ok {
-  color: var(--ok);
+  color: var(--state-verified-fg);
 }
 .trace-line.err {
-  color: var(--err);
+  color: var(--state-failed-fg);
 }
 .trace-line.warn {
-  color: var(--warn);
+  color: var(--state-warning-fg);
 }
 
 /* -------------------------------------------------------------- terminal */
 
 .term {
   margin: 8px 0 8px 44px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-hairline);
   border-radius: 8px;
   overflow: hidden;
-  background: #0a0d12;
+  background: var(--surface-code);
 }
 .term-head {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
-  background: var(--bg-elev);
-  border-bottom: 1px solid var(--border);
+  background: var(--surface-raised);
+  border-bottom: 1px solid var(--border-hairline);
   font-size: 11.5px;
 }
 .term-head code {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
 }
 .term-cmd {
   display: flex;
   gap: 6px;
   align-items: baseline;
   padding: 6px 10px 2px;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--text);
+  color: var(--text-primary);
 }
 .term-cmd .ok {
-  color: var(--ok);
-  font-size: 10.5px;
+  color: var(--state-verified-fg);
+  font-size: 11.5px;
 }
 .term-cmd .err {
-  color: var(--err);
-  font-size: 10.5px;
+  color: var(--state-failed-fg);
+  font-size: 11.5px;
 }
 .term-prompt {
-  color: var(--ok);
+  color: var(--state-verified-fg);
   font-weight: 600;
 }
 .term-body {
   margin: 0;
   padding: 6px 10px 10px;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.5;
-  color: #b7c2d0;
+  color: var(--text-code);
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 320px;
   overflow-y: auto;
 }
 .term-body.dim {
-  color: var(--text-faint);
+  color: var(--text-tertiary);
 }
 
 .toolrow {
@@ -665,8 +801,8 @@ ul.plain li {
   border-radius: 7px;
 }
 .toolrow[open] {
-  border-color: var(--border);
-  background: var(--bg-panel);
+  border-color: var(--border-hairline);
+  background: var(--surface-panel);
 }
 .toolrow summary {
   display: flex;
@@ -681,18 +817,18 @@ ul.plain li {
   display: none;
 }
 .toolrow summary:hover {
-  background: var(--bg-elev);
+  background: var(--surface-raised);
   border-radius: 7px;
 }
 .toolrow summary code {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: 11px;
 }
 .toolrow-body {
   padding: 0 9px 9px;
 }
 .toolrow-error {
-  color: var(--err);
+  color: var(--state-failed-fg);
   font-size: 11.5px;
   margin-bottom: 6px;
 }
@@ -700,7 +836,7 @@ ul.plain li {
 /* -------------------------------------------------------------- provider */
 
 .provider {
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-hairline);
   border-radius: 8px;
   margin-bottom: 8px;
   overflow: hidden;
@@ -713,11 +849,11 @@ ul.plain li {
   cursor: pointer;
 }
 .provider-head:hover {
-  background: var(--bg-elev);
+  background: var(--surface-raised);
 }
 .provider-body {
   padding: 4px 12px 14px 30px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-hairline);
 }
 .provider-body .row input {
   flex: 1;
@@ -730,8 +866,8 @@ ul.plain li {
 /* ------------------------------------------------------------ file panel */
 
 .filepanel {
-  background: var(--bg-panel);
-  border-left: 1px solid var(--border);
+  background: var(--surface-panel);
+  border-left: 1px solid var(--border-hairline);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -742,7 +878,7 @@ ul.plain li {
   align-items: center;
   gap: 6px;
   padding: 38px 10px 10px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-hairline);
 }
 .filepanel-head button {
   padding: 2px 7px;
@@ -755,7 +891,7 @@ ul.plain li {
   padding: 5px 8px;
 }
 .filepanel-error {
-  color: var(--err);
+  color: var(--state-failed-fg);
   font-size: 11px;
   padding: 6px 12px;
 }
@@ -777,18 +913,18 @@ ul.plain li {
   padding: 3px 6px;
   border-radius: 5px;
   font-size: 11.5px;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
 }
 .tree-row:hover {
-  background: var(--bg-elev);
+  background: var(--surface-raised);
 }
 .tree-row.active {
-  background: var(--bg-elev);
-  color: var(--accent);
+  background: var(--surface-raised);
+  color: var(--accent-interactive);
 }
 .tree-caret {
   width: 10px;
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   font-size: 9px;
   flex: none;
 }
@@ -798,19 +934,19 @@ ul.plain li {
   white-space: nowrap;
 }
 .tree-name.changed {
-  color: var(--ok);
+  color: var(--state-verified-fg);
 }
 .tree-dot {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: var(--ok);
+  background: var(--state-verified-fg);
   flex: none;
   margin-left: auto;
 }
 
 .filepanel-viewer {
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-hairline);
   display: flex;
   flex-direction: column;
   max-height: 52%;
@@ -820,7 +956,7 @@ ul.plain li {
   align-items: center;
   gap: 6px;
   padding: 7px 10px;
-  background: var(--bg-elev);
+  background: var(--surface-raised);
 }
 .filepanel-viewer-head button {
   padding: 1px 6px;
@@ -829,12 +965,12 @@ ul.plain li {
 .filepanel-code {
   margin: 0;
   padding: 8px 10px;
-  font-family: var(--mono);
-  font-size: 10.5px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
   line-height: 1.55;
   overflow: auto;
   white-space: pre;
-  color: #b7c2d0;
+  color: var(--text-code);
   flex: 1;
 }
 
@@ -869,13 +1005,13 @@ ul.plain li {
   align-items: center;
   gap: 10px;
   padding: 10px 28px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--surface-panel);
   flex-shrink: 0;
 }
 .chat-head-title {
   font-size: 12.5px;
-  color: var(--text);
+  color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -887,16 +1023,16 @@ ul.plain li {
 }
 .usage-chip {
   font-size: 11px;
-  color: var(--text-dim);
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-hairline);
   border-radius: 999px;
   padding: 3px 10px;
 }
 .usage-chip.open,
 .usage-chip:hover {
-  color: var(--text);
-  border-color: var(--accent);
+  color: var(--text-primary);
+  border-color: var(--accent-interactive);
 }
 .usage-pop {
   position: absolute;
@@ -904,11 +1040,11 @@ ul.plain li {
   top: calc(100% + 8px);
   z-index: 30;
   width: 320px;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-hairline);
   border-radius: 10px;
   padding: 12px 14px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-popover);
 }
 .usage-row {
   display: grid;
@@ -920,21 +1056,21 @@ ul.plain li {
 .usage-label {
   grid-area: label;
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
 }
 .usage-value {
   grid-area: value;
   text-align: right;
   font-size: 11px;
-  font-family: var(--mono);
-  color: var(--text);
+  font-family: var(--font-mono);
+  color: var(--text-primary);
 }
 .usage-track {
   grid-area: track;
   height: 4px;
   margin-top: 4px;
   border-radius: 2px;
-  background: var(--border);
+  background: var(--surface-track);
   overflow: hidden;
 }
 .usage-fill {
@@ -943,9 +1079,9 @@ ul.plain li {
 }
 .usage-note {
   margin-top: 10px;
-  font-size: 10.5px;
+  font-size: 11.5px;
   line-height: 1.5;
-  color: var(--text-faint);
+  color: var(--text-tertiary);
 }
 
 /* ---------------------------------------------------------------- dock */
@@ -954,15 +1090,15 @@ ul.plain li {
   align-items: center;
   gap: 10px;
   padding: 10px 28px;
-  border-top: 1px solid var(--border);
-  background: var(--bg-panel);
+  border-top: 1px solid var(--border-hairline);
+  background: var(--surface-panel);
   flex-shrink: 0;
 }
 .dock-plan {
-  border-top: 1px solid var(--purple);
+  border-top: 1px solid var(--state-unknown-fg);
 }
 .dock-patch {
-  border-top: 1px solid var(--accent);
+  border-top: 1px solid var(--accent-interactive);
 }
 .dock-text {
   display: flex;
@@ -976,7 +1112,7 @@ ul.plain li {
 }
 .dock-sub {
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -984,19 +1120,19 @@ ul.plain li {
 
 /* ---------------------------------------------------------------- composer */
 .composer {
-  border-top: 1px solid var(--border);
-  background: var(--bg);
+  border-top: 1px solid var(--border-hairline);
+  background: var(--surface-canvas);
   padding: 10px 28px 14px;
   flex-shrink: 0;
 }
 .composer-note {
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
   margin-bottom: 8px;
 }
 .composer-empty {
   font-size: 12px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
   padding: 6px 0;
 }
 .composer-chips {
@@ -1007,29 +1143,29 @@ ul.plain li {
   margin-bottom: 8px;
 }
 .composer-chips-label {
-  font-size: 10.5px;
-  color: var(--text-faint);
+  font-size: 11.5px;
+  color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.4px;
   margin-right: 2px;
 }
 .composer-unverified {
   font-size: 11px;
-  color: var(--warn);
+  color: var(--state-warning-fg);
 }
 .composer-box textarea {
   width: 100%;
   min-height: 64px;
   resize: vertical;
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-hairline);
   border-radius: 10px;
   padding: 10px 12px;
   font-size: 13px;
   line-height: 1.5;
 }
 .composer-box textarea:focus {
-  border-color: var(--accent);
+  border-color: var(--focus-ring);
   outline: none;
 }
 .composer-bar {
@@ -1040,14 +1176,14 @@ ul.plain li {
 }
 .composer-adv {
   font-size: 11.5px;
-  color: var(--text-dim);
+  color: var(--text-secondary);
 }
 .composer-adv.open {
-  color: var(--accent);
+  color: var(--accent-interactive);
 }
 .composer-hint {
   font-size: 11px;
-  color: var(--purple);
+  color: var(--state-unknown-fg);
 }
 .composer-model {
   max-width: 320px;
@@ -1066,10 +1202,10 @@ ul.plain li {
   max-height: 60vh;
   overflow-y: auto;
   padding: 10px 14px 8px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-hairline);
   border-radius: 12px;
-  background: var(--bg-elev);
-  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-overlay);
 }
 .composer-advanced-head {
   display: flex;
@@ -1077,12 +1213,12 @@ ul.plain li {
   gap: 8px;
   padding-bottom: 8px;
   margin-bottom: 10px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-hairline);
   font-size: 12.5px;
 }
 .composer-advanced-hint {
   font-size: 11px;
-  color: var(--text-faint);
+  color: var(--text-tertiary);
 }
 .popover-backdrop {
   position: fixed;
@@ -1094,7 +1230,7 @@ ul.plain li {
   background: none;
   border: none;
   padding: 0;
-  color: var(--accent);
+  color: var(--accent-interactive);
   cursor: pointer;
   font-size: inherit;
 }
@@ -1118,30 +1254,30 @@ ul.plain li {
  * 平台的标注刻意做得比 AI 输出更轻 —— 它是注脚，不是对话主体。
  */
 .msg.platform .msg-gutter {
-  color: var(--text-faint);
+  color: var(--text-tertiary);
   font-weight: 400;
 }
 .msg.platform .msg-body {
-  color: var(--text-dim);
+  color: var(--text-secondary);
   font-size: 12px;
 }
 .msg.agent .msg-gutter {
-  color: var(--purple);
+  color: var(--state-unknown-fg);
 }
 .msg.user .msg-gutter {
-  color: var(--accent);
+  color: var(--accent-interactive);
 }
 
 /* 回合：一次模型思考 + 它引发的工具调用，默认折叠成一行 */
 .turn {
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-hairline);
   border-radius: 8px;
   margin: 6px 0;
-  background: var(--bg-panel);
+  background: var(--surface-panel);
   overflow: hidden;
 }
 .turn[open] {
-  border-color: #33405a;
+  border-color: var(--border-control);
 }
 .turn-head {
   display: flex;
@@ -1156,43 +1292,43 @@ ul.plain li {
   display: none;
 }
 .turn-head:hover {
-  background: var(--bg-elev);
+  background: var(--surface-raised);
 }
 .turn-index {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-tertiary);
   min-width: 24px;
 }
 .turn-purpose {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--purple);
-  border: 1px solid #34275a;
-  background: #17122b;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--state-unknown-fg);
+  border: 1px solid var(--state-unknown-tint-border);
+  background: var(--state-unknown-tint-bg);
   border-radius: 20px;
   padding: 1px 7px;
 }
 .turn-detail {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 40%;
 }
 .turn-count {
-  font-size: 10.5px;
-  color: var(--text-dim);
+  font-size: 11.5px;
+  color: var(--text-secondary);
 }
 .turn-count.bad {
-  color: var(--err);
+  color: var(--state-failed-fg);
 }
 .turn-tools {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1200,7 +1336,7 @@ ul.plain li {
 }
 .turn-body {
   padding: 4px 10px 8px 34px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--border-hairline);
 }
 
 /* --------------------------------------------- 任务选项 / 自定义命令的状态回显 */
@@ -1209,12 +1345,12 @@ ul.plain li {
  * 用同样的选中态显示就是在骗人。用虚线 + 警示色表示"还差一步"。
  */
 .chip.pending {
-  border-color: var(--warn);
+  border-color: var(--state-warning-fg);
   border-style: dashed;
-  color: var(--warn);
+  color: var(--state-warning-fg);
 }
 .composer-adv.has-config {
-  color: var(--text);
+  color: var(--text-primary);
 }
 .adv-count {
   display: inline-block;
@@ -1222,8 +1358,8 @@ ul.plain li {
   padding: 0 4px;
   margin-left: 4px;
   border-radius: 999px;
-  background: var(--accent);
-  color: #0b1220;
+  background: var(--accent-interactive);
+  color: var(--state-solid-ink);
   font-size: 10px;
   font-weight: 600;
   text-align: center;
@@ -1235,10 +1371,217 @@ ul.plain li {
   flex-wrap: wrap;
 }
 .configured-chip {
-  font-size: 10.5px;
-  color: var(--text-dim);
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-hairline);
   border-radius: 999px;
   padding: 1px 7px;
+}
+
+/* =================================================================== Slice B
+ * 诚实的过渡、就地反馈与无障碍基线。
+ *
+ * 三条约束贯穿这一段：
+ *   1. 动效只做 opacity + 位移，不改变布局事实，也不冒充进度；
+ *   2. 任何运动都必须能被 prefers-reduced-motion 关掉，且关掉后功能不缺失；
+ *   3. 键盘用户必须看得见焦点 —— 之前全局去掉了 outline，等于让键盘路径隐身。
+ */
+
+/* ------------------------------------------------------------ 焦点可见性 */
+/*
+ * 统一用 :focus-visible：鼠标点击不显示焦点环，键盘 Tab 一定显示。
+ * 这比"到处 outline: none"安全，也比"永远显示 outline"干净。
+ */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-color: var(--focus-ring);
+}
+
+/* --------------------------------------------------------------- 入场动效 */
+/*
+ * 140ms 落在任务书要求的 120–160ms 区间内。位移只有 4px 且用 transform，
+ * 不参与布局计算 —— 所以卡片不会在动画期间把下面的内容顶来顶去。
+ */
+@keyframes rp-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rp-enter {
+  animation: rp-enter 140ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /*
+   * 用户要求减少动效时，全部非必要运动关闭 —— 包括 button 的颜色过渡。
+   * 注意关的是"运动"，不是"状态"：颜色、禁用、busy 文案仍然照常变化。
+   */
+  .rp-enter {
+    animation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ------------------------------------------------------- 新事件跟随提示 */
+/*
+ * 外层是一个零高度的常规流元素，插在滚动区与停靠条之间；内层绝对定位并向上偏移，
+ * 于是提示浮在时间线底部、审批停靠条之上。零高度是关键：这个提示会频繁出现和消失，
+ * 一旦占据布局空间，每次出现都会把整条时间线顶一下 —— 那正是要消除的"生硬"。
+ * pointer-events 只在按钮上打开，避免透明容器吞掉下面内容的点击。
+ */
+.follow-nudge {
+  position: relative;
+  height: 0;
+  z-index: 5;
+}
+.follow-nudge-inner {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 10px;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+.follow-nudge-button {
+  pointer-events: auto;
+  background: var(--accent-interactive);
+  border-color: var(--accent-interactive);
+  color: var(--accent-fg-on-accent);
+  font-weight: 500;
+  font-size: 12px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-lift);
+  animation: rp-enter 140ms ease-out both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .follow-nudge-button {
+    animation: none;
+  }
+}
+
+/* --------------------------------------------------------- 省略披露 */
+.transcript-omissions {
+  margin-top: 14px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border-hairline);
+  border-radius: 6px;
+  background: var(--surface-panel);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+.transcript-omissions-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.transcript-omissions-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  line-height: 1.6;
+}
+.transcript-omissions-hard {
+  color: var(--text-tertiary);
+}
+
+/* ------------------------------------------------- 工具预览的截断交代 */
+.preview-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+.preview-footer code {
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+}
+
+/* --------------------------------------------------- 文件面板的上一代态 */
+.filepanel-stale {
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--state-warning-fg);
+  background: var(--state-warning-tint-overlay);
+  border-bottom: 1px solid var(--border-hairline);
+}
+/*
+ * 上一代内容保持可见是为了不闪屏，但必须一眼看出它不是当前事实，
+ * 而且不能被点击 —— 对过期坐标系操作只会换来一个 Core 的 CONFLICT。
+ */
+.filepanel-tree.stale,
+.filepanel-viewer.stale {
+  opacity: 0.55;
+}
+
+/* ------------------------------------------------- provider 展开头（语义化后） */
+.provider-head {
+  cursor: default;
+}
+/*
+ * 展开头本体现在是 button：它要看起来还是那一行，所以去掉按钮的外观，
+ * 但保留按钮的一切行为（Tab、Enter/Space、:focus-visible 焦点环）。
+ */
+.provider-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 2px 4px;
+  color: inherit;
+}
+.provider-toggle:hover:not(:disabled) {
+  background: transparent;
+  border-color: transparent;
+}
+.transcript-omissions-merged {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border-hairline);
+  color: var(--text-tertiary);
+  line-height: 1.6;
+}
+
+/* --------------------------------------------------- 高影响动作的两段式确认 */
+.confirm-action {
+  min-width: 260px;
+}
+.confirm-action .banner {
+  margin: 0;
+}
+.confirm-action .preview-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  max-height: 160px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
 }

@@ -50,7 +50,8 @@
 - 每个「修好了」都要有测试或运行输出撑着，别写没跑过的结论。
 - 负向测试是主体。正向路径不容易错，错都错在边界上。
 - 改了行为就同步改测试断言，不要让断言变成过期的装饰。
-- 自检和测试**不能留下持久化改动**（写了配置就要还原）。
+- 自检和测试**不能留下持久化改动**（写了配置就要还原）。自检更进一步：不在真实
+  data root 上跑，隔离由 `REPOPILOT_DATA_ROOT` 保证，缺隔离时写入型用例直接 `BLOCKED`。
 
 ## 范围纪律
 
@@ -65,10 +66,14 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 44 个测试，含真实 tsc + vite build 的端到端链路
-pnpm selftest   # 三进程 + IPC + Renderer 挂载自检
+pnpm test       # 43 个文件 / 777 个测试，含真实 tsc + vite build 的端到端链路
+pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 ```
+
+`pnpm test` 里 Renderer 部分跑在 jsdom 下，是真实 DOM 断言。`pnpm selftest` 需要
+Electron 运行时，所以不在 `pnpm test` 里；它会在启动 Core 前把 `REPOPILOT_DATA_ROOT`
+指向一次性目录并在 `finally` 里删掉，不碰你的真实数据与凭据。
 
 端到端测试需要 fixture 的依赖：
 
