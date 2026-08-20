@@ -41,7 +41,7 @@ describe('IPC 合同表', () => {
   });
 
   it('Renderer 拿不到 Main 内部方法的合同', () => {
-    for (const internal of ['__project.register', '__patch.content', '__patch.applyToRepo', '__credentials.sync']) {
+    for (const internal of ['__project.register', '__patch.exportGrant', '__patch.applyToRepo', '__credentials.sync']) {
       expect(ALLOWED_METHODS.has(internal)).toBe(false);
     }
   });

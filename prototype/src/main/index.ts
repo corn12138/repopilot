@@ -1,5 +1,5 @@
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import {
@@ -12,7 +12,7 @@ import {
   type UtilityProcess,
 } from 'electron';
 import * as credentials from './credentials';
-import type { DoctorCheck } from '@shared/domain';
+import type { DoctorCheck, PatchExportGrant } from '@shared/domain';
 import {
   IPC_CHANNEL,
   PROTOCOL_VERSION,
@@ -23,6 +23,11 @@ import {
 } from '@shared/protocol';
 import { isRequestMethod, methodTimeoutMs } from '@shared/ipcContract';
 import { classifyEnvelope } from './envelope';
+import {
+  ExportDestinationError,
+  classifyExportDestination,
+  writeExportAtomically,
+} from './patchExport';
 import { probeRenderedStyles } from './renderProbe';
 import { DATA_ROOT_ENV, isIsolatedDataRoot, resolveDataRoot } from '@shared/dataRoot';
 import { CoreRequestBroker } from './coreChannel';
@@ -362,21 +367,37 @@ async function exportPatch(req: ExportRequest): Promise<IpcResult<unknown>> {
     });
   }
 
-  const contentResult = await callCore('__patch.content', {
+  /*
+   * 一次性导出授权（PRD-DIFF-004）。Core 一并给出内容、内容 digest、和一份
+   * "绝对不能写进去"的目录清单；无论成功还是失败，这张票都要回报给 Core 消费掉。
+   * 分两次拿（先内容后授权）会在中间留一个"补丁已变但票还有效"的窗口，所以是一次调用。
+   */
+  const granted = await callCore('__patch.exportGrant', {
     runId: req.runId,
     patchId: req.patchId,
   });
-  if (!contentResult.ok) return contentResult;
-  const { filename, content } = contentResult.data as { filename: string; content: string };
+  if (!granted.ok) return granted;
+  const { grant, content } = granted.data as { grant: PatchExportGrant; content: string };
+  const settle = (
+    outcome: 'WRITTEN' | 'CANCELLED' | 'REJECTED' | 'FAILED',
+    extra: Record<string, unknown> = {},
+  ): Promise<IpcResult<unknown>> =>
+    callCore('__patch.exportResult', { grantId: grant.grantId, outcome, ...extra });
 
   if (req.mode === 'COPY') {
     clipboard.writeText(content);
+    await settle('WRITTEN', {
+      targetName: '(剪贴板)',
+      bytes: grant.byteLength,
+      overwrote: false,
+      contentDigest: grant.contentDigest,
+    });
     return {
       ok: true,
       data: {
         ok: true,
         mode: 'COPY',
-        detail: `${Buffer.byteLength(content, 'utf8')} 字节已复制到剪贴板`,
+        detail: `${grant.byteLength} 字节已复制到剪贴板`,
         target: null,
       },
     };
@@ -384,26 +405,44 @@ async function exportPatch(req: ExportRequest): Promise<IpcResult<unknown>> {
 
   const chosen = await dialog.showSaveDialog(mainWindow!, {
     title: '保存补丁',
-    defaultPath: join(app.getPath('downloads'), filename),
+    defaultPath: join(app.getPath('downloads'), grant.filename),
     filters: [{ name: 'Patch', extensions: ['patch', 'diff'] }],
   });
   if (chosen.canceled || !chosen.filePath) {
+    await settle('CANCELLED', { detail: '用户取消' });
     return { ok: true, data: { ok: false, reason: 'CANCELLED', detail: '已取消' } };
   }
-  try {
-    writeFileSync(chosen.filePath, content, 'utf8');
-  } catch (err) {
-    return {
-      ok: true,
-      data: { ok: false, reason: 'WRITE_FAILED', detail: (err as Error).message },
-    };
+
+  // 选完先判一次：受保护根 / 符号链接 / 父目录不可解析。写之前还会再判一次（TOCTOU）
+  const verdict = classifyExportDestination(chosen.filePath, grant.forbiddenRoots);
+  if (!verdict.ok) {
+    await settle('REJECTED', { detail: `${verdict.reason}: ${verdict.detail}` });
+    return { ok: true, data: { ok: false, reason: verdict.reason, detail: verdict.detail } };
   }
+
+  let written;
+  try {
+    written = writeExportAtomically(chosen.filePath, content, grant.forbiddenRoots);
+  } catch (err) {
+    const reason = err instanceof ExportDestinationError ? err.reason : 'WRITE_FAILED';
+    await settle(err instanceof ExportDestinationError ? 'REJECTED' : 'FAILED', {
+      detail: (err as Error).message,
+    });
+    return { ok: true, data: { ok: false, reason, detail: (err as Error).message } };
+  }
+
+  await settle('WRITTEN', {
+    targetName: basename(chosen.filePath),
+    bytes: written.bytes,
+    overwrote: written.overwrote,
+    contentDigest: grant.contentDigest,
+  });
   return {
     ok: true,
     data: {
       ok: true,
       mode: 'SAVE_FILE',
-      detail: `已保存 ${Buffer.byteLength(content, 'utf8')} 字节`,
+      detail: `已保存 ${written.bytes} 字节${written.overwrote ? '（覆盖了同名文件）' : ''}`,
       target: basename(chosen.filePath),
     },
   };

@@ -6,6 +6,7 @@ import type {
   CommandDefinition,
   DataEgressConsent,
   DataEgressDisclosure,
+  PatchExportGrant,
   FailureClass,
   ModelConnectionProfile,
   LedgerCharge,
@@ -224,6 +225,8 @@ export class PausableDeadline {
 const EXTERNAL_REVIEW_TIMEOUT_MS = 300_000;
 /** 外部作者单次调用上限：改代码比审代码慢得多，但仍受任务墙钟预算收口 */
 const EXTERNAL_AUTHOR_TIMEOUT_MS = 900_000;
+/** 导出授权有效期：够用户在保存对话框里挑个位置，不够拿去以后重放 */
+const EXPORT_GRANT_TTL_MS = 5 * 60 * 1000;
 
 /** 审核方绑定：模型 API 与外部 CLI 两种选手，规则完全相同 */
 /**
@@ -422,6 +425,12 @@ export class RunAuthority {
    * 调用约定：**先 append 事件，再调这个**。事件流是流水账，状态快照是结算结果；
    * 顺序反了会在崩溃窗口里产生"状态说成功、时间线停在半路"的说谎方式。
    */
+  /**
+   * 未消费的导出授权（PRD-DIFF-004）。一次性 + TTL：
+   * 消费即删除，过期即无效。进程重启后全部作废 —— 授权不该跨重启存活。
+   */
+  private readonly exportGrants = new Map<string, PatchExportGrant>();
+
   private persist(record: RunRecord): void {
     try {
       writeRunState({
@@ -815,17 +824,11 @@ export class RunAuthority {
         );
 
       // Main 需要补丁正文来存文件 / 写剪贴板；这两件事是原生能力，由 Main 做
-      case '__patch.content': {
-        const rec = this.require(String(payload.runId));
-        if (!rec.patch || rec.patch.patchId !== String(payload.patchId)) {
-          throw platformError('NOT_FOUND', '补丁不存在或已变化');
-        }
-        return {
-          filename: suggestPatchFilename(rec),
-          content: renderPatchFile(rec),
-          digest: rec.patch.digest,
-        };
-      }
+      case '__patch.exportGrant':
+        return this.issueExportGrant(String(payload.runId), String(payload.patchId));
+
+      case '__patch.exportResult':
+        return this.settleExportGrant(payload as never);
 
       case '__patch.applyToRepo':
         return this.applyPatchToRepo(
@@ -2532,7 +2535,7 @@ export class RunAuthority {
    *   - unverifiedItems 头部有显式挽救标记，UI 靠它给出"不能接受"的横幅；
    *   - 它永远无法被接受：decidePatch 只认 AWAITING_PATCH_REVIEW，
    *     applyPatchToRepo 只认接受态 —— 两道既有门禁都在终态前面，
-   *     所以挽救补丁只能被检视 / 复制 / 存盘（__patch.content 无接受态门禁，这是有意的）。
+   *     所以挽救补丁只能被检视 / 复制 / 存盘（导出授权无接受态门禁，这是有意的）。
    *   - 封存自身失败绝不掩盖原始失败：包在 try/catch 里降级为 NOTE。
    *
    * 已知不做的：TIMED_OUT 路径（deadline 回调先把终态定了，之后补 patch 不会
@@ -3115,6 +3118,123 @@ export class RunAuthority {
 
     void this.execute(record, resolution);
     return record.view;
+  }
+
+  /**
+   * 签发一次性导出授权。
+   *
+   * 三件事在这里做，因为只有 Core 知道：补丁是不是当前那一份（digest）、
+   * 哪些目录绝对不能写（项目仓库 / 受管数据根 / 活动工作区）、以及要导出的字节里
+   * 有没有高置信度凭据（导出是 DLP 的 `PATCH_EXPORT` 阶段，与出站那道同源）。
+   *
+   * 内容与授权一起返回：分两次调用会在中间留一个"补丁已经变了但票还有效"的窗口。
+   */
+  private issueExportGrant(
+    runId: string,
+    patchId: string,
+  ): { grant: PatchExportGrant; content: string } {
+    const record = this.require(runId);
+    if (!record.patch || record.patch.patchId !== patchId) {
+      throw platformError('NOT_FOUND', '补丁不存在或已变化');
+    }
+    const content = renderPatchFile(record);
+    /*
+     * 导出期 DLP：补丁正文会离开应用落到用户磁盘上。fs_read 那道闸挡住了"含凭据的文件
+     * 进入模型上下文"，但 diff 的上下文行仍可能带出邻近的凭据 —— 这是最后一道。
+     * 与出站一样 fail-closed，没有"仍然导出"。
+     */
+    const hits = scanSegments([{ text: content, where: `patch:${patchId}` }]);
+    if (hits.length > 0) {
+      this.emit(record, 'PATCH_EXPORTED', `导出被拒绝：${describeDlpHits(hits)}`, {
+        patchId,
+        outcome: 'BLOCKED_DLP',
+      });
+      throw platformError(
+        'POLICY_DENIED',
+        `补丁内容含高置信度凭据（${describeDlpHits(hits)}），已拒绝导出`,
+        '请先把凭据从仓库里移除并重新导入；导出会把这些字节写到你的磁盘上',
+      );
+    }
+
+    const project = this.projects.get(record.view.projectId);
+    const forbiddenRoots = [
+      // 项目仓库本身：把 .patch 存进正在被修的仓库，下一次导入就会把它当源码收进快照
+      ...(project ? [project.hostPath] : []),
+      // 受管数据根（快照/工作区/证据/凭据都在里面）：保留策略会把陌生文件当垃圾清掉
+      PATHS.root,
+    ];
+    const grant: PatchExportGrant = {
+      grantId: newId('xgrant'),
+      runId,
+      patchId,
+      patchDigest: record.patch.digest,
+      contentDigest: digestOf({ content }),
+      filename: suggestPatchFilename(record),
+      byteLength: Buffer.byteLength(content, 'utf8'),
+      forbiddenRoots,
+      issuedAt: nowIso(),
+      expiresAt: new Date(Date.now() + EXPORT_GRANT_TTL_MS).toISOString(),
+    };
+    this.exportGrants.set(grant.grantId, grant);
+    return { grant, content };
+  }
+
+  /**
+   * 消费一张导出授权并记账。
+   *
+   * 一次性：无论成功、被拒还是取消，票据都在这里作废 —— 想再导一次就得再要一张。
+   * 这样"选完路径之后又改主意"和"重放同一张票写第二个地方"都不可能。
+   */
+  private settleExportGrant(input: {
+    grantId: string;
+    outcome: 'WRITTEN' | 'CANCELLED' | 'REJECTED' | 'FAILED';
+    detail?: string;
+    targetName?: string;
+    bytes?: number;
+    overwrote?: boolean;
+    contentDigest?: string;
+  }): { accepted: boolean; reason: string | null } {
+    const grant = this.exportGrants.get(input.grantId);
+    if (!grant) {
+      // 票不存在 = 已经用过或已过期。这不是异常，是"这次导出不算数"
+      return { accepted: false, reason: '导出授权不存在、已使用或已过期' };
+    }
+    this.exportGrants.delete(input.grantId);
+    const record = this.runs.get(grant.runId);
+    if (!record) return { accepted: false, reason: 'Run 不存在' };
+
+    if (Date.parse(grant.expiresAt) < Date.now()) {
+      this.emit(record, 'PATCH_EXPORTED', '导出授权已过期，本次导出不计入', {
+        patchId: grant.patchId,
+        outcome: 'EXPIRED',
+      });
+      return { accepted: false, reason: '导出授权已过期' };
+    }
+    if (input.outcome === 'WRITTEN' && input.contentDigest !== grant.contentDigest) {
+      this.emit(record, 'PATCH_EXPORTED', '导出内容与授权的 digest 不一致，已记为无效', {
+        patchId: grant.patchId,
+        outcome: 'DIGEST_MISMATCH',
+      });
+      return { accepted: false, reason: '导出内容与授权不一致' };
+    }
+    this.emit(
+      record,
+      'PATCH_EXPORTED',
+      input.outcome === 'WRITTEN'
+        ? `补丁已导出到 ${input.targetName ?? '(未记录文件名)'}（${input.bytes ?? 0} 字节${input.overwrote ? '，覆盖了同名文件' : ''}）`
+        : `导出未完成（${input.outcome}）：${input.detail ?? ''}`,
+      {
+        patchId: grant.patchId,
+        patchDigest: grant.patchDigest,
+        // 只记文件名，不记宿主绝对路径 —— 事件流是要给人看、也要能导出的
+        targetName: input.targetName ?? null,
+        outcome: input.outcome,
+        bytes: input.bytes ?? null,
+        overwrote: input.overwrote ?? null,
+        detail: input.detail ?? null,
+      },
+    );
+    return { accepted: input.outcome === 'WRITTEN', reason: null };
   }
 
   private setStatus(

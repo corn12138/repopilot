@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 50 个文件、912 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 51 个文件、929 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -333,8 +333,24 @@ CLI 跑起来时的隔离是硬的：
 | 方式 | 行为 |
 |---|---|
 | 复制到剪贴板 | 带元信息头（base、baseKind、是否验证、未验证项、apply/revert 命令）的完整 patch 文本 |
-| 保存为 `.patch` | 同上，写到你选的位置 |
+| 保存为 `.patch` | 同上，写到你选的位置 —— 但要先领一张一次性的导出票 |
 | 应用到仓库 | 真的写宿主文件。二次确认 → `git apply --check` 干跑 → 通过才写 |
+
+「保存为 `.patch`」在 08-17 审计里是个洞：主进程自己从 Core 拿到补丁全文，
+自己 `writeFileSync` 到用户选的任意路径，Core 不知道这件事发生过、也没机会说不。
+现在它走 **PatchExportGrant**：
+
+| 环节 | 规则 |
+|---|---|
+| 签发 | `patch.exportGrant` 出票，一次性、5 分钟 TTL、绑 runId+patchId+内容 digest |
+| 内容 | 只从票里拿。票过期/用过/digest 对不上 → 拒绝，主进程手上没有第二份全文 |
+| 目的地 | 父目录 `realpathSync` 之后判：在项目仓库或 RepoPilot 数据根之内 → `FORBIDDEN_ROOT`；不是普通文件（符号链接、目录）→ `NOT_A_REGULAR_FILE` |
+| 写入 | 同目录临时文件 + `openSync(…, 'wx')` + `renameSync`；写之前**再判一次**目的地（TOCTOU） |
+| 落账 | 四种结局（写了/取消/被拒/失败）都回 `settle`，进事件流 `PATCH_EXPORTED`；记的是**文件名**，不是宿主绝对路径 |
+| 出站 | 出票时跑一遍导出期 DLP，把命中的段落报给用户 —— 补丁离开应用之前的最后一道 |
+
+"不能存进项目仓库"不是洁癖：把 `.patch` 落进被快照的仓库里，下一次导入就会把它
+当成源码，而"宿主仓库只读"这条不变式在那一刻就已经破了。
 
 应用是原型里**唯一**会写你仓库的路径，所以刻意做得很窄：交给 `git apply`，
 不用 `--3way`、不用 `--reject`、不自动 commit、不自动 stage。

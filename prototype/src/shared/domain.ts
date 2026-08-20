@@ -434,6 +434,8 @@ export type RunEventKind =
   | 'VERIFICATION_FINISHED'
   | 'PATCH_SEALED'
   | 'PATCH_DECISION'
+  /** 一次补丁导出的结果（成功/被拒/取消都记）—— 这是补丁离开应用的唯一出口 */
+  | 'PATCH_EXPORTED'
   /** 用户 REQUEST_CHANGES 之后开始的新一次 Attempt（PRD-DIFF-003） */
   | 'ATTEMPT_STARTED'
   | 'SELF_FIX_ROUND'
@@ -714,6 +716,30 @@ export interface PatchArtifact {
 }
 
 export type PatchDecisionKind = 'ACCEPT' | 'REJECT' | 'REQUEST_CHANGES';
+
+/**
+ * 一次性导出授权（PRD-DIFF-004 / TD §13 PatchExportGrant）。
+ *
+ * 导出是补丁**离开应用**的唯一出口，所以它不能是"随便调一次 IPC 就写盘"：
+ * 授权绑定具体的补丁与内容 digest、带 TTL、只能用一次，并且由 Core 给出
+ * 一份"绝对不能写进去"的目录清单（项目仓库、受管数据根、活动工作区）。
+ * Main 持有原生能力（对话框与文件系统），但写哪儿这件事由这张票据约束。
+ */
+export interface PatchExportGrant {
+  readonly grantId: string;
+  readonly runId: string;
+  readonly patchId: string;
+  /** 补丁本身的 digest：与用户看到/接受的那一份对不上就不该导出 */
+  readonly patchDigest: Digest;
+  /** 实际要写出去的字节的 digest（含文件头）；Main 写完回报，Core 核对 */
+  readonly contentDigest: Digest;
+  readonly filename: string;
+  readonly byteLength: number;
+  /** 绝对不能作为导出目的地的目录（realpath 由 Main 侧再解析一次） */
+  readonly forbiddenRoots: readonly string[];
+  readonly issuedAt: Iso8601;
+  readonly expiresAt: Iso8601;
+}
 
 // ---------------------------------------------------------------------------
 // 交叉审核（PRD-XAGENT-003/004 的诚实子集：第二个模型 API 只读交叉审核）

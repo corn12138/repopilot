@@ -435,6 +435,18 @@ function PlanApproval({
   );
 }
 
+/**
+ * 导出被拒的原因标签。原始 reason 是给日志与统计用的封闭枚举，
+ * 但直接甩给用户一句 `FORBIDDEN_ROOT` 等于让他自己去猜 —— 每一条都要说清下一步。
+ */
+const EXPORT_REASON_LABEL: Record<string, string> = {
+  FORBIDDEN_ROOT: '不能存到这里（项目仓库或 RepoPilot 数据目录内）',
+  NOT_A_REGULAR_FILE: '目标不是普通文件（符号链接与目录都不覆盖）',
+  UNRESOLVABLE: '目标所在目录无法解析',
+  WRITE_FAILED: '写入失败',
+  CANCELLED: '已取消',
+};
+
 function PatchReview({
   patch,
   canDecide,
@@ -472,7 +484,7 @@ function PatchReview({
       setExportMsg(
         r.ok
           ? { ok: true, text: `${r.detail}${r.target ? ` → ${r.target}` : ''}` }
-          : { ok: false, text: `${r.reason}：${r.detail}` },
+          : { ok: false, text: `${EXPORT_REASON_LABEL[r.reason] ?? r.reason}：${r.detail}` },
       );
       if (r.ok) setConfirmApply(false);
     } catch (err) {

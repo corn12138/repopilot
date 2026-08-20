@@ -790,7 +790,7 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
 
       // 正向对照：真正通过验证的补丁，导出文件头才允许说 yes，且点名那次验证
       const exported = await harness.call<{ filename: string; content: string; digest: string }>(
-        '__patch.content',
+        '__patch.exportGrant',
         { runId, patchId: patch.patchId },
       );
       const verifiedLine = exported.content.split('\n').find((l) => l.startsWith('# verified:'));
@@ -873,7 +873,7 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
        */
       expect(patch!.verificationRunId).not.toBeNull();
       const exported = await harness.call<{ filename: string; content: string; digest: string }>(
-        '__patch.content',
+        '__patch.exportGrant',
         { runId, patchId: patch!.patchId },
       );
       const verifiedLine = exported.content.split('\n').find((l) => l.startsWith('# verified:'));

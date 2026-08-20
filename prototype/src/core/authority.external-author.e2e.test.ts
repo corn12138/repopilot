@@ -231,6 +231,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  /*
+   * 先停掉还在跑的 Run：用例结束时后台可能仍有 Attempt 在推进。fetch 是全局 stub，
+   * 上一条用例的后台 Run 会去喝**下一条**用例的模型脚本，表现成"脚本已耗尽"的假失败
+   * （单独跑绿、一起跑红）。这段在四份 harness 副本里都要有 —— 复制出来的东西会各自漂移。
+   */
+  harness.authority.shutdown('test-teardown');
   delete process.env.DEEPSEEK_API_KEY;
   delete process.env.OPENAI_API_KEY;
   delete process.env.REPOPILOT_CODEX_CLI_PATH;

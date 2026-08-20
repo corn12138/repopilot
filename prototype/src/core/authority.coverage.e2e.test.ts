@@ -238,6 +238,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  /*
+   * 先停掉还在跑的 Run：用例结束时后台可能仍有 Attempt 在推进。fetch 是全局 stub，
+   * 上一条用例的后台 Run 会去喝**下一条**用例的模型脚本，表现成"脚本已耗尽"的假失败
+   * （单独跑绿、一起跑红）。这段在四份 harness 副本里都要有 —— 复制出来的东西会各自漂移。
+   */
+  harness.authority.shutdown('test-teardown');
   delete process.env.DEEPSEEK_API_KEY;
   delete process.env.OPENAI_API_KEY;
   delete process.env.REPOPILOT_CODEX_CLI_PATH;
@@ -303,7 +309,8 @@ describe('Slice G：补丁动了验证输入，"验证通过"就不能再证明�
       expect(decided.run.terminalFacts?.verificationRunId).toBeNull();
       expect(decided.run.terminalFacts?.patchAcceptanceId).toBeTruthy();
 
-      const exported = await harness.call<{ content: string }>('__patch.content', { runId, patchId: patch.patchId });
+      // 走真实导出路径取字节（含导出期 DLP 与一次性授权），而不是一个只有测试在用的旁路
+      const exported = await harness.call<{ content: string }>('__patch.exportGrant', { runId, patchId: patch.patchId });
       const verifiedLine = exported.content.split('\n').find((l) => l.startsWith('# verified:'));
       expect(verifiedLine).toContain('NO');
       expect(verifiedLine).toContain('check.mjs');
@@ -417,5 +424,152 @@ describe('Slice I-1：用户手填的验证命令先分级再登记', () => {
       customCommands: [{ label: 'node check.mjs', argv: ['node', 'check.mjs'] }],
     });
     expect(ok.run.runId).toBeTruthy();
+  });
+});
+
+
+describe('导出授权（PatchExportGrant）：一次性、绑 digest、给受保护根、导出期 DLP', () => {
+  async function readyPatch(hostPath: string): Promise<{ runId: string; patch: PatchArtifact }> {
+    harness.script(IMPL, [() => planCall()]);
+    const { runId } = await harness.createRun({ hostPath, authorConnectorId: 'codex-cli' });
+    await harness.approvePlan(runId);
+    await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+    const { patch } = await harness.call<{ patch: PatchArtifact }>('patch.get', { runId });
+    return { runId, patch };
+  }
+
+  it('签发的票绑定补丁与内容 digest，并给出"绝不能写进去"的目录（项目仓库 + 受管数据根）', async () => {
+    installFakeCodex(`printf "export const STATUS = 'fixed';\\n" > src/app.js`);
+    const hostPath = makeFixtureRepo();
+    const { runId, patch } = await readyPatch(hostPath);
+
+    const { grant, content } = await harness.call<{
+      grant: {
+        grantId: string;
+        patchDigest: string;
+        contentDigest: string;
+        filename: string;
+        byteLength: number;
+        forbiddenRoots: string[];
+        expiresAt: string;
+      };
+      content: string;
+    }>('__patch.exportGrant', { runId, patchId: patch.patchId });
+
+    expect(grant.patchDigest).toBe(patch.digest);
+    expect(grant.byteLength).toBe(Buffer.byteLength(content, 'utf8'));
+    expect(grant.filename.endsWith('.patch')).toBe(true);
+    // 项目仓库与受管数据根都在禁止清单里
+    expect(grant.forbiddenRoots).toContain(hostPath);
+    expect(grant.forbiddenRoots.some((r) => r.includes('repopilot-attempt-e2e-') || r.includes('repopilot-coverage-e2e-'))).toBe(true);
+    expect(Date.parse(grant.expiresAt)).toBeGreaterThan(Date.now());
+    // 内容就是那份带文件头的补丁
+    expect(content).toContain('# RepoPilot patch');
+    expect(content).toContain(patch.digest);
+  });
+
+  it('一次性：同一张票只能结算一次，重放被拒且不再记账', async () => {
+    installFakeCodex(`printf "export const STATUS = 'fixed';\\n" > src/app.js`);
+    const { runId, patch } = await readyPatch(makeFixtureRepo());
+    const { grant } = await harness.call<{ grant: { grantId: string; contentDigest: string } }>(
+      '__patch.exportGrant',
+      { runId, patchId: patch.patchId },
+    );
+
+    const first = await harness.call<{ accepted: boolean; reason: string | null }>('__patch.exportResult', {
+      grantId: grant.grantId,
+      outcome: 'WRITTEN',
+      targetName: 'fix.patch',
+      bytes: 100,
+      overwrote: false,
+      contentDigest: grant.contentDigest,
+    });
+    expect(first).toEqual({ accepted: true, reason: null });
+
+    const replay = await harness.call<{ accepted: boolean; reason: string | null }>('__patch.exportResult', {
+      grantId: grant.grantId,
+      outcome: 'WRITTEN',
+      targetName: '别处.patch',
+      bytes: 100,
+      overwrote: false,
+      contentDigest: grant.contentDigest,
+    });
+    expect(replay.accepted).toBe(false);
+    expect(replay.reason).toContain('已使用');
+
+    // 账上只有一次成功导出，重放没有留下第二条"已导出"
+    const events = await harness.events(runId);
+    const exported = events.filter((e) => e.kind === 'PATCH_EXPORTED');
+    expect(exported).toHaveLength(1);
+    expect(exported[0]!.payload.outcome).toBe('WRITTEN');
+    expect(exported[0]!.payload.targetName).toBe('fix.patch');
+    // 事件里只留文件名，不留宿主绝对路径
+    expect(JSON.stringify(exported[0]!.payload)).not.toContain('/');
+  });
+
+  it('内容 digest 对不上 → 不算导出成功（写出去的字节不是我们授权的那份）', async () => {
+    installFakeCodex(`printf "export const STATUS = 'fixed';\\n" > src/app.js`);
+    const { runId, patch } = await readyPatch(makeFixtureRepo());
+    const { grant } = await harness.call<{ grant: { grantId: string } }>('__patch.exportGrant', {
+      runId,
+      patchId: patch.patchId,
+    });
+    const settled = await harness.call<{ accepted: boolean; reason: string | null }>('__patch.exportResult', {
+      grantId: grant.grantId,
+      outcome: 'WRITTEN',
+      targetName: 'fix.patch',
+      bytes: 100,
+      overwrote: false,
+      contentDigest: 'sha256:something-else',
+    });
+    expect(settled.accepted).toBe(false);
+    const events = await harness.events(runId);
+    expect(events.find((e) => e.kind === 'PATCH_EXPORTED')!.payload.outcome).toBe('DIGEST_MISMATCH');
+  });
+
+  it('取消 / 被拒也记账，且都作废票据 —— 失败不是"什么都没发生"', async () => {
+    installFakeCodex(`printf "export const STATUS = 'fixed';\\n" > src/app.js`);
+    const { runId, patch } = await readyPatch(makeFixtureRepo());
+    const { grant } = await harness.call<{ grant: { grantId: string } }>('__patch.exportGrant', {
+      runId,
+      patchId: patch.patchId,
+    });
+    const cancelled = await harness.call<{ accepted: boolean }>('__patch.exportResult', {
+      grantId: grant.grantId,
+      outcome: 'REJECTED',
+      detail: 'FORBIDDEN_ROOT: 目标落在受保护目录内',
+    });
+    expect(cancelled.accepted).toBe(false);
+    const events = await harness.events(runId);
+    const exported = events.filter((e) => e.kind === 'PATCH_EXPORTED');
+    expect(exported).toHaveLength(1);
+    expect(exported[0]!.payload.outcome).toBe('REJECTED');
+    expect(exported[0]!.summary).toContain('FORBIDDEN_ROOT');
+    // 票已作废：不能拿它再去写一次
+    const reuse = await harness.call<{ accepted: boolean }>('__patch.exportResult', {
+      grantId: grant.grantId,
+      outcome: 'WRITTEN',
+      contentDigest: 'x',
+    });
+    expect(reuse.accepted).toBe(false);
+  });
+
+  it('补丁正文含高置信度凭据 → 拒绝签发（导出是最后一道 DLP），原因不含原文', async () => {
+    // 让作者写入一段带 AWS key 的代码：fs_read 那道闸挡的是"读含凭据的文件"，
+    // 这里凭据是**新写进去的**，只有导出期这道能挡住它离开应用
+    const secret = 'AKIAIOSFODNN7EXAMPLE';
+    installFakeCodex(`printf "export const STATUS = 'fixed'; // ${secret}\\n" > src/app.js`);
+    const { runId, patch } = await readyPatch(makeFixtureRepo());
+
+    await expect(
+      harness.call('__patch.exportGrant', { runId, patchId: patch.patchId }),
+    ).rejects.toMatchObject({
+      payload: { code: 'POLICY_DENIED', message: expect.stringContaining('DLP: AWS_ACCESS_KEY_ID') },
+    });
+    const events = await harness.events(runId);
+    const blocked = events.filter((e) => e.kind === 'PATCH_EXPORTED');
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]!.payload.outcome).toBe('BLOCKED_DLP');
+    expect(JSON.stringify(events)).not.toContain(secret);
   });
 });
