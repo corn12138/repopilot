@@ -54,6 +54,19 @@ function resolutionOf(outcome: CommandOutcome['outcome']): ToolCallResolution {
  *   - 命令不存在时**不是**跳过成功，而是记为 SPAWN_ERROR。
  *   - passed 只在所有命令都 EXIT_ZERO 时为真。
  */
+/**
+ * 执行期的一次性批准闸门（Slice K）。
+ *
+ * 只有 `risk !== 'R1'` 的命令才会问到它。返回 `ok: false` 时命令记 SPAWN_ERROR ——
+ * **不跑 ≠ 通过**，验证不会 passed。
+ */
+export interface CommandApprovalChecker {
+  consume(
+    def: Pick<CommandDefinition, 'commandId' | 'argv' | 'risk' | 'approvalId'>,
+    role: CommandRole,
+  ): { ok: true } | { ok: false; reason: string };
+}
+
 export async function runVerification(
   runId: string,
   attemptId: string,
@@ -63,6 +76,7 @@ export async function runVerification(
   commandIds: readonly string[],
   signal: AbortSignal,
   recorder: VerificationRecorder | null = null,
+  approvals: CommandApprovalChecker | null = null,
 ): Promise<VerificationRun> {
   const startedAt = nowIso();
   const outcomes: CommandOutcome[] = [];
@@ -121,25 +135,35 @@ export async function runVerification(
       continue;
     }
     /*
-     * 风险闸门（纵深防御）：验证只跑 R1。用户手填的命令在登记时就只放 R1 进来
-     * （commandRisk.ts），这里再挡一次 —— 万一将来有别的路径往 profile 里塞命令，
-     * 它也不能借"验证"这个身份绕过分级。不跑 ≠ 通过：它记 SPAWN_ERROR，验证不会 passed。
+     * 风险闸门（纵深防御）：验证默认只跑 R1。用户手填的命令在登记时就分过一次级
+     * （commandRisk.ts），这里在**每一次执行前**再查一遍 —— 万一将来有别的路径往
+     * profile 里塞命令，它也不能借"验证"这个身份绕过分级。
+     *
+     * 唯一的例外是拿着一次性精确批准的 R2（`CommandApproval`，Slice K）：由 checker
+     * 逐次校验并计数。没有 checker、或 checker 说不行 —— 一律 SPAWN_ERROR。
+     * 不跑 ≠ 通过：验证不会 passed。
      */
     if (def.risk !== 'R1') {
-      outcomes.push(
-        await record(def, async () => ({
-          commandId: def.commandId,
-          argv: def.argv,
-          outcome: 'SPAWN_ERROR' as const,
-          exitCode: null,
-          signal: null,
-          durationMs: 0,
-          stdoutPreview: '',
-          stderrPreview: `command "${def.commandId}" 的风险等级是 ${def.risk}，验证只执行 R1 —— 拒绝执行`,
-          outputTruncated: false,
-        })),
-      );
-      continue;
+      const verdict = approvals?.consume(def, role) ?? {
+        ok: false as const,
+        reason: '本次运行没有命令批准通道',
+      };
+      if (!verdict.ok) {
+        outcomes.push(
+          await record(def, async () => ({
+            commandId: def.commandId,
+            argv: def.argv,
+            outcome: 'SPAWN_ERROR' as const,
+            exitCode: null,
+            signal: null,
+            durationMs: 0,
+            stdoutPreview: '',
+            stderrPreview: `command "${def.commandId}" 的风险等级是 ${def.risk}，拒绝执行：${verdict.reason}`,
+            outputTruncated: false,
+          })),
+        );
+        continue;
+      }
     }
     if (signal.aborted) {
       // 取消掉的命令同样留一条记录：用户要能看出"这一步没跑"，而不是它凭空消失。不计账。

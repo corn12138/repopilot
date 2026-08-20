@@ -24,7 +24,7 @@ import { textOf, toolUsesOf } from './model/types';
 import type { MutationPolicy } from './mutation';
 import { PLANNING_TOOLS, TOOLS, TOOLS_BY_NAME, type ToolContext, type ToolDefinition } from './tools';
 import { summarizeShapes } from './repo';
-import { compareVerification, runVerification, summarizeFailures } from './verify';
+import { compareVerification, runVerification, summarizeFailures, type CommandApprovalChecker } from './verify';
 import type { MaterializedWorkspace } from './workspace';
 
 export interface AgentHost {
@@ -116,6 +116,11 @@ export interface AgentDeps {
     readonly previousAttemptNo: number;
     readonly previousPatchDiff: string;
   };
+  /**
+   * 可选：一次性精确命令批准的执行期闸门（Slice K）。不传 = 没有批准通道，
+   * 高于 R1 的命令一律 SPAWN_ERROR —— 缺省是关的，这一点不能靠调用方记得传参。
+   */
+  readonly commandApprovals?: CommandApprovalChecker;
 }
 
 export interface AgentResult {
@@ -207,6 +212,7 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
       task.verificationCommandIds,
       signal,
       host, // 平台自己发起的命令同样留 ToolCall、同样计入账本
+      deps.commandApprovals ?? null,
     );
     throwIfCancelled(signal);
     host.emit(
@@ -401,6 +407,7 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
       task.verificationCommandIds,
       signal,
       host,
+      deps.commandApprovals ?? null,
     );
     host.emit(
       'VERIFICATION_FINISHED',

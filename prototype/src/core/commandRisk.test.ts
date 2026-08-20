@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { classifyUserCommand, userCommandAdmission } from './commandRisk';
+import {
+  classifyUserCommand,
+  commandArgvDigest,
+  isApprovableCause,
+  userCommandAdmission,
+} from './commandRisk';
 
 /**
  * 用户手填命令的风险分级：白名单放行、其余 fail-closed。
@@ -87,9 +92,86 @@ describe('userCommandAdmission：只有 R1 能登记为验证命令', () => {
     const r3 = userCommandAdmission(['rm', '-rf', 'dist']);
     if (!r3.ok) expect(r3.message).toContain('（R3）');
     const r2 = userCommandAdmission(['npm', 'install', 'some-pkg']);
+    expect(r2.ok).toBe(false);
     if (!r2.ok) {
       expect(r2.message).toContain('（R2）');
-      expect(r2.message).toContain('原型不开放');
+      // 说清"为什么"而不是"不支持"：装依赖会写进宿主真实的依赖树
+      expect(r2.message).toContain('node_modules');
+      // 而且它**不可批准** —— 界面不该给它一个"我了解风险"的复选框
+      expect(r2.approvable).toBe(false);
     }
+  });
+});
+
+describe('可批准的只有"未知二进制"这一档（Slice K）', () => {
+  it('未知可执行名 → R2 + UNKNOWN_BINARY + approvable，消息是"需要你逐条批准"而不是"拒绝登记"', () => {
+    const v = classifyUserCommand(['bash', 'scripts/test.sh']);
+    expect(v.risk).toBe('R2');
+    expect(v.cause).toBe('UNKNOWN_BINARY');
+    expect(isApprovableCause(v)).toBe(true);
+
+    const admission = userCommandAdmission(['bash', 'scripts/test.sh']);
+    expect(admission.ok).toBe(false);
+    if (!admission.ok) {
+      expect(admission.approvable).toBe(true);
+      expect(admission.message).toContain('逐条批准');
+    }
+  });
+
+  it('联网/装依赖/容器、未知 git 子命令、R3、R4 一律不可批准', () => {
+    const cases: ReadonlyArray<readonly [string[], string]> = [
+      [['pnpm', 'install'], 'NETWORK_OR_DEPS'],
+      [['curl', 'https://example.com'], 'NETWORK_OR_DEPS'],
+      [['docker', 'compose', 'up'], 'NETWORK_OR_DEPS'],
+      [['git', 'bisect', 'start'], 'GIT_UNKNOWN'],
+      [['rm', '-rf', 'dist'], 'DESTRUCTIVE'],
+      [['sudo', 'make', 'install'], 'PRIVILEGED'],
+      [['npm', 'publish'], 'PUBLISH'],
+      [['git', 'push'], 'GIT_WRITE'],
+    ];
+    for (const [argv, cause] of cases) {
+      const v = classifyUserCommand(argv);
+      expect(v.cause, argv.join(' ')).toBe(cause);
+      expect(isApprovableCause(v), argv.join(' ')).toBe(false);
+      const admission = userCommandAdmission(argv);
+      expect(admission.ok, argv.join(' ')).toBe(false);
+      if (!admission.ok) expect(admission.approvable, argv.join(' ')).toBe(false);
+    }
+  });
+
+  it('批准绑整条 argv：多一个参数就是另一条命令，digest 不同 → 仍然拒绝', () => {
+    const approved = new Set([commandArgvDigest(['bash', 'scripts/test.sh'])]);
+    expect(userCommandAdmission(['bash', 'scripts/test.sh'], approved).ok).toBe(true);
+    // 加参数
+    expect(userCommandAdmission(['bash', 'scripts/test.sh', '-u'], approved).ok).toBe(false);
+    // 换可执行名
+    expect(userCommandAdmission(['zsh', 'scripts/test.sh'], approved).ok).toBe(false);
+    // 同一批准不会顺带放行另一条未知命令
+    expect(userCommandAdmission(['bazel', 'test', '//...'], approved).ok).toBe(false);
+  });
+
+  it('批准过的 R2 通过登记时 viaApproval=true，风险等级仍然如实是 R2 —— 不被"洗白"成 R1', () => {
+    const approved = new Set([commandArgvDigest(['just', 'ci'])]);
+    const admission = userCommandAdmission(['just', 'ci'], approved);
+    expect(admission.ok).toBe(true);
+    if (admission.ok) {
+      expect(admission.viaApproval).toBe(true);
+      expect(admission.verdict.risk).toBe('R2');
+    }
+  });
+
+  it('批准不能把 R3/R4 变成可登记：即使 digest 在集合里也照拒', () => {
+    const approved = new Set([
+      commandArgvDigest(['rm', '-rf', 'dist']),
+      commandArgvDigest(['git', 'push']),
+      commandArgvDigest(['pnpm', 'install']),
+    ]);
+    expect(userCommandAdmission(['rm', '-rf', 'dist'], approved).ok).toBe(false);
+    expect(userCommandAdmission(['git', 'push'], approved).ok).toBe(false);
+    expect(userCommandAdmission(['pnpm', 'install'], approved).ok).toBe(false);
+  });
+
+  it('argv digest 区分 ["a b"] 与 ["a","b"]：用空格 join 会把它们混成同一条命令', () => {
+    expect(commandArgvDigest(['a b'])).not.toBe(commandArgvDigest(['a', 'b']));
   });
 });

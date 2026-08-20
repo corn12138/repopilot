@@ -171,6 +171,94 @@ describe('runVerification / passed 的计算', () => {
     expect(run.passed).toBe(true);
   });
 
+  /*
+   * 风险闸门 × 一次性精确批准（Slice K）。
+   *
+   * 这几条钉的是同一件事：**高于 R1 的命令能不能跑，由闸门每次现问**。
+   * 拒绝执行必须留下记录并让 passed=false —— 不跑 ≠ 通过，这是整个产品最怕被绕过的一句。
+   */
+  it('高于 R1 且没有批准通道 → SPAWN_ERROR，passed=false，且明说是"没有批准通道"', async () => {
+    const def = { ...cmd('risky', nodeArgv('process.exit(0)')), risk: 'R2' as const };
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'BASELINE',
+      workspace,
+      profileOf([def]),
+      ['risky'],
+      freshSignal(),
+      // 没有 recorder，也没有 approvals —— 缺省就是关的
+    );
+    expect(run.commands[0]!.outcome).toBe('SPAWN_ERROR');
+    expect(run.commands[0]!.stderrPreview).toContain('没有命令批准通道');
+    expect(run.passed, '拒绝执行不能被算成通过').toBe(false);
+  });
+
+  it('闸门说不行 → 同样 SPAWN_ERROR，理由原样带出来给用户', async () => {
+    const def = { ...cmd('risky', nodeArgv('process.exit(0)')), risk: 'R2' as const };
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'POST_MUTATION',
+      workspace,
+      profileOf([def]),
+      ['risky'],
+      freshSignal(),
+      null,
+      { consume: () => ({ ok: false, reason: '批准记录已不存在（进程重启后批准一律作废）' }) },
+    );
+    expect(run.commands[0]!.outcome).toBe('SPAWN_ERROR');
+    expect(run.commands[0]!.stderrPreview).toContain('批准记录已不存在');
+    expect(run.passed).toBe(false);
+  });
+
+  it('对照组：闸门放行时 R2 命令真的执行 —— 证明上面两条不是"R2 永远跑不了"', async () => {
+    const def = { ...cmd('risky', nodeArgv('process.exit(0)')), risk: 'R2' as const };
+    const seen: string[] = [];
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'BASELINE',
+      workspace,
+      profileOf([def]),
+      ['risky'],
+      freshSignal(),
+      null,
+      {
+        consume: (d, role) => {
+          seen.push(`${d.commandId}/${role}`);
+          return { ok: true };
+        },
+      },
+    );
+    expect(run.commands[0]!.outcome).toBe('EXIT_ZERO');
+    expect(run.passed).toBe(true);
+    // 闸门确实被问过，而且拿到的是这条命令与它的角色
+    expect(seen).toEqual(['risky/BASELINE']);
+  });
+
+  it('R1 命令不打扰闸门：批准通道只对高于 R1 的命令生效', async () => {
+    let asked = 0;
+    const run = await runVerification(
+      'run_1',
+      'att_1',
+      'BASELINE',
+      workspace,
+      profileOf([cmd('ok', nodeArgv('process.exit(0)'))]),
+      ['ok'],
+      freshSignal(),
+      null,
+      {
+        consume: () => {
+          asked += 1;
+          return { ok: true };
+        },
+      },
+    );
+    expect(run.passed).toBe(true);
+    expect(asked).toBe(0);
+  });
+
   it('一成功一失败 → passed=false，且成功那条的结论不被失败污染', async () => {
     // 反过来也要成立：整体失败不代表每条都失败，自修复提示需要知道"哪条还活着"。
     const run = await runVerification(

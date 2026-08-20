@@ -138,8 +138,18 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
       authorConnectorId: OPTIONAL_ID,
       // 合同层可选、Core 必填：缺了由 Core 以 CONSENT_REQUIRED 拒绝（带可读的修复建议），不在 IPC 层吞成"字段缺失"
       egressConsentDigest: { kind: 'string', optional: true, maxLength: 200 },
+      // 批准 id 与命令一一对应，所以上限跟着 customCommands 的 maxItems 走
+      commandApprovalIds: { kind: 'stringArray', optional: true, maxItems: 20, maxLength: 200 },
     },
     timeoutMs: SLOW,
+  },
+  'command.classify': {
+    fields: { argv: { kind: 'stringArray', maxItems: 100, maxLength: 1_000 } },
+    timeoutMs: QUICK,
+  },
+  'command.requestApproval': {
+    fields: { argv: { kind: 'stringArray', maxItems: 100, maxLength: 1_000 } },
+    timeoutMs: QUICK,
   },
   'egress.disclosure': {
     fields: {

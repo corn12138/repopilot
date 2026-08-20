@@ -6,6 +6,7 @@ import type {
   CommandDefinition,
   DataEgressConsent,
   DataEgressDisclosure,
+  CommandApproval,
   PatchExportGrant,
   FailureClass,
   ModelConnectionProfile,
@@ -82,7 +83,7 @@ import {
 import { runExternalCliAuthor } from './external/author';
 import { verificationInputsFromCommands } from './coverage';
 import { describeDlpHits, scanSegments } from './dlp';
-import { userCommandAdmission } from './commandRisk';
+import { commandArgvDigest, isApprovableCause, classifyUserCommand, userCommandAdmission } from './commandRisk';
 import { buildDisclosure, consentedResolutionDigests, type DisclosureInput } from './egress';
 import { applyCandidate } from './external/normalize';
 import { EventStore, readJson, writeJsonAtomic } from './store';
@@ -104,7 +105,7 @@ import {
   sweep,
 } from './retention';
 import { PATHS, ensureDataRoot, snapshotDir, workspaceDir } from './paths';
-import { compareVerification, runVerification } from './verify';
+import { compareVerification, runVerification, type CommandApprovalChecker } from './verify';
 import {
   MaterializedWorkspace,
   fileDigestAt,
@@ -227,6 +228,11 @@ const EXTERNAL_REVIEW_TIMEOUT_MS = 300_000;
 const EXTERNAL_AUTHOR_TIMEOUT_MS = 900_000;
 /** 导出授权有效期：够用户在保存对话框里挑个位置，不够拿去以后重放 */
 const EXPORT_GRANT_TTL_MS = 5 * 60 * 1000;
+/**
+ * 命令批准有效期：够用户批完把任务填完提交，不够让它变成"上周批的今天还在用"。
+ * 批准和使用之间隔着一个表单，所以比导出授权宽一些。
+ */
+const COMMAND_APPROVAL_TTL_MS = 15 * 60 * 1000;
 
 /** 审核方绑定：模型 API 与外部 CLI 两种选手，规则完全相同 */
 /**
@@ -430,6 +436,15 @@ export class RunAuthority {
    * 消费即删除，过期即无效。进程重启后全部作废 —— 授权不该跨重启存活。
    */
   private readonly exportGrants = new Map<string, PatchExportGrant>();
+
+  /**
+   * 未过期的命令批准（Slice K）。与导出授权同构：内存态、进程重启即作废。
+   *
+   * 批准**不写盘**是刻意的 —— 一旦持久化，它就会在下一次启动后继续生效，
+   * 那正好又回到审计要打掉的"填一次即永久授权"。想再用一次就再批一次，
+   * 代价是一次点击，换来的是这个授权不会在你不记得的时候还活着。
+   */
+  private readonly commandApprovals = new Map<string, CommandApproval>();
 
   private persist(record: RunRecord): void {
     try {
@@ -824,6 +839,12 @@ export class RunAuthority {
         );
 
       // Main 需要补丁正文来存文件 / 写剪贴板；这两件事是原生能力，由 Main 做
+      case 'command.classify':
+        return this.classifyCommand((payload.argv as string[]) ?? []);
+
+      case 'command.requestApproval':
+        return this.requestCommandApproval((payload.argv as string[]) ?? []);
+
       case '__patch.exportGrant':
         return this.issueExportGrant(String(payload.runId), String(payload.patchId));
 
@@ -1004,22 +1025,38 @@ export class RunAuthority {
   private withUserCommands(
     profile: RepositoryHarnessProfile,
     custom: ReadonlyArray<{ label: string; argv: string[] }>,
+    approvals: readonly CommandApproval[] = [],
+    /** 出参：commandId ← approvalId，供 Run 创建后落账绑定 */
+    usedApprovals?: Map<string, string>,
   ): RepositoryHarnessProfile {
     if (custom.length === 0) return profile;
     const commands = { ...profile.commands };
+    const byDigest = new Map(approvals.map((a) => [a.argvDigest, a]));
     custom.forEach((c, i) => {
       const argv = c.argv.map((a) => a.trim()).filter(Boolean);
       if (argv.length === 0) return;
       /*
        * 风险分级发生在登记之前（Slice I-1）。登记即意味着：计划批准前作为基线跑一次、
-       * 之后模型可在预算内用 run_command 重复调用 —— 所以只有 R1 能进来；
-       * R2（网络/依赖）原型没有一次性精确审批，R3/R4 本就 deny。硬编码 'R1' 等于"填一次即永久授权"。
+       * 之后模型还能在预算内重复调用 —— 所以默认只有 R1 能进来；R3/R4 本就 deny。
+       * 硬编码 'R1' 等于"填一次即永久授权"。
+       *
+       * Slice K 开了唯一一道口子：`UNKNOWN_BINARY` 这一类 R2 可以凭一张**这次请求里
+       * 带过来的**一次性精确批准登记进来（见 commandRisk.ts 的说明）。批准绑整条 argv，
+       * 所以这里用 digest 去认，而不是"用户批过某个可执行名"。
        */
-      const admission = userCommandAdmission(argv);
+      const admission = userCommandAdmission(argv, new Set(byDigest.keys()));
       if (!admission.ok) {
-        throw platformError('BAD_REQUEST', admission.message, '验证命令只接受构建/测试/类型检查/lint/本地脚本（node、tsc、vitest、pnpm build…）');
+        throw platformError(
+          'BAD_REQUEST',
+          admission.message,
+          admission.approvable
+            ? '这条命令不在已知工具白名单内。可以逐条批准它（一次性、只对本次运行有效），或改用 node / pnpm 等已知入口包装。'
+            : '验证命令只接受构建/测试/类型检查/lint/本地脚本（node、tsc、vitest、pnpm build…）',
+        );
       }
       const commandId = `user${i + 1}`;
+      const approval = admission.viaApproval ? byDigest.get(commandArgvDigest(argv))! : null;
+      if (approval) usedApprovals?.set(approval.approvalId, commandId);
       commands[commandId] = {
         commandId,
         label: c.label.trim() || argv.join(' '),
@@ -1028,6 +1065,7 @@ export class RunAuthority {
         timeoutMs: 600_000,
         risk: admission.verdict.risk,
         source: 'USER',
+        approvalId: approval?.approvalId ?? null,
       };
     });
     return { ...profile, profileId: newId('prof'), commands };
@@ -1092,6 +1130,11 @@ export class RunAuthority {
      * 缺失 → CONSENT_REQUIRED；对不上（路由/审核方/作者/快照任一不同）→ CONSENT_STALE。
      */
     egressConsentDigest?: string;
+    /**
+     * 用户在本次提交里逐条批准过的 R2 命令（Slice K）。批准由 `command.requestApproval`
+     * 签发，只在内存里活着、有 TTL、绑整条 argv、一张只能进一个 Run。
+     */
+    commandApprovalIds?: readonly string[];
   }): { task: TaskSpec; run: RunView } {
     const project = this.projects.get(input.projectId);
     const snapshot = this.snapshots.get(input.snapshotId);
@@ -1142,7 +1185,13 @@ export class RunAuthority {
       );
     }
 
-    const effectiveProfile = this.withUserCommands(profile, input.customCommands ?? []);
+    const usedApprovals = new Map<string, string>();
+    const effectiveProfile = this.withUserCommands(
+      profile,
+      input.customCommands ?? [],
+      this.liveApprovals(input.commandApprovalIds ?? []),
+      usedApprovals,
+    );
     const unknownCommands = input.verificationCommandIds.filter(
       // hasOwnProperty：否则 'constructor' 这类 id 能通过这道校验，一路走到运行时崩溃
       (id) => !Object.prototype.hasOwnProperty.call(effectiveProfile.commands, id),
@@ -1337,6 +1386,8 @@ export class RunAuthority {
       profileSupportStatus: effectiveProfile.supportStatus,
       verificationCommands: input.verificationCommandIds,
       userDefinedCommands: (input.customCommands ?? []).length,
+      // 逐条批准过的 R2 命令数：它改变了"这个 Run 允许跑什么"，必须在 RUN_CREATED 里
+      approvedCommands: usedApprovals.size,
       // 用户同意了什么：披露 digest + 目的地清单（标签/通道/是否中转/数据类别）。不含 actor 身份
       egressConsent: {
         consentId: consent.consentId,
@@ -1352,6 +1403,8 @@ export class RunAuthority {
         policy: disclosure.policy,
       },
     });
+    // 绑定要紧跟 RUN_CREATED：Run 存在之前批准无处可落，Run 开跑之前它必须已在账上
+    this.bindApprovals(record, usedApprovals);
     this.emit(
       record,
       'NOTE',
@@ -1527,6 +1580,7 @@ export class RunAuthority {
         attemptId: record.view.attemptId,
         signal: record.abort.signal,
         host: this.hostFor(record, deadline),
+        commandApprovals: this.approvalCheckerFor(record),
         ...(record.author
           ? { externalAuthor: this.authorRunnerFor(record, record.author, workspace, mutationPolicy, deadline) }
           : {}),
@@ -2031,6 +2085,7 @@ export class RunAuthority {
       attemptId: record.view.attemptId,
       signal: record.abort.signal,
       host: this.hostFor(record, deadline),
+      commandApprovals: this.approvalCheckerFor(record),
       // 外部作者任务：整改也由同一个外部作者执行（同一 candidate → 归一化 → CAS 路径），不换成内部模型
       ...(record.author
         ? { externalAuthor: this.authorRunnerFor(record, record.author, workspace, crossReviewPolicy, deadline) }
@@ -2064,6 +2119,7 @@ export class RunAuthority {
                   record.task.verificationCommandIds,
                   record.abort.signal,
                   deps.host, // 整改后的重验也进 ToolCall 与账本
+                  deps.commandApprovals ?? null,
                 );
                 record.verifications.push(v);
                 this.emit(
@@ -3129,6 +3185,176 @@ export class RunAuthority {
    *
    * 内容与授权一起返回：分两次调用会在中间留一个"补丁已经变了但票还有效"的窗口。
    */
+  // -------------------------------------------------------------------------
+  // 一次性精确命令批准
+  // -------------------------------------------------------------------------
+
+  /**
+   * 为一条命令签发批准（`command.requestApproval`）。
+   *
+   * 只签"我们不认识它"的那一类。已知危险的 R2（联网/装依赖/容器/未知 git 子命令）在这里
+   * 直接 `POLICY_DENIED` —— 界面不该给它一个"我了解风险"的复选框，因为工作区的
+   * `node_modules` 是指向宿主仓库的 symlink，`pnpm install` 会写进用户真实的依赖树，
+   * 那不是一次点击能授权的东西。R3/R4 同样在这里止步。
+   */
+  /**
+   * 只判级、不签发。界面每敲一次键都可以问，问多少次都不会在 Core 里留下东西。
+   */
+  private classifyCommand(argv: readonly string[]): {
+    risk: ToolRisk;
+    cause: string;
+    reason: string;
+    approvable: boolean;
+    remediation: string | null;
+  } {
+    const clean = argv.map((a) => a.trim()).filter(Boolean);
+    const verdict = classifyUserCommand(clean);
+    const approvable = isApprovableCause(verdict);
+    return {
+      risk: verdict.risk,
+      cause: verdict.cause,
+      reason: verdict.reason,
+      approvable,
+      remediation:
+        verdict.risk === 'R1' || approvable
+          ? null
+          : verdict.cause === 'NETWORK_OR_DEPS'
+            ? '请先在你自己的仓库里装好依赖，RepoPilot 会只读复用它 —— 工作区的 node_modules 是指向你仓库的 symlink，在这里装依赖会写进你真实的依赖树。'
+            : '这一类命令没有批准通道。可以改用 node / pnpm 等已知入口包装你要跑的脚本。',
+    };
+  }
+
+  private requestCommandApproval(argv: readonly string[]): CommandApproval {
+    const clean = argv.map((a) => a.trim()).filter(Boolean);
+    if (clean.length === 0) throw platformError('BAD_REQUEST', '空命令');
+    const verdict = classifyUserCommand(clean);
+    if (verdict.risk === 'R1') {
+      throw platformError('BAD_REQUEST', `「${clean.join(' ')}」是 R1，不需要批准`);
+    }
+    if (!isApprovableCause(verdict)) {
+      throw platformError(
+        'POLICY_DENIED',
+        `「${clean.join(' ')}」不可批准（${verdict.risk}）：${verdict.reason}`,
+        verdict.cause === 'NETWORK_OR_DEPS'
+          ? '工作区的 node_modules 是指向你仓库的 symlink，装依赖会写进你真实的依赖树 —— 请先在仓库里装好依赖，再让 RepoPilot 只读复用。'
+          : '这一类命令原型不提供批准通道。可以改用 node / pnpm 等已知入口包装你要跑的脚本。',
+      );
+    }
+    /*
+     * 凭据扫描：批准过的 argv 会原样进事件流落盘（事后要能复核"我当时批的是什么"）。
+     * 与任务文本同一条规矩 —— 先拦，不要先落盘再靠别处兜。
+     */
+    const hits = scanSegments([{ text: clean.join(' '), where: '待批准命令' }]);
+    if (hits.length > 0) {
+      throw platformError(
+        'BAD_REQUEST',
+        `命令含高置信度凭据（${describeDlpHits(hits)}），已拒绝批准`,
+        '批准过的命令会原样写进事件日志；请改用环境变量或配置文件，不要把凭据写在 argv 里',
+      );
+    }
+    const approval: CommandApproval = {
+      approvalId: newId('capp'),
+      argv: clean,
+      argvDigest: commandArgvDigest(clean),
+      reason: verdict.reason,
+      grantedAt: nowIso(),
+      expiresAt: new Date(Date.now() + COMMAND_APPROVAL_TTL_MS).toISOString(),
+      maxBindings: 1,
+      bindings: 0,
+      boundRunIds: [],
+      executions: 0,
+    };
+    this.commandApprovals.set(approval.approvalId, approval);
+    return approval;
+  }
+
+  /** 取出仍然可用（未过期、未用尽绑定）的批准；其余一律当作不存在 */
+  private liveApprovals(approvalIds: readonly string[]): CommandApproval[] {
+    const now = Date.now();
+    const out: CommandApproval[] = [];
+    for (const id of approvalIds) {
+      const a = this.commandApprovals.get(id);
+      if (!a) continue;
+      if (Date.parse(a.expiresAt) < now) continue;
+      if (a.bindings >= a.maxBindings) continue;
+      out.push(a);
+    }
+    return out;
+  }
+
+  /**
+   * 把批准绑定到刚创建的 Run，并把绑定这件事写进事件流。
+   *
+   * 绑定发生在 Run 存在之后（批准本身早于 Run，所以签发时无事件可发）。
+   * 只绑**真的被用上**的那些：批了却没有对应命令的票不消耗绑定次数，也不落账 ——
+   * 落一条"批准了 X"而 X 根本没进 profile，是在事件流里制造不存在的事实。
+   */
+  private bindApprovals(record: RunRecord, used: ReadonlyMap<string, string>): void {
+    for (const [approvalId, commandId] of used) {
+      const a = this.commandApprovals.get(approvalId);
+      if (!a) continue;
+      this.commandApprovals.set(approvalId, {
+        ...a,
+        bindings: a.bindings + 1,
+        boundRunIds: [...a.boundRunIds, record.view.runId],
+      });
+      this.emit(
+        record,
+        'COMMAND_APPROVAL_BOUND',
+        `你逐条批准了 R2 命令「${a.argv.join(' ')}」作为 ${commandId}（一次性，只对本次运行有效）`,
+        {
+          approvalId,
+          commandId,
+          argv: a.argv,
+          argvDigest: a.argvDigest,
+          reason: a.reason,
+          grantedAt: a.grantedAt,
+          expiresAt: a.expiresAt,
+          scope: 'BASELINE_AND_VERIFICATION',
+        },
+      );
+    }
+  }
+
+  /**
+   * 执行期的批准校验（传给 `runVerification` 的闸门）。
+   *
+   * 这是纵深防御的第二道：登记时已经查过一次，这里在**每一次执行前**再查
+   * —— 命令定义有可能被别的路径塞进 profile，它不能靠"验证命令"这个身份绕过分级。
+   *
+   * 拒绝的四种情形都要说清是哪一种，因为它们的下一步完全不同：没批过、批的不是这条、
+   * 票过期了、这个角色用不了这张票。
+   */
+  private approvalCheckerFor(record: RunRecord): CommandApprovalChecker {
+    return {
+      consume: (def, role) => {
+        if (role === 'MODEL_PROPOSED') {
+          // 用户批的是"我的验证命令"，不是"模型可以调用的工具"。这条界线不能由角色自己跨。
+          return { ok: false, reason: '用户批准的命令只对基线/验证生效，模型提出的调用不能借用' };
+        }
+        const approvalId = def.approvalId ?? null;
+        if (!approvalId) return { ok: false, reason: '这条命令高于 R1 且没有批准记录' };
+        const a = this.commandApprovals.get(approvalId);
+        if (!a) return { ok: false, reason: '批准记录已不存在（进程重启后批准一律作废）' };
+        if (a.argvDigest !== commandArgvDigest(def.argv)) {
+          // 批准绑的是整条 argv：命令定义被改过一个字，这张票就不再对应它
+          return { ok: false, reason: '命令与批准时的 argv 不一致（批准绑定整条命令，不是可执行名）' };
+        }
+        if (!a.boundRunIds.includes(record.view.runId)) {
+          return { ok: false, reason: '这张批准没有绑定到本次运行' };
+        }
+        this.commandApprovals.set(approvalId, { ...a, executions: a.executions + 1 });
+        this.emit(
+          record,
+          'COMMAND_APPROVAL_USED',
+          `按批准执行 R2 命令「${a.argv.join(' ')}」（${role}，第 ${a.executions + 1} 次）`,
+          { approvalId, commandId: def.commandId, role, executions: a.executions + 1 },
+        );
+        return { ok: true };
+      },
+    };
+  }
+
   private issueExportGrant(
     runId: string,
     patchId: string,

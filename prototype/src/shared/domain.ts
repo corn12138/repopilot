@@ -171,6 +171,51 @@ export interface CommandDefinition {
   readonly risk: ToolRisk;
   /** DETECTED = 从 package.json 解析；USER = 用户在本次任务里手填 */
   readonly source: 'DETECTED' | 'USER';
+  /**
+   * 这条命令高于 R1 却仍被登记时，凭据是哪一张 `CommandApproval`。
+   *
+   * 只有 `risk === 'R2' && cause === 'UNKNOWN_BINARY'` 会走到这里。null = 不需要批准
+   * （R1）。旧数据里没有这个字段，读出来是 undefined —— 按旧语义（R1，无批准）处理。
+   */
+  readonly approvalId?: string | null;
+}
+
+/**
+ * 一次性精确命令批准（PRD-CMD-002 / 08-17 审计 D3 的后半段）。
+ *
+ * 审计打掉的是"填一次即永久授权"。这里给出的替代不是"永远拒绝"，而是把那个决定
+ * **收窄到一次、绑死到一条 argv、限定在一个 Run 里、并且全程记账**：
+ *
+ * | 维度 | 约束 |
+ * |---|---|
+ * | 精确 | 绑 `argvDigest`（整个 argv 数组，不是可执行名，也不是前缀） |
+ * | 一次性 | `maxBindings` 次绑定，默认 1 —— 一张票只能进一个 Run |
+ * | 时效 | `expiresAt` 之后作废；批准了不用，过期就得重批 |
+ * | 身份 | 只对 BASELINE / VERIFICATION 生效，**模型提出的命令永远不能用它** |
+ * | 记账 | 绑定与每一次执行都进事件流，`executions` 计数 |
+ *
+ * **为什么不限制执行次数**：PRD 的措辞是 "max uses"，这里落成 max *bindings*。
+ * 一条验证命令在一个 Run 里本来就要跑很多次（基线 1 次、终验 1 次、每轮自修复重验 1 次、
+ * 交叉审核整改后再 1 次，而续期可以让轮次继续增加）。给执行次数设上限，等于让一次
+ * 合法的重验变成 SPAWN_ERROR —— 那是**假红**。要限的是"这次授权能扩散多远"，
+ * 不是"这条命令跑了几遍"，所以次数照记不照拦。这是与 PRD 措辞的一处显式偏离。
+ */
+export interface CommandApproval {
+  readonly approvalId: string;
+  /** 用户看到并批准的那一条 argv，原样留存 —— 事后要能复核"我当时批的到底是什么" */
+  readonly argv: readonly string[];
+  readonly argvDigest: string;
+  /** 它为什么需要批准（分级给出的原因），不是用户填的备注 */
+  readonly reason: string;
+  readonly grantedAt: string;
+  readonly expiresAt: string;
+  readonly maxBindings: number;
+  /** 已经绑定到几个 Run */
+  readonly bindings: number;
+  /** 绑定到的 Run（按绑定顺序），用于事后追溯 */
+  readonly boundRunIds: readonly string[];
+  /** 实际执行了几次 —— 只计数、不设上限，理由见上 */
+  readonly executions: number;
 }
 
 /**
@@ -436,6 +481,8 @@ export type RunEventKind =
   | 'PATCH_DECISION'
   /** 一次补丁导出的结果（成功/被拒/取消都记）—— 这是补丁离开应用的唯一出口 */
   | 'PATCH_EXPORTED'
+  | 'COMMAND_APPROVAL_BOUND'
+  | 'COMMAND_APPROVAL_USED'
   /** 用户 REQUEST_CHANGES 之后开始的新一次 Attempt（PRD-DIFF-003） */
   | 'ATTEMPT_STARTED'
   | 'SELF_FIX_ROUND'

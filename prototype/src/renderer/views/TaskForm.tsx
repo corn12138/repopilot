@@ -9,7 +9,9 @@ import type {
 } from '@shared/domain';
 import { COMMON_TASK_CLASSES } from '@shared/domain';
 import type { DataEgressDisclosure } from '@shared/domain';
-import type { ReviewerOption } from '@shared/protocol';
+import type { ResponsePayload, ReviewerOption } from '@shared/protocol';
+
+type CommandClassification = ResponsePayload<'command.classify'>;
 import { RequestError, call } from '../bridge';
 
 const DATA_CLASS_LABEL: Record<string, string> = {
@@ -125,6 +127,56 @@ export function Composer({
   const hasCustom = useCustom && customArgv.length > 0;
   const unverifiedMode = selectedCommands.length === 0 && !hasCustom;
 
+  /**
+   * 自填命令的风险判级（Slice K）。判级由 Core 做 —— 界面不复制一份分级规则，
+   * 那种复制迟早会漂移成"界面说可以、Core 说不行"。
+   *
+   * 判级是只读的，签发批准是另一个方法：所以这里可以随打字跑，不会在 Core 里堆票。
+   */
+  const [risk, setRisk] = useState<CommandClassification | null>(null);
+  /** 已经签发、待随本次提交带走的批准。命令一改就作废 —— 批准绑的是整条 argv */
+  const [approval, setApproval] = useState<{ approvalId: string; argv: string } | null>(null);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
+  const customKey = customArgv.join(' ');
+  useEffect(() => {
+    // 命令变了，上一张票就不再对应它。不清掉的话界面会显示"已批准"而 Core 会拒绝
+    setApproval(null);
+    setApprovalError(null);
+    if (!useCustom || customArgv.length === 0) {
+      setRisk(null);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void call('command.classify', { argv: customKey.split(' ') })
+        .then((r) => {
+          if (!cancelled) setRisk(r);
+        })
+        .catch(() => {
+          // 判级失败不阻断填写：真正的闸门在 Core 的 task.create，这里只是提前告知
+          if (!cancelled) setRisk(null);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+    // customArgv 每次渲染都是新数组，用它做依赖会每帧重跑；customKey 才是真正的输入
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useCustom, customKey]);
+
+  const approveCustom = async () => {
+    setApprovalError(null);
+    try {
+      const a = await call('command.requestApproval', { argv: customKey.split(' ') });
+      setApproval({ approvalId: a.approvalId, argv: customKey });
+    } catch (err) {
+      setApprovalError(err instanceof Error ? err.message : String(err));
+    }
+  };
+  /** 票必须对应当前这条命令 —— 中途改过字就不算数 */
+  const approvedNow = approval !== null && approval.argv === customKey;
+
   // 选中的模型失效时（例如刚删了 key）回落到第一个可用的
   const effectiveModelId = enabledModels.some((m) => m.profileId === modelProfileId)
     ? modelProfileId
@@ -214,6 +266,8 @@ export function Composer({
     (reviewerLines.length === 0 || (reviewerLines.length === 1 && reviewerResolved)) &&
     // 出站同意：没看到披露或没点头，就不能发 —— 这是 P0 契约，不是可选项
     consented &&
+    // 自填命令高于 R1 时：可批准的要先批（否则提交必被 Core 拒），不可批准的直接挡住
+    (!hasCustom || !risk || risk.risk === 'R1' || (risk.approvable && approvedNow)) &&
     !submitting;
 
   const submit = async () => {
@@ -239,6 +293,7 @@ export function Composer({
         ...(hasCustom
           ? { customCommands: [{ label: customCommand.trim(), argv: customArgv }] }
           : {}),
+        ...(hasCustom && approvedNow ? { commandApprovalIds: [approval!.approvalId] } : {}),
         ...(reviewerProfileId
           ? reviewerIsCli
             ? { reviewerConnectorId: reviewerProfileId }
@@ -487,6 +542,32 @@ export function Composer({
                     placeholder="例如：pnpm --filter web build（按空格拆成 argv，不经过 shell）"
                     onChange={(e) => setCustomCommand(e.target.value)}
                   />
+                  {risk && risk.risk !== 'R1' && (
+                    <div className={`banner ${risk.approvable ? 'warn' : 'err'}`} role="status">
+                      <strong>
+                        {risk.approvable ? `需要你逐条批准（${risk.risk}）` : `不能作为验证命令（${risk.risk}）`}
+                      </strong>
+                      <div>{risk.reason}</div>
+                      {risk.remediation && <div className="help">{risk.remediation}</div>}
+                      {risk.approvable &&
+                        (approvedNow ? (
+                          <div className="help">
+                            已批准「{customKey}」—— 一次性，只对本次运行有效；改动命令内容需要重批。
+                          </div>
+                        ) : (
+                          <>
+                            <button type="button" className="chip" onClick={() => void approveCustom()}>
+                              我了解风险，批准这一条
+                            </button>
+                            <div className="help">
+                              批准绑定整条命令（多一个参数就是另一条），15 分钟内有效，只能进这一个任务，
+                              执行次数全部进事件流。
+                            </div>
+                          </>
+                        ))}
+                      {approvalError && <div className="help">批准失败：{approvalError}</div>}
+                    </div>
+                  )}
                 </div>
               )}
 

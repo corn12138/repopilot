@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 51 个文件、929 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 52 个文件、953 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -76,6 +76,8 @@
 | 任务输入区：披露常驻输入框上方；不勾同意不能发；选了作者/审核方后 digest 变、同意自动作废；披露取不到显示原因且不能发 | `TaskForm.externalAuthor.test.tsx` |
 | 运行页「数据出站」面板：同意摘要 + 每次模型/CLI 出站一行，NOT_SENT 带阻断原因并列展示，token 未知不填 0 | `RunDetail.test.tsx` |
 | **Slice I-1 用户命令分级**：按可执行名 + 子命令白名单分 R1–R4；`git push/merge/reset/commit`、`npm publish`、`sudo/ssh/env/aws/kubectl` → R4，`rm/chmod/mv/dd` → R3，`install/add/ci/curl/wget/docker/未知二进制` → R2（fail-closed），只有 R1 能登记为验证命令；e2e：`git push origin main`/`rm -rf dist`/`npm install x`/`sh -c` 在 task.create 被拒且不执行、不建 Run，`node check.mjs` 照常 | `commandRisk.test.ts` / `authority.coverage.e2e.test.ts` |
+| **Slice K 一次性精确批准**：`cause` 把"已知危险"与"不认识它"分开 —— 只有 `UNKNOWN_BINARY` 可批；批准绑整条 argv（加一个参数即失效）、15 分钟 TTL、`maxBindings=1`（一张票只进一个 Run）、只对 BASELINE/VERIFICATION 生效；批准后 profile 里的 risk 仍是 R2，账本记的也是 R2；`command.classify` 只判级不签发，问多少次都不留票；`pnpm install`/`rm -rf`/`git push` 请求批准 → POLICY_DENIED 并说明下一步 | `commandRisk.test.ts` / `authority.commandApproval.e2e.test.ts` |
+| **Slice K 闸门每次现问**：没有批准通道 / 闸门说不行 → `SPAWN_ERROR` + `passed=false`（不跑 ≠ 通过）；放行时 R2 命令真的执行（对照组）；R1 不打扰闸门；批准记录被清掉后闸门自己再查一次 | `verify.test.ts` / `authority.commandApproval.e2e.test.ts` |
 | **Slice I-2 receipt 覆盖范围**：fs_read 未截断 → `FULL_BLOB`；被截断 → `BYTE_RANGE` + coveredBytes 按真正展示的行数算，并当场告诉模型不能整文件替换；BYTE_RANGE receipt 的 `REPLACE_WHOLE_FILE` → `RECEIPT_COVERAGE_INSUFFICIENT` 且逐字节不变，exact-span 仍可用，FULL_BLOB 照常通过 | `tools.test.ts` / `mutation.test.ts` |
 | **Slice I-2 尾部不再被静默删**：400 行文件 fs_read 只给前 120 行 → 模型据此整文件替换被拒，`line 399` 还在 | `tools.test.ts` |
 | **Slice I-2 同一账本**：平台发起的验证命令留 `verify_command` ToolCall（带 `BASELINE/VERIFICATION` role、commandId、argv）并计入预算；未登记命令与取消也留记录（取消不计账）；非 R1 的 profile 命令拒绝执行且验证不 passed；不传 recorder 行为不变 | `verify.test.ts` |
@@ -325,6 +327,39 @@ CLI 跑起来时的隔离是硬的：
 | 一个验证命令都不选 | 照样跑，进入**未验证模式** |
 
 只在物理上做不到时才失败：目录读不了（`PATH_UNREADABLE`）、没有可用文件（`EMPTY_TREE`）、超出容量（`CAPACITY_EXCEEDED`）。
+
+### 自己填的验证命令：先分级，再决定要不要你点头
+
+手填的命令不会被硬编码成 R1（那等于"填一次即永久授权"）。它按 argv 首段分级，
+然后走三条不同的路：
+
+| 分级 | 例子 | 行为 |
+|---|---|---|
+| R1 | `node check.mjs`、`pnpm build`、`git status` | 直接登记 |
+| R2 · 未知二进制 | `bash scripts/test.sh`、`just ci`、`bazel test //...` | **可以逐条批准** |
+| R2 · 联网/装依赖/容器 | `pnpm install`、`curl …`、`docker compose up` | 没有批准通道 |
+| R3 / R4 | `rm -rf dist`、`git push`、`sudo …`、`npm publish` | 永不允许 |
+
+第二行是 Slice K 加的。原因是第三行和第二行此前混在一起，而它们完全不是一回事：
+白名单里没有 `bash`，挡住的不是能力（`node -e "…"` 是 R1，能干的事不比它少），
+只是**用别的语言栈的人**。所以诚实的做法是把决定权交回人，然后把这个决定绑死：
+
+- **精确**：绑整条 argv 的 digest。`bash test.sh` 的批准不覆盖 `bash test.sh -u`。
+- **一次性**：`maxBindings = 1`，一张票只能进一个 Run；不写盘，进程重启即作废。
+- **有时效**：15 分钟。批了不用，过期重批。
+- **不越界**：只对 BASELINE / VERIFICATION 生效，**模型提出的调用借不到**。
+- **不洗白**：批准是"允许它跑"，不是"把它变成 R1"。profile 里、账本里记的都还是 R2。
+- **每次现问**：执行期闸门每次执行前再查一遍，不因为登记时查过就一路放行。
+
+第三行没有批准通道，不是保守，是物理上做不到：工作区的 `node_modules` 是指向
+你仓库的 symlink，`pnpm install` 会写进你**真实的**依赖树 —— 那是"宿主仓库只读"
+这条不变式的破口，不是一次点击能授权的东西。界面在这里给的是下一步（先在自己仓库里装好，
+RepoPilot 只读复用），不是一句"不支持"。
+
+**与 PRD 措辞的一处显式偏离**：PRD 写的是 "TTL + max uses"，这里落成 max *bindings*。
+一条验证命令在一个 Run 里本来就要跑很多次（基线、终验、每轮自修复重验、整改后重验），
+给执行次数设上限等于让一次合法的重验变成 `SPAWN_ERROR` —— 那是**假红**。
+要限的是"这次授权能扩散多远"，不是"这条命令跑了几遍"，所以次数照记不照拦。
 
 ### 补丁交付
 

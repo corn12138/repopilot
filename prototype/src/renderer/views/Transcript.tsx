@@ -76,6 +76,8 @@ const MERGED_KINDS = new Set<string>([
   'CROSS_REVIEW_STARTED',
   'CROSS_REVIEW_ROUND',
   'CROSS_REVIEW_FINISHED',
+  // 每一次执行都在 verify_command 那条工具调用行上，这里再列一遍是重复
+  'COMMAND_APPROVAL_USED',
 ]);
 
 export function Transcript({
@@ -200,6 +202,14 @@ function build(
           role: 'user',
           text: e.summary.replace(/^任务已创建：/, ''),
         });
+        break;
+
+      case 'COMMAND_APPROVAL_BOUND':
+        /*
+         * 逐条批准过的 R2 命令要有自己的一行。它改变了"这个 Run 允许跑什么"——
+         * 混进"省略了 N 条"里，等于把一次授权藏进折叠区。
+         */
+        items.push({ kind: 'text', seq: e.seq, at: e.at, role: 'platform', text: e.summary });
         break;
 
       case 'ATTEMPT_STARTED': {

@@ -11,6 +11,8 @@
  */
 
 import type {
+  CommandApproval,
+  ToolRisk,
   DataEgressDisclosure,
   ApprovalDecisionKind,
   ApprovalRequest,
@@ -193,8 +195,43 @@ export interface RequestMap {
        * 取披露、给用户看、用户确认后把 digest 带回；Core 重算比对，缺失/过期一律拒绝创建。
        */
       egressConsentDigest?: string;
+      /**
+       * 用户逐条批准过的 R2 命令（`command.requestApproval` 签发）。批准绑整条 argv、
+       * 有 TTL、一张只能进一个 Run —— 不带就等于没批过，Core 会照常拒绝登记。
+       */
+      commandApprovalIds?: readonly string[];
     };
     res: { task: TaskSpec; run: RunView };
+  };
+
+  /**
+   * 只判级、不签发（Slice K）。界面据此决定是"不支持"还是"可以批准"。
+   *
+   * 与 `requestApproval` 分开是有意的：判级要能在用户每敲一次键时跑，而**签发是一个
+   * 手势**。合在一起会让每次输入都在 Core 里堆一张票，那时"一次性"就只是名义上的。
+   */
+  'command.classify': {
+    req: { argv: readonly string[] };
+    res: {
+      risk: ToolRisk;
+      cause: string;
+      reason: string;
+      /** 能否用一次性精确批准放行；false = 界面不该给"我了解风险"的复选框 */
+      approvable: boolean;
+      /** 不可批准时给出的下一步（不是道歉，是别的走法） */
+      remediation: string | null;
+    };
+  };
+
+  /**
+   * 为一条 R2 命令签发一次性精确批准（Slice K）。
+   *
+   * 只签"不在已知工具白名单内"的那一类；联网/装依赖/容器、未知 git 子命令、R3/R4
+   * 一律 `POLICY_DENIED` —— 界面不该给它们一个"我了解风险"的复选框。
+   */
+  'command.requestApproval': {
+    req: { argv: readonly string[] };
+    res: CommandApproval;
   };
 
   'run.get': { req: { runId: string }; res: { run: RunView | null } };

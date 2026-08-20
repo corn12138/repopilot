@@ -218,6 +218,39 @@ describe('平台发起的验证命令：合并进省略说明，不重复展示'
   });
 });
 
+describe('COMMAND_APPROVAL_BOUND：逐条批准的 R2 命令要有自己的一行', () => {
+  it('批准事件渲染成可见行，不被折进"省略了 N 条"', () => {
+    render(
+      <Transcript
+        events={[
+          event('RUN_CREATED', '任务已创建：修 CI'),
+          event('COMMAND_APPROVAL_BOUND', '你逐条批准了 R2 命令「bash scripts/test.sh」作为 user1（一次性，只对本次运行有效）', {
+            approvalId: 'capp_1',
+            commandId: 'user1',
+          }),
+        ]}
+        toolCalls={[]}
+      />,
+    );
+    expect(screen.getByText(/逐条批准了 R2 命令/)).toBeTruthy();
+    // 它不该同时出现在省略提示里
+    expect(screen.queryByText(/COMMAND_APPROVAL_BOUND/)).toBeNull();
+  });
+
+  it('每一次执行（COMMAND_APPROVAL_USED）并进省略提示：内容在 verify_command 那一行上', () => {
+    render(
+      <Transcript
+        events={[
+          event('RUN_CREATED', '任务已创建：修 CI'),
+          event('COMMAND_APPROVAL_USED', '按批准执行 R2 命令「bash scripts/test.sh」（BASELINE，第 1 次）'),
+        ]}
+        toolCalls={[]}
+      />,
+    );
+    expect(screen.queryByText(/按批准执行 R2 命令/)).toBeNull();
+  });
+});
+
 describe('ATTEMPT_STARTED：新一次尝试是看得见的分隔', () => {
   afterEach(() => {
     cleanup();
