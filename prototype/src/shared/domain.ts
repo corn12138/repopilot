@@ -106,6 +106,28 @@ export interface ExclusionEntry {
     | 'SYMLINK'
     /** 存在但读不了（EACCES/ELOOP/竞态删除）。与"不存在"必须可区分。 */
     | 'UNREADABLE'
+    /**
+     * Git LFS 指针：磁盘上是一段 ~130 字节的 `version https://git-lfs...` 文本，不是真内容。
+     *
+     * 必须与 BINARY / UNREADABLE 分开，因为它的危险方式独一无二：把指针当源码收进快照，
+     * 模型会对指针本身生成补丁，而这个补丁在宿主上 `git apply --check` 会**通过** ——
+     * 于是"应用到仓库"把用户真正的 LFS 指针覆盖成模型写的文本，大文件与仓库的关联就断了。
+     * 排除是唯一安全的处理：模型看不见它，就不可能改它。
+     */
+    | 'LFS_POINTER'
+    /** 子模块（gitlink，mode 160000）：它是另一个仓库的引用，不是本仓库的文件 */
+    | 'SUBMODULE'
+    /**
+     * 索引里有、工作区没有（sparse checkout / 未 checkout）。
+     * 与 UNREADABLE 分开：那是"读不了"，这是"根本没检出"，用户的下一步完全不同。
+     */
+    | 'NOT_CHECKED_OUT'
+    /**
+     * 只有大小写不同的多个索引条目，在当前文件系统上指向同一个 inode。
+     * 收进来会让快照声称有两个文件、而磁盘只有一个 —— 对其中一个做整文件替换会静默改掉另一个。
+     * 无法无歧义寻址，所以整组一起排除。
+     */
+    | 'CASE_COLLISION'
     /** 枚举本身被上限截断；`path` 是被截断的目录，`bytes` 为 0。 */
     | 'ENUMERATION_TRUNCATED';
   readonly bytes: number;

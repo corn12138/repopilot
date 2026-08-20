@@ -34,6 +34,26 @@ const BINARY_EXT = new Set([
 const SECRET_SUSPECT = [/^\.env($|\.)/, /(^|\/)id_rsa$/, /\.pem$/, /\.p12$/, /\.keystore$/];
 
 /**
+ * Git LFS 指针文件的固定头。规范见 `https://git-lfs.github.com/spec/v1`：
+ * 一个 LFS 指针总是以 `version <spec-url>` 开头，后面跟 oid / size，整体一百多字节。
+ *
+ * 用**内容**判断而不是看 `.gitattributes`：smudge filter 跑过的仓库里，同一批路径
+ * 拿到的是真内容，那时它就是普通文件，不该被排除。判据必须是"磁盘上现在是什么"。
+ */
+const LFS_POINTER_HEAD = 'version https://git-lfs.github.com/spec/v1';
+/** 指针文件都很小；超过这个大小就不必读头去试了 */
+const LFS_POINTER_MAX_BYTES = 1024;
+
+function isLfsPointer(abs: string, size: number): boolean {
+  if (size > LFS_POINTER_MAX_BYTES || size < LFS_POINTER_HEAD.length) return false;
+  try {
+    return readFileSync(abs, 'utf8').startsWith(LFS_POINTER_HEAD);
+  } catch {
+    return false; // 读不了由调用方按 UNREADABLE 处理，这里不冒充判断
+  }
+}
+
+/**
  * 导入只在**物理上做不到**时失败：目录不存在、里面没有可用文件、超出容量。
  *
  * 仓库脏不脏、是不是 git、是不是 Vite —— 都不再是门禁。用户选中目录
@@ -125,14 +145,34 @@ export function importSnapshot(
     baseSha = git(hostPath, ['rev-parse', 'HEAD']).trim();
     branch = git(hostPath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
 
-    const lsArgs = ['ls-files', '-z'];
+    /*
+     * `-s` 一并拿到 index 里的 mode：mode 160000 是 gitlink（子模块）。
+     * 不看 mode 的话，子模块在磁盘上是个目录，走到 lstat 那里会被记成 UNREADABLE ——
+     * 把"未支持的形态"伪装成"读取失败"，用户根本不知道该去 `git submodule update` 还是修权限。
+     */
+    const lsArgs = ['ls-files', '-s', '-z'];
     if (subPath) lsArgs.push('--', subPath);
-    listed = git(hostPath, lsArgs)
+    const entries = git(hostPath, lsArgs)
       .split('\0')
       .filter(Boolean)
-      // 子包导入时，快照内路径相对子包根，profile / 命令 / 补丁都以子包为坐标系
-      .map((p) => (subPath ? p.slice(subPath.length + 1) : p))
-      .filter(Boolean);
+      .map((line) => {
+        // 形如 `100644 <sha> 0\t<path>`
+        const tab = line.indexOf('\t');
+        const mode = tab > 0 ? line.slice(0, 6) : '';
+        const full = tab > 0 ? line.slice(tab + 1) : line;
+        // 子包导入时，快照内路径相对子包根，profile / 命令 / 补丁都以子包为坐标系
+        const rel = subPath ? full.slice(subPath.length + 1) : full;
+        return { mode, path: rel };
+      })
+      .filter((e) => e.path);
+    listed = [];
+    for (const e of entries) {
+      if (e.mode === '160000') {
+        enumerationExclusions.push({ path: e.path, reason: 'SUBMODULE', bytes: 0 });
+        continue;
+      }
+      listed.push(e.path);
+    }
   } else {
     // 非 git 目录：直接走文件树，用与 git 相同的排除规则
     const walked = walkPlainDirectory(scopeRoot);
@@ -157,18 +197,65 @@ export function importSnapshot(
   const included: Array<{ path: string; digest: string }> = [];
   let totalBytes = 0;
 
+  /*
+   * 仅大小写不同的条目。在大小写不敏感的文件系统（APFS 默认）上它们指向**同一个 inode**：
+   * 收进来会让快照声称有两个文件，而对其中一个做整文件替换会静默改掉另一个。
+   * 判据用 inode 而不是 `process.platform === 'darwin'` —— 猜平台会在大小写敏感的 APFS 卷
+   * 或 Linux 上误伤真正不同的两个文件。无法无歧义寻址的整组一起排除。
+   */
+  const collided = new Set<string>();
+  const byLowerCase = new Map<string, string[]>();
   for (const rel of listed) {
+    const key = rel.toLowerCase();
+    byLowerCase.set(key, [...(byLowerCase.get(key) ?? []), rel]);
+  }
+  for (const group of byLowerCase.values()) {
+    if (group.length < 2) continue;
+    const inodes = new Set<string>();
+    let allResolved = true;
+    for (const rel of group) {
+      try {
+        const st = lstatSync(join(scopeRoot, rel));
+        inodes.add(`${st.dev}:${st.ino}`);
+      } catch {
+        allResolved = false;
+      }
+    }
+    /*
+     * 只有"全部能解析且指向同一个 inode"才是碰撞。
+     * 其中一个解析不了时**不能**判碰撞：在大小写不敏感的文件系统上这种组合不会出现
+     * （查找会命中同一个文件），所以它意味着那条路径是真的没检出 ——
+     * 该由下面的循环按 errno 记成 NOT_CHECKED_OUT，而不是在这里把原因说成大小写碰撞。
+     */
+    if (allResolved && inodes.size === 1) {
+      for (const rel of group) collided.add(rel);
+    }
+  }
+
+  for (const rel of listed) {
+    if (collided.has(rel)) {
+      excluded.push({ path: rel, reason: 'CASE_COLLISION', bytes: 0 });
+      continue;
+    }
     const abs = join(scopeRoot, rel);
     let st;
     try {
       st = lstatSync(abs);
-    } catch {
+    } catch (err) {
       /*
        * 以前是裸 `continue`：git 说这个文件存在，我们读不到，然后它从两边都消失了 ——
        * 既不在 included，也不在 excluded，fileCount 只是悄悄小了一个。
-       * 权限问题和 ls-files 之后的竞态删除都会走到这里，两者都必须留下痕迹。
+       *
+       * 而"不存在"与"读不了"必须再分一层：sparse checkout 的仓库里，索引列出的大部分路径
+       * 磁盘上压根没有（ENOENT）。把它们记成 UNREADABLE 会让用户去查权限，
+       * 真正该做的是 `git sparse-checkout disable` 或换个导入范围。
        */
-      excluded.push({ path: rel, reason: 'UNREADABLE', bytes: 0 });
+      const code = (err as NodeJS.ErrnoException).code;
+      excluded.push({
+        path: rel,
+        reason: code === 'ENOENT' ? 'NOT_CHECKED_OUT' : 'UNREADABLE',
+        bytes: 0,
+      });
       continue;
     }
     // 不跟随 symlink：软链接一律不进快照
@@ -183,6 +270,18 @@ export function importSnapshot(
     }
 
     const reason = classifyExclusion(rel, st.size);
+    /*
+     * LFS 指针不是源码：收进来模型会当真内容改它，而那个补丁在宿主上 apply 会成功。
+     *
+     * 归因顺序有讲究：`.png` 这类扩展名会先被判成 BINARY，而"二进制，跳过了"这句话
+     * 恰好把最该说的事实盖住了 —— 用户需要知道的是"这个仓库用了 LFS、真内容不在本地"。
+     * 所以 BINARY（和"没有理由排除"）都要再让 LFS 判一次；
+     * DEPENDENCY_DIR / BUILD_OUTPUT / SECRET_SUSPECT 保持原判：那些路径本来就与 LFS 无关。
+     */
+    if ((reason === null || reason === 'BINARY') && isLfsPointer(abs, st.size)) {
+      excluded.push({ path: rel, reason: 'LFS_POINTER', bytes: st.size });
+      continue;
+    }
     if (reason) {
       excluded.push({ path: rel, reason, bytes: st.size });
       continue;
@@ -314,6 +413,62 @@ function walkPlainDirectory(root: string): { files: string[]; excluded: Exclusio
  *
  * 只扫两层常见工作区目录，不递归全仓 —— 避免为了找包把整个磁盘走一遍。
  */
+/**
+ * 从排除清单里汇总"仓库形态"层面的事实：LFS / 子模块 / 未检出 / 大小写碰撞。
+ *
+ * 这几类与 DEPENDENCY_DIR、BUILD_OUTPUT 那种"本来就不该进来"的排除不同 ——
+ * 它们意味着**用户以为在仓库里的东西不在快照里**，而且下一步动作各不相同
+ * （装 LFS 并 checkout / `git submodule update` / 关掉 sparse / 改名）。
+ * 所以它们要单独说给用户和模型听，而不是混在"共排除 N 个文件"里。
+ */
+export interface RepositoryShapeFinding {
+  readonly kind: 'LFS_POINTER' | 'SUBMODULE' | 'NOT_CHECKED_OUT' | 'CASE_COLLISION';
+  readonly count: number;
+  /** 举几个例子给人看，不列全（清单本身在 excludedPaths 里） */
+  readonly samples: readonly string[];
+  /** 一句话：这是什么、下一步做什么 */
+  readonly advice: string;
+}
+
+const SHAPE_ADVICE: Record<RepositoryShapeFinding['kind'], string> = {
+  LFS_POINTER:
+    'Git LFS 指针（磁盘上是一段 130 字节左右的引用文本，不是文件真内容）已被排除：' +
+    '收进来模型会把指针当源码改，而那个补丁在你的仓库上 git apply 会成功 —— 真正的指针就被覆盖了。' +
+    '要让 Agent 看到真内容，请先 `git lfs install && git lfs pull` 再重新导入',
+  SUBMODULE:
+    '子模块是另一个仓库的引用，不是本仓库的文件，未进入快照。' +
+    '要改子模块里的代码，请把那个仓库单独导入为一个项目',
+  NOT_CHECKED_OUT:
+    '索引里有、工作区没有（通常是 sparse checkout）。这些路径不在快照里，Agent 看不到它们。' +
+    '如果要修的代码在其中，先 `git sparse-checkout disable`（或调整范围）再重新导入',
+  CASE_COLLISION:
+    '这些路径只有大小写不同，在当前文件系统上指向同一个文件 —— 无法无歧义寻址，整组都没进快照。' +
+    '请在仓库里改名消歧后重新导入',
+};
+
+export function summarizeShapes(
+  excludedPaths: readonly ExclusionEntry[],
+): readonly RepositoryShapeFinding[] {
+  const kinds: RepositoryShapeFinding['kind'][] = [
+    'LFS_POINTER',
+    'SUBMODULE',
+    'NOT_CHECKED_OUT',
+    'CASE_COLLISION',
+  ];
+  const out: RepositoryShapeFinding[] = [];
+  for (const kind of kinds) {
+    const hits = excludedPaths.filter((e) => e.reason === kind);
+    if (hits.length === 0) continue;
+    out.push({
+      kind,
+      count: hits.length,
+      samples: hits.slice(0, 3).map((e) => e.path),
+      advice: SHAPE_ADVICE[kind],
+    });
+  }
+  return out;
+}
+
 export function findSubPackages(hostPath: string): SubPackageCandidate[] {
   const roots = ['apps', 'packages', 'examples', 'services'];
   const found: SubPackageCandidate[] = [];

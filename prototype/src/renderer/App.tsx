@@ -572,8 +572,47 @@ const EXCLUSION_LABEL: Record<ExclusionEntry['reason'], string> = {
   SECRET_SUSPECT: '疑似 secret',
   SYMLINK: '软链接（不跟随）',
   UNREADABLE: '存在但读不了',
+  LFS_POINTER: 'Git LFS 指针（不是真内容）',
+  SUBMODULE: '子模块（另一个仓库）',
+  NOT_CHECKED_OUT: '索引里有、工作区没有（未检出）',
+  CASE_COLLISION: '仅大小写不同、指向同一文件',
   ENUMERATION_TRUNCATED: '枚举被上限截断',
 };
+
+/**
+ * 形态层面的缺席：每一种的下一步动作都不同，所以一种一条横幅、各说各的修复路径。
+ */
+const SHAPE_BANNERS: ReadonlyArray<{
+  reason: ExclusionEntry['reason'];
+  tone: 'warn' | 'err';
+  text: string;
+}> = [
+  {
+    reason: 'LFS_POINTER',
+    tone: 'err',
+    text:
+      '磁盘上是一段引用文本、不是文件真内容。收进来的话模型会把指针当源码改，' +
+      '而那个补丁在你的仓库上 git apply 会成功 —— 真正的指针就被覆盖了。' +
+      '要让 Agent 看到真内容：git lfs install && git lfs pull，然后重新导入。',
+  },
+  {
+    reason: 'SUBMODULE',
+    tone: 'warn',
+    text: '子模块是另一个仓库的引用。要改它里面的代码，请把那个仓库单独导入成一个项目。',
+  },
+  {
+    reason: 'NOT_CHECKED_OUT',
+    tone: 'warn',
+    text:
+      '索引里有、工作区没有（通常是 sparse checkout）。Agent 看不到这些路径；' +
+      '要修的代码若在其中，先 git sparse-checkout disable 或调整范围，再重新导入。',
+  },
+  {
+    reason: 'CASE_COLLISION',
+    tone: 'warn',
+    text: '这些路径只有大小写不同、在当前文件系统上指向同一个文件，无法无歧义寻址，整组都没进快照。',
+  },
+];
 
 /**
  * 按原因分组报数。
@@ -1034,6 +1073,23 @@ function SnapshotPanel({
           看不到它们，基于这份快照产生的补丁也不会包含它们。
         </Banner>
       )}
+
+      {/*
+        形态层面的缺席各自一条：LFS / 子模块 / 未检出 / 大小写碰撞的下一步动作完全不同，
+        合并成一句"共排除 N 个"等于什么也没说。LFS 单独用 err 色 —— 它是唯一一条
+        会破坏用户真实仓库的形态（指针被当源码改，补丁在宿主上 apply 会成功）。
+      */}
+      {SHAPE_BANNERS.map(({ reason, tone, text }) => {
+        const hits = snapshot.excludedPaths.filter((e) => e.reason === reason);
+        if (hits.length === 0) return null;
+        return (
+          <Banner key={reason} tone={tone}>
+            <b>{hits.length} 项</b>因「{EXCLUSION_LABEL[reason]}」未进入快照（例如{' '}
+            <code>{hits.slice(0, 3).map((e) => e.path).join('、')}</code>
+            {hits.length > 3 ? ' 等' : ''}）。{text}
+          </Banner>
+        );
+      })}
 
       {snapshot.excludedPaths.some((e) => e.reason === 'ENUMERATION_TRUNCATED') && (
         <Banner tone="err">

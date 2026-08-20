@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 50 个文件、901 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 50 个文件、912 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -84,6 +84,9 @@
 | REQUEST_CHANGES 的三条拒绝路径：旧补丁 digest 在新 Attempt 里不再可决定（CONFLICT）；预算已耗尽 → `BLOCKED/CHANGES_REQUESTED` 且点名是哪一项预算；恢复态 Run 可接受/拒绝但开不了新尝试 | `authority.attempt.e2e.test.ts` |
 | 持久化 v3：`priorPatches` 原样往返（diff 正文必须在，事件里没有它）；v2 旧快照缺字段读回 undefined，v4 仍 fail-closed | `persistence.test.ts` |
 | 审查页：历史补丁默认折叠可展开、没有时不给空壳；恢复态 Run 的"要求修改"禁用并说明原因；时间线里 `ATTEMPT_STARTED` 单独成行且切断上一轮 | `RunDetail.test.tsx` / `Transcript.test.tsx` |
+| **仓库形态识别**（此前四种全是静默 fail-open）：LFS 指针按**内容**判定并排除（`.png` 下的指针归 `LFS_POINTER` 而不是 `BINARY` —— "二进制跳过了"会盖住"这个仓库用了 LFS"）；gitlink 归 `SUBMODULE` 而不是伪装成读取失败；索引有、工作区无归 `NOT_CHECKED_OUT` 而不是 `UNREADABLE`；仅大小写不同且同 inode 的整组归 `CASE_COLLISION`（不同 inode 不误伤） | `repo.test.ts` |
+| **宿主 LFS 指针的两道闸**：导入时不进快照（工作区里根本没有它）；即便补丁带同路径"新建文件"，`git apply --check` 整笔拒绝、宿主指针逐字节不变、`git status` 干净 | `apply.test.ts` |
+| 形态缺席对人对模型都说清楚：导入页每种形态一条横幅（LFS 用错误色并给 `git lfs pull`）、任务创建各发一条 NOTE、模型简报里点名"这些不在快照里，不要假设它们存在" | `repo.test.ts`（`summarizeShapes`）/ `App.tsx` / `agent.ts` |
 
 ## 尚未证明的
 

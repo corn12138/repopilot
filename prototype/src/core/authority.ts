@@ -64,6 +64,7 @@ import {
   findSubPackages,
   importSnapshot,
   resolveProfile,
+  summarizeShapes,
 } from './repo';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { buildChildEnv, resolveBinary } from './command';
@@ -1373,6 +1374,26 @@ export class RunAuthority {
      * 只新建了文件的仓库现在是 CLEAN_COMMIT 基线，如果这条 NOTE 不发，
      * 用户与模型都会以为那些新文件在快照里。
      */
+    /*
+     * 形态层面的缺席（LFS / 子模块 / 未检出 / 大小写碰撞）各发一条 NOTE：
+     * 它们与 dirty/untracked 一样，都是"影响成功意味着什么"的事实，而且每一种的下一步都不同。
+     */
+    for (const shape of summarizeShapes(snapshot.excludedPaths)) {
+      this.emit(
+        record,
+        'NOTE',
+        `仓库形态：${shape.count} 项因「${
+          shape.kind === 'LFS_POINTER'
+            ? 'Git LFS 指针'
+            : shape.kind === 'SUBMODULE'
+              ? '子模块'
+              : shape.kind === 'NOT_CHECKED_OUT'
+                ? '未检出'
+                : '大小写碰撞'
+        }」未进入快照（例如 ${shape.samples.join('、')}）。${shape.advice}`,
+        { shape: shape.kind, count: shape.count, samples: shape.samples },
+      );
+    }
     if (snapshot.untrackedCount > 0) {
       this.emit(
         record,

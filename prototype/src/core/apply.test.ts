@@ -266,3 +266,59 @@ describe('写回宿主仓库的接受态门禁（checkPatchApplyGate）', () => 
     if (!g.ok) expect(g.reason).toBe('NOT_ACCEPTED');
   });
 });
+
+// ---------------------------------------------------------------------------
+// LFS 指针：宿主上的真指针不能被补丁覆盖
+// ---------------------------------------------------------------------------
+
+/**
+ * 08-17 审计 D2 里最危险的一条：LFS 指针被当源码收进快照 → 模型对它生成补丁 →
+ * 用户点「应用到仓库」→ `git apply --check` 通过 → **宿主上真正的指针被覆盖成模型写的文本**，
+ * 大文件与仓库的关联就此断掉。
+ *
+ * 现在第一道闸是导入时排除（repo.test.ts 证明它不进快照）。这里补第二道：
+ * 就算模型在同一路径上**新建**文件，`git apply --check` 也会因为宿主上那个文件已存在而整笔拒绝。
+ * 两道都断掉，这条路径才算真的关上。
+ */
+describe('LFS 指针在宿主上的保护', () => {
+  const POINTER = `version https://git-lfs.github.com/spec/v1\noid sha256:${'a'.repeat(64)}\nsize 12345678\n`;
+
+  beforeEach(() => {
+    setup();
+    writeFileSync(join(host, 'assets.bin'), POINTER, 'utf8');
+    git(['add', '-A']);
+    git(['-c', 'user.email=t@e.com', '-c', 'user.name=t', 'commit', '-q', '-m', 'lfs pointer']);
+  });
+
+  it('指针不进快照，所以工作区里根本没有它 —— 模型改不了看不见的文件', () => {
+    const snapshot = importSnapshot('p', host);
+    expect(snapshot.excludedPaths.filter((e) => e.reason === 'LFS_POINTER').map((e) => e.path)).toEqual([
+      'assets.bin',
+    ]);
+    const ws = MaterializedWorkspace.create(newId('run'), snapshot.snapshotId);
+    try {
+      expect(ws.exists('assets.bin')).toBe(false);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it('即便补丁里带一个同路径的"新建文件"，宿主上的指针也逐字节不变（--check 整笔拒绝）', () => {
+    const before = readFileSync(join(host, 'assets.bin'), 'utf8');
+    // 手工构造一个"新建 assets.bin"的补丁 —— 相当于模型在工作区里创建了这个路径
+    const malicious =
+      'diff --git a/assets.bin b/assets.bin\n' +
+      'new file mode 100644\n' +
+      '--- /dev/null\n' +
+      '+++ b/assets.bin\n' +
+      '@@ -0,0 +1,1 @@\n' +
+      '+模型以为这是一个文本文件，于是把它整个重写了\n';
+
+    const result = applyPatchWithGit(host, '', malicious, patchFile, ['assets.bin']);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.stage).toBe('CHECK');
+    // 唯一真正重要的断言：宿主上的指针一个字节都没动
+    expect(readFileSync(join(host, 'assets.bin'), 'utf8')).toBe(before);
+    expect(git(['status', '--porcelain'])).toBe('');
+  });
+});

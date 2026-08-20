@@ -23,6 +23,7 @@ import type { ContentBlock, ModelMessage, ToolSchema } from './model/types';
 import { textOf, toolUsesOf } from './model/types';
 import type { MutationPolicy } from './mutation';
 import { PLANNING_TOOLS, TOOLS, TOOLS_BY_NAME, type ToolContext, type ToolDefinition } from './tools';
+import { summarizeShapes } from './repo';
 import { compareVerification, runVerification, summarizeFailures } from './verify';
 import type { MaterializedWorkspace } from './workspace';
 
@@ -1510,6 +1511,23 @@ function buildTaskBrief(deps: AgentDeps, baseline: VerificationRun | null): stri
   const unreadable = deps.snapshot.excludedPaths.filter((e) => e.reason === 'UNREADABLE').length;
   if (unreadable > 0) {
     absences.push(`- 读取失败: ${unreadable} 个路径存在但读不了，不在快照里`);
+  }
+  /*
+   * 仓库形态造成的缺席（LFS / 子模块 / 未检出 / 大小写碰撞）要点名说。
+   * 模型的世界就是这份快照：不说清楚，它会去"修"一个它看不见的文件，然后把失败归因到别处。
+   */
+  for (const shape of summarizeShapes(deps.snapshot.excludedPaths)) {
+    const label =
+      shape.kind === 'LFS_POINTER'
+        ? 'Git LFS 指针'
+        : shape.kind === 'SUBMODULE'
+          ? '子模块'
+          : shape.kind === 'NOT_CHECKED_OUT'
+            ? '索引里有但未检出'
+            : '仅大小写不同的重名路径';
+    absences.push(
+      `- ${label}: ${shape.count} 项**不在快照里**（例如 ${shape.samples.join('、')}）—— 你看不到它们，也不要假设它们存在`,
+    );
   }
 
   const header = `仓库信息：

@@ -1,5 +1,13 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -41,8 +49,15 @@ vi.mock('./paths', async () => {
   };
 });
 
-import { RepositoryImportError, findSubPackages, importSnapshot, resolveProfile } from './repo';
+import {
+  RepositoryImportError,
+  findSubPackages,
+  importSnapshot,
+  resolveProfile,
+  summarizeShapes,
+} from './repo';
 import { listTree } from './workspace';
+import type { RepositorySnapshot } from '@shared/domain';
 import { snapshotDir } from './paths';
 import { ensureDataRoot } from './paths';
 
@@ -319,5 +334,199 @@ describe('仍然成立的物理约束', () => {
     } finally {
       rmSync(empty, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 仓库形态：LFS 指针 / 子模块 / 未检出 / 大小写碰撞
+// ---------------------------------------------------------------------------
+
+/**
+ * 这四种形态此前全是 fail-open，而且失败方式都不可见（08-17 审计 D2-repo-shape-fail-open）：
+ * LFS 指针被当源码收进快照且**完全静默**，子模块与未检出都被伪装成"读取失败"。
+ *
+ * 其中 LFS 是唯一一条会**破坏用户真实仓库**的：指针进了快照 → 模型对它生成补丁 →
+ * 用户点「应用到仓库」→ `git apply --check` 通过 → 宿主上真正的指针被覆盖成模型写的文本。
+ */
+
+const LFS_POINTER =
+  'version https://git-lfs.github.com/spec/v1\noid sha256:' +
+  'a'.repeat(64) +
+  '\nsize 12345678\n';
+
+function excludedFor(snapshot: RepositorySnapshot, reason: string): string[] {
+  return snapshot.excludedPaths.filter((e) => e.reason === reason).map((e) => e.path);
+}
+
+function setupPlainGitRepo(): void {
+  repo = mkdtempSync(join(tmpdir(), 'repopilot-shape-'));
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+  write('package.json', JSON.stringify({ name: 'shape', scripts: { build: 'vite build' } }));
+  write('src/app.ts', 'export const a = 1;\n');
+  ensureDataRoot();
+}
+
+describe('仓库形态：Git LFS 指针', () => {
+  beforeEach(setupPlainGitRepo);
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it('指针文件被排除并单独归因 LFS_POINTER —— 不进快照，模型看不到，也就改不了它', () => {
+    write('assets/logo.png', LFS_POINTER);
+    write('docs/big.psd', LFS_POINTER);
+    commitAll('lfs');
+
+    const snap = importSnapshot('proj', repo);
+    expect(excludedFor(snap, 'LFS_POINTER').sort()).toEqual(['assets/logo.png', 'docs/big.psd']);
+    // 关键：快照里没有它们 —— 补丁不可能触碰到宿主上的真指针
+    expect(listTree(snapshotDir(snap.snapshotId)).map((f) => f.path)).not.toContain('assets/logo.png');
+    // 不能被伪装成别的原因（此前它是完全静默的，连排除清单都没有）
+    expect(excludedFor(snap, 'BINARY')).not.toContain('assets/logo.png');
+    expect(excludedFor(snap, 'UNREADABLE')).toEqual([]);
+  });
+
+  it('判据是磁盘上现在是什么：同一目录同一扩展名，指针被排除、真内容照常收进来', () => {
+    /*
+     * 不写 `filter=lfs` 的 .gitattributes —— 那会让 git 去调本机的 git-lfs 二进制，
+     * 测试就变成"这台机器装没装 git-lfs"的函数（本机没装时 `git add` 直接失败）。
+     * 而这条用例要断言的本来就与 .gitattributes 无关：**只看内容**。
+     */
+    write('data/big.csv', LFS_POINTER);
+    write('data/real.csv', 'a,b\n1,2\n');
+    commitAll('mixed-csv');
+
+    const snap = importSnapshot('proj', repo);
+    expect(excludedFor(snap, 'LFS_POINTER')).toEqual(['data/big.csv']);
+    expect(listTree(snapshotDir(snap.snapshotId)).map((f) => f.path)).toContain('data/real.csv');
+  });
+
+  it('二进制扩展名下的指针归因 LFS_POINTER 而不是 BINARY —— "二进制跳过了"会盖住真正该说的事', () => {
+    write('assets/logo.png', LFS_POINTER); // 指针
+    write('assets/tiny.gif', 'GIF89a-real-bytes\n'); // 真二进制内容
+    commitAll('mixed');
+
+    const snap = importSnapshot('proj', repo);
+    expect(excludedFor(snap, 'LFS_POINTER')).toEqual(['assets/logo.png']);
+    expect(excludedFor(snap, 'BINARY')).toEqual(['assets/tiny.gif']);
+  });
+
+  it('只是碰巧以 version 开头的普通文件不误判', () => {
+    write('src/notes.txt', 'version https://example.com/not-lfs\nsome notes\n');
+    commitAll('lookalike');
+    const snap = importSnapshot('proj', repo);
+    expect(excludedFor(snap, 'LFS_POINTER')).toEqual([]);
+  });
+});
+
+describe('仓库形态：子模块', () => {
+  beforeEach(setupPlainGitRepo);
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it('gitlink 归因 SUBMODULE，而不是伪装成"读取失败"', () => {
+    // 造一个真的子模块：另建一个仓库再 add 进来
+    const inner = mkdtempSync(join(tmpdir(), 'repopilot-inner-'));
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: inner });
+      writeFileSync(join(inner, 'lib.ts'), 'export const x = 1;\n');
+      execFileSync('git', ['add', '-A'], { cwd: inner });
+      execFileSync('git', ['-c', 'user.email=t@e.com', '-c', 'user.name=t', 'commit', '-q', '-m', 'inner'], {
+        cwd: inner,
+      });
+      commitAll('base');
+      execFileSync(
+        'git',
+        ['-c', 'protocol.file.allow=always', 'submodule', '--quiet', 'add', inner, 'vendor/inner'],
+        { cwd: repo, stdio: 'ignore' },
+      );
+      commitAll('add submodule');
+
+      const snap = importSnapshot('proj', repo);
+      expect(excludedFor(snap, 'SUBMODULE')).toEqual(['vendor/inner']);
+      // 此前它走到 lstat 那里被记成 UNREADABLE —— 把"未支持形态"说成"读取失败"
+      expect(excludedFor(snap, 'UNREADABLE')).toEqual([]);
+      // 子模块里的文件当然也不在快照里
+      expect(listTree(snapshotDir(snap.snapshotId)).map((f) => f.path)).not.toContain('vendor/inner/lib.ts');
+    } finally {
+      rmSync(inner, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('仓库形态：索引里有、工作区没有（sparse checkout）', () => {
+  beforeEach(setupPlainGitRepo);
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it('ENOENT 归因 NOT_CHECKED_OUT，与真正读不了的 UNREADABLE 分开', () => {
+    write('src/kept.ts', 'export const kept = 1;\n');
+    write('src/gone.ts', 'export const gone = 1;\n');
+    write('src/also-gone.ts', 'export const g2 = 1;\n');
+    commitAll('all');
+    // 模拟 sparse：索引里还在，工作区删掉（不 commit 删除）
+    rmSync(join(repo, 'src/gone.ts'));
+    rmSync(join(repo, 'src/also-gone.ts'));
+
+    const snap = importSnapshot('proj', repo);
+    expect(excludedFor(snap, 'NOT_CHECKED_OUT').sort()).toEqual(['src/also-gone.ts', 'src/gone.ts']);
+    expect(excludedFor(snap, 'UNREADABLE')).toEqual([]);
+    // 快照仍然产出（用户可能就是有意 sparse），但缺席是**报了数**的
+    expect(listTree(snapshotDir(snap.snapshotId)).map((f) => f.path)).toContain('src/kept.ts');
+  });
+});
+
+describe('仓库形态：仅大小写不同的重名路径', () => {
+  beforeEach(setupPlainGitRepo);
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it('在大小写不敏感的文件系统上整组排除（磁盘只有一个文件，两条路径无法无歧义寻址）', () => {
+    write('src/readme.md', 'lower\n');
+    commitAll('one');
+    // 用 update-index 往索引里塞一个只有大小写不同的条目 —— 在 APFS 上它们指向同一个 inode
+    const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd: repo, input: 'upper\n' })
+      .toString()
+      .trim();
+    execFileSync('git', ['update-index', '--add', '--cacheinfo', `100644,${blob},src/README.md`], {
+      cwd: repo,
+    });
+
+    const snap = importSnapshot('proj', repo);
+    const collided = excludedFor(snap, 'CASE_COLLISION').sort();
+    const insensitive = existsSync(join(repo, 'src/README.md')); // APFS 默认大小写不敏感
+    if (insensitive) {
+      expect(collided).toEqual(['src/README.md', 'src/readme.md']);
+      // 整组都不进快照：收一个进来就等于让"改这个"静默改掉"那个"
+      expect(listTree(snapshotDir(snap.snapshotId)).map((f) => f.path)).not.toContain('src/readme.md');
+    } else {
+      // 大小写敏感的文件系统上它们是两个真文件：不许误伤
+      expect(collided).toEqual([]);
+      expect(excludedFor(snap, 'NOT_CHECKED_OUT')).toEqual(['src/README.md']);
+    }
+  });
+
+  it('大小写不同但确实是两个不同文件时不误伤（不同 inode）', () => {
+    // 造两个内容不同、路径大小写不同的文件；在不敏感 FS 上第二次 write 会覆盖第一个，
+    // 于是它们本来就是同一个 inode —— 这条用例只在敏感 FS 上有区分力，两边都不该崩
+    write('src/a.ts', 'a\n');
+    write('src/B.ts', 'b\n');
+    commitAll('two');
+    const snap = importSnapshot('proj', repo);
+    expect(excludedFor(snap, 'CASE_COLLISION')).toEqual([]);
+  });
+});
+
+describe('summarizeShapes', () => {
+  it('按形态聚合、给样例与下一步；没有该形态就不出现', () => {
+    const findings = summarizeShapes([
+      { path: 'a.png', reason: 'LFS_POINTER', bytes: 130 },
+      { path: 'b.png', reason: 'LFS_POINTER', bytes: 130 },
+      { path: 'c.png', reason: 'LFS_POINTER', bytes: 130 },
+      { path: 'd.png', reason: 'LFS_POINTER', bytes: 130 },
+      { path: 'vendor/x', reason: 'SUBMODULE', bytes: 0 },
+      { path: 'node_modules/y', reason: 'DEPENDENCY_DIR', bytes: 10 },
+    ]);
+    expect(findings.map((f) => f.kind)).toEqual(['LFS_POINTER', 'SUBMODULE']);
+    expect(findings[0]!.count).toBe(4);
+    expect(findings[0]!.samples).toHaveLength(3); // 只举例，不列全
+    expect(findings[0]!.advice).toContain('git lfs pull');
+    expect(findings[1]!.advice).toContain('单独导入');
+    expect(summarizeShapes([])).toEqual([]);
   });
 });
