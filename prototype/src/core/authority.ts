@@ -1870,6 +1870,62 @@ export class RunAuthority {
    * exportCandidate → 调用 CLI → 退出即封存 → applyCandidate（归一化 + CAS）→ discardCandidate。
    * 无论成败，candidate 目录都在 finally 里丢弃；主线 generation 只会因 applyMutationPlan 前进。
    */
+  /**
+   * 外部 CLI 出站的**运行期**同意闸门。
+   *
+   * ModelGateway 那条路上早就有这道检查（gateway.ts 的 preflight：CONSENT_MISSING /
+   * CONSENT_STALE / ROUTE_DRIFT）。外部 CLI 完全不经 gateway，它的 PREFLIGHT 只查
+   * 连接器状态、apiKey 非空与 prompt DLP —— 也就是说 task.create 那一次比对之后，
+   * 到真正 spawn 之间的一切变化都无人过问。
+   *
+   * 两件事在这里被挡住：
+   *   1. 根本没有同意（恢复态 Run、或披露里压根没列这个选手）→ 不出站。
+   *   2. **身份漂移**：identityDigest = digestOf({binaryPath, version})。用户在
+   *      task.create 之后升级了 Codex、或 PATH 指到了另一个二进制，我们就会把整仓副本
+   *      交给一个用户从未在披露上看见过的东西。这与 gateway 的 ROUTE_DRIFT 同形。
+   *
+   * 现在才做得成，是因为披露里的 EXTERNAL_CLI 目的地此前 `resolutionDigest` 硬编码
+   * 为 null（见 egress.ts），外部选手对同意覆盖集合的贡献是 0。
+   */
+  private assertExternalEgressConsent(
+    record: RunRecord,
+    connector: ExternalConnectorProfile,
+    role: 'AUTHOR' | 'REVIEWER',
+  ): void {
+    const label = role === 'AUTHOR' ? '外部作者' : '外部审核方';
+    const consent = record.consent;
+    if (!consent) {
+      throw platformError(
+        'POLICY_DENIED',
+        `${label} ${connector.label} 没有出站同意记录，已阻断调用`,
+        '请重新创建任务：出站披露必须在调用之前由你确认。',
+      );
+    }
+    /*
+     * 现场重算身份，不用绑定时那份。绑定时的 profile 是 task.create 当下的快照；
+     * 要挡的恰恰是"从那时到现在变了什么"，拿旧快照去比等于自己跟自己比。
+     */
+    const descriptor = descriptorOfConnector(connector.connectorId);
+    if (!descriptor) {
+      throw platformError('POLICY_DENIED', `未知连接器 ${connector.connectorId}，已阻断调用`);
+    }
+    const now = probeConnector(descriptor);
+    if (now.state !== 'READY' || !now.identityDigest) {
+      throw platformError(
+        'POLICY_DENIED',
+        `${label} ${connector.label} 当前不可用（${now.state}），已阻断调用`,
+        now.remediation ?? '请在设置里重新检测该连接器。',
+      );
+    }
+    if (!consent.resolutionDigests.includes(now.identityDigest)) {
+      throw platformError(
+        'POLICY_DENIED',
+        `${label} ${connector.label} 与你同意的那份披露不一致（可执行文件路径或版本已变），已阻断调用`,
+        '这台机器上的该 CLI 在你确认披露之后被改动过。请重新创建任务并确认新的出站披露。',
+      );
+    }
+  }
+
   private authorRunnerFor(
     record: RunRecord,
     author: AuthorBinding,
@@ -1878,6 +1934,8 @@ export class RunAuthority {
     deadline: PausableDeadline,
   ): ExternalAuthorRunner {
     return async (i) => {
+      // 出站前置：先过运行期同意与身份漂移，再动工作区 —— 拦下来的时候一个 candidate 都别建
+      this.assertExternalEgressConsent(record, author.connector, 'AUTHOR');
       const candidate = workspace.exportCandidate();
       this.emit(
         record,
@@ -1982,6 +2040,7 @@ export class RunAuthority {
       return (i) => runReviewPass(deps, { ...i, reviewerResolution: reviewer.resolution });
     }
     return async (i) => {
+      this.assertExternalEgressConsent(record, reviewer.connector, 'REVIEWER');
       const startedAt = nowIso();
       const result = await runExternalCliReview({
         connector: reviewer.connector,
@@ -2485,11 +2544,17 @@ export class RunAuthority {
   // 补丁决定 —— 唯一能进入 SUCCEEDED 的入口
   // -------------------------------------------------------------------------
 
-  /** 续期只对"上一循环没收敛"的三种收场开放；其余没有可续的东西 */
+  /**
+   * 续期只对"上一循环没收敛"的收场开放；其余没有可续的东西。
+   *
+   * REVIEWER_INCONCLUSIVE 在这里 —— 审核方压根没给出结论，"再跑一轮"正是它的下一步。
+   * 此前它被折进 REVIEWER_PASSED，于是用户不但看到假的"通过"，还连重跑的入口都没有。
+   */
   private static readonly CONTINUABLE_STOP_REASONS: ReadonlySet<string> = new Set([
     'COUNTER_EXHAUSTED',
     'NO_PROGRESS',
     'NO_DELTA',
+    'REVIEWER_INCONCLUSIVE',
   ]);
 
   /**

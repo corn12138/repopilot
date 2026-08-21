@@ -1026,13 +1026,36 @@ export interface CrossReviewCycleOutcome {
 }
 
 /**
+ * 一轮审核该怎么收场 —— 只在"没有阻断项"时才轮到 verdict 说话。
+ *
+ * 两条规则，都指向同一个原则：**平台能数的东西优先于模型的自评**。
+ *
+ * 1. 有阻断项就整改，不管 verdict 写的是什么。verdict 是模型对自己这轮的一句总结，
+ *    findings 是它逐条列出来的证据；`PASS` + 一条 CRITICAL 阻断项时，可信的是后者。
+ *    此前 `verdict === 'PASS'` 会短路掉整个 findings 数组。
+ * 2. 零阻断项时区分两种成因：`INCONCLUSIVE` 是"没看成"，不是"看过了没问题"。
+ *    这两种此前都折成 REVIEWER_PASSED，而界面把它渲染成"审核方未发现阻断问题" ——
+ *    外部审核方输出不可解析、schema 不过、用满轮次未提交（authority.ts / agent.ts
+ *    三处都返回 `{verdict:'INCONCLUSIVE', findings:[]}`）全都走这条路，于是
+ *    "拿不到结论"被显示成"通过"。
+ */
+function verdictOutcome(
+  round: CrossReviewRound,
+  blocking: readonly ReviewFinding[],
+): 'REMEDIATE' | 'REVIEWER_PASSED' | 'REVIEWER_INCONCLUSIVE' {
+  if (blocking.length > 0) return 'REMEDIATE';
+  return round.verdict === 'INCONCLUSIVE' ? 'REVIEWER_INCONCLUSIVE' : 'REVIEWER_PASSED';
+}
+
+/**
  * 交叉审核收敛循环：审核 →（有阻断）整改 → 重验 → 重封存 → 再审 → 终止判定。
  *
  * 硬上限来自 CROSS_REVIEW_LIMITS（2 次审核 + 1 次整改，PRD-XAGENT-004），
  * 流程本身写成直线而不是 while —— 上限不是"循环恰好走不满"，是结构上走不满。
  *
  * 终止语义（全部转人工，绝不自动接受）：
- *   REVIEWER_PASSED    某轮无阻断发现
+ *   REVIEWER_PASSED    某轮无阻断发现，且审核方确实给出了结论
+ *   REVIEWER_INCONCLUSIVE  审核方没给出可用结论（不可解析 / schema 不过 / 用满轮次未提交）
  *   NO_DELTA           整改没改出实质差异（没动文件，或 digest 与整改前相同）
  *   NO_PROGRESS        整改后验证反而失败（已恢复工作区），或第二轮阻断未减少/指纹重现
  *   COUNTER_EXHAUSTED  两轮审核 + 一次整改用满，仍有（减少了的）阻断
@@ -1070,7 +1093,8 @@ export async function runCrossReviewCycle(
   }
   rounds.push(round1);
   const blocking1 = round1.findings.filter((f) => f.blocking);
-  if (round1.verdict === 'PASS' || blocking1.length === 0) return done('REVIEWER_PASSED');
+  const outcome1 = verdictOutcome(round1, blocking1);
+  if (outcome1 !== 'REMEDIATE') return done(outcome1);
 
   // ---- 整改（1/1）----
   if (remediations >= CROSS_REVIEW_LIMITS.maxRemediations) return done('COUNTER_EXHAUSTED');
@@ -1163,7 +1187,8 @@ export async function runCrossReviewCycle(
   }
   rounds.push(round2);
   const blocking2 = round2.findings.filter((f) => f.blocking);
-  if (round2.verdict === 'PASS' || blocking2.length === 0) return done('REVIEWER_PASSED');
+  const outcome2 = verdictOutcome(round2, blocking2);
+  if (outcome2 !== 'REMEDIATE') return done(outcome2);
 
   // 进展判定用平台算的指纹，不用模型的自我评价
   const seen = new Set(blocking1.map((f) => f.fingerprint));

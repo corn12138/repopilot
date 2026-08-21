@@ -84,7 +84,8 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
         origin: null,
         isRelay: false,
         modelId: null,
-        resolutionDigest: null,
+        // 本机 CLI 没有网络 route，但有身份：路径 + 版本。见下方 consentedResolutionDigests
+        resolutionDigest: c.identityDigest,
         dataClasses: REVIEWER_CLASSES,
       });
     }
@@ -99,7 +100,7 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
       origin: null,
       isRelay: false,
       modelId: null,
-      resolutionDigest: null,
+      resolutionDigest: c.identityDigest,
       dataClasses: AUTHOR_CLI_CLASSES,
     });
   }
@@ -113,7 +114,17 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
   return { ...body, digest: digestOf(body) };
 }
 
-/** 同意所覆盖的 ModelGateway 路由：披露里每个 MODEL_API 目的地的冻结路由 digest */
+/**
+ * 同意所覆盖的**目的地身份**集合。
+ *
+ * MODEL_API 目的地给的是冻结路由 digest（profileId+providerId+origin+modelId）；
+ * EXTERNAL_CLI 目的地给的是连接器 identityDigest（binaryPath+version）。
+ *
+ * 外部 CLI 此前在这里贡献为 0（`resolutionDigest` 硬编码 null），后果有两层：
+ * 用户同意的那份披露对外部选手**没有任何运行期约束力**；而且从 task.create 到真正
+ * spawn 之间，用户把 Codex 升了一版、或 PATH 指向了另一个二进制，平台也发现不了 ——
+ * 这正是 ModelGateway 那边 `ROUTE_DRIFT` 要挡的东西，只是外部这条路上一直没装。
+ */
 export function consentedResolutionDigests(d: DataEgressDisclosure): string[] {
   return d.destinations.map((x) => x.resolutionDigest).filter((x): x is string => x !== null);
 }

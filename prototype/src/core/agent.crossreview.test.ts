@@ -576,6 +576,75 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     expect(duo.resolutionIds).toEqual(['route_reviewer']);
   });
 
+  /*
+   * "没给出结论" ≠ "通过"。
+   *
+   * 外部审核方输出不可解析、schema 不过、模型用满 8 轮没调 submit_review —— 三处都返回
+   * `{verdict:'INCONCLUSIVE', findings:[]}`。此前 `blocking.length === 0` 把它折成
+   * REVIEWER_PASSED，界面显示"审核方未发现阻断问题"，用户还没有重跑入口。
+   */
+  it('第 1 轮 INCONCLUSIVE + 空发现 → REVIEWER_INCONCLUSIVE，不是 REVIEWER_PASSED', async () => {
+    const host = new ReviewHost();
+    const duo = new ScriptedDuo(() => submitReview('INCONCLUSIVE', []));
+    const { hooks, calls } = makeHooks();
+
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
+
+    expect(out.stopReason).toBe('REVIEWER_INCONCLUSIVE');
+    expect(out.rounds).toHaveLength(1);
+    // 没有结论就没有可整改的东西，但也绝不能进整改
+    expect(out.remediations).toBe(0);
+    expect(calls).toEqual({ reverify: 0, reseal: 0, adopt: 0, restore: 0 });
+  });
+
+  it('第 2 轮 INCONCLUSIVE 同样不折成通过：整改过一次也不改变这一点', async () => {
+    const host = new ReviewHost();
+    let ws: ReviewWorkspace | null = null;
+    const duo = new ScriptedDuo(
+      (turn) => (turn === 1 ? submitReview('CHANGES_REQUESTED', [FINDING_A]) : submitReview('INCONCLUSIVE', [])),
+      () => {
+        ws!.activeGeneration += 1;
+        return textResponse('已按发现修复');
+      },
+    );
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+    ws = deps.workspace as unknown as ReviewWorkspace;
+    const { hooks } = makeHooks();
+
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
+
+    expect(out.stopReason).toBe('REVIEWER_INCONCLUSIVE');
+    expect(out.rounds).toHaveLength(2);
+    expect(out.remediations).toBe(1);
+  });
+
+  /*
+   * verdict 是模型对自己这轮的一句总结，findings 是它逐条列出的证据。
+   * 两者矛盾时可信的是后者 —— 与"进展判定用平台算的指纹，不用模型的自我评价"同一条原则。
+   */
+  it('verdict 说 PASS 但列了阻断发现 → 照常整改，findings 不被 verdict 短路', async () => {
+    const host = new ReviewHost();
+    let ws: ReviewWorkspace | null = null;
+    const duo = new ScriptedDuo(
+      (turn) => (turn === 1 ? submitReview('PASS', [FINDING_A]) : submitReview('PASS', [])),
+      () => {
+        ws!.activeGeneration += 1;
+        return textResponse('已按发现修复');
+      },
+    );
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+    ws = deps.workspace as unknown as ReviewWorkspace;
+    const { hooks, calls } = makeHooks();
+
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
+
+    expect(out.remediations, 'PASS 不该短路掉一条 blocking 发现').toBe(1);
+    expect(calls.reverify).toBe(1);
+    expect(out.rounds).toHaveLength(2);
+    expect(out.stopReason).toBe('REVIEWER_PASSED');
+  });
+
   it('有发现但零阻断 → 不整改，REVIEWER_PASSED（提示性发现不驱动整改）', async () => {
     const host = new ReviewHost();
     const duo = new ScriptedDuo(() =>

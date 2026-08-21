@@ -731,6 +731,8 @@ const SEVERITY_TONE: Record<ReviewFinding['severity'], 'err' | 'warn' | 'info' |
 
 const STOP_REASON_LABEL: Record<string, string> = {
   REVIEWER_PASSED: '审核方未发现阻断问题',
+  // 与上一行必须读起来就不一样：一个是"看过了"，一个是"没看成"
+  REVIEWER_INCONCLUSIVE: '审核方未给出可用结论 —— 这不是"通过"',
   COUNTER_EXHAUSTED: '已用满可自动进行的审核/整改轮次',
   NO_DELTA: '整改后补丁无变化',
   NO_PROGRESS: '整改未产生进展（阻断未减少 / 指纹重现 / 整改后验证失败）',
@@ -740,7 +742,13 @@ const STOP_REASON_LABEL: Record<string, string> = {
   ERROR: '审核过程出错',
 };
 
-const CONTINUABLE_STOP_REASONS = new Set(['COUNTER_EXHAUSTED', 'NO_PROGRESS', 'NO_DELTA']);
+const CONTINUABLE_STOP_REASONS = new Set([
+  'COUNTER_EXHAUSTED',
+  'NO_PROGRESS',
+  'NO_DELTA',
+  // 没拿到结论 → "再跑一轮"正是下一步（与 authority.ts 的同名集合保持一致）
+  'REVIEWER_INCONCLUSIVE',
+]);
 
 /**
  * 循环续期的用户闸门。自动轮次每循环硬上限（2 审 1 改），

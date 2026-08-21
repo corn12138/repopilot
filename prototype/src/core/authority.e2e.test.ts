@@ -966,6 +966,60 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
   );
 
   it(
+    '审核方一轮都没给出结论 → REVIEWER_INCONCLUSIVE（不是"通过"），并且续期是开着的',
+    async () => {
+      harness.script(IMPL, [
+        () => planCall(),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('修复完成。'),
+      ]);
+      /*
+       * 审核方用满 8 轮都不调 submit_review —— agent.ts 把它记为
+       * `{verdict:'INCONCLUSIVE', findings:[]}`（不编造发现）。此前空 findings 会让
+       * 收敛循环判成 REVIEWER_PASSED，界面显示"审核方未发现阻断问题"。
+       */
+      harness.script(
+        REVIEWER,
+        Array.from({ length: 8 }, () => () => oaText('我需要再看看上下文')),
+      );
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        reviewerModelProfileId: 'profile_moonshot-cn',
+      });
+      await harness.approvePlan(runId);
+      await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+
+      const { crossReview } = await harness.call<{
+        crossReview: { stopReason: string; reviewerInvocations: number; remediations: number } | null;
+      }>('crossreview.get', { runId });
+      expect(crossReview!.stopReason).toBe('REVIEWER_INCONCLUSIVE');
+      // 没有结论就没有可整改的东西，也不该白跑第二轮
+      expect(crossReview!.remediations).toBe(0);
+      expect(crossReview!.reviewerInvocations).toBe(1);
+
+      // 事件流里写的是真实收场，不是"通过"
+      const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+      const finished = events.find((e) => e.kind === 'CROSS_REVIEW_FINISHED')!;
+      expect(finished.summary).toContain('REVIEWER_INCONCLUSIVE');
+      expect(finished.summary).not.toContain('REVIEWER_PASSED');
+
+      /*
+       * 与 REVIEWER_PASSED 的关键差别：那条之后"没有可续期的东西"，
+       * 而"没拿到结论"的下一步恰恰就是再跑一轮 —— 入口必须开着。
+       */
+      harness.script(REVIEWER, [() => oaToolCall('submit_review', { verdict: 'PASS', findings: [] })]);
+      const cont = await harness.call<{ accepted: boolean; reason: string | null }>(
+        'crossreview.continue',
+        { runId },
+      );
+      expect(cont.accepted, cont.reason ?? '').toBe(true);
+    },
+    40_000,
+  );
+
+  it(
     '用户闸门：COUNTER_EXHAUSTED 后由用户授权续循环，续期那轮收敛通过',
     async () => {
       harness.script(IMPL, [

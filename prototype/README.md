@@ -16,7 +16,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 52 个文件、953 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 52 个文件、960 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -56,6 +56,8 @@
 | **权威层 e2e**：自修复用尽 → `FAILED` + `failureClass` + 挽救补丁封存，接受被状态门禁拒绝 | `authority.e2e.test.ts` |
 | **权威层 e2e**：交叉审核阻断 → 整改 → 重验 → 重封存（digest 变化）→ 第二轮通过，2 审 1 改如实记账 | `authority.e2e.test.ts` |
 | **权威层 e2e**：`COUNTER_EXHAUSTED` 后用户授权续循环 → 续期轮收敛，累计 4 审 2 改 1 续期、轮次连续编号；终态/`REVIEWER_PASSED` 续期被拒 | `authority.e2e.test.ts` |
+| **"没给出结论" ≠ "通过"**：`INCONCLUSIVE` + 空发现 → `REVIEWER_INCONCLUSIVE`（零整改、零钩子），第 2 轮同理；`verdict:'PASS'` + 一条 blocking → 照常整改，不被 verdict 短路；e2e：审核方用满 8 轮不提交 → 事件流写 `REVIEWER_INCONCLUSIVE` 且不含 `REVIEWER_PASSED`，续期入口开着 | `agent.crossreview.test.ts` / `authority.e2e.test.ts` |
+| **外部 CLI 出站的运行期同意闸门**：披露里 EXTERNAL_CLI 目的地贡献 `identityDigest`（路径+版本）而不再是 null；spawn 前现场重探，同意集合里没有它就阻断；e2e：同意之后把 CLI 升一版 → 拦在 `exportCandidate` 之前，零 candidate 目录、主线 gen 不动、简报根本没送出去 | `egress.test.ts` / `authority.external-author.e2e.test.ts` |
 | 外部 CLI 隔离（**真子进程**）：外部代理看到的 HOME 不是真实 HOME、读不到 `~/.claude`、宿主凭据与 `GITHUB_TOKEN` 不在其环境、cwd 是一次性目录、调用后 HOME 被删 | `external/connector.test.ts` |
 | 外部 CLI：无显式凭据拒绝启动（不以宿主登录态运行）、非零退出/不可解析输出一律 FAILED 且不编造发现、manifest 不含 raw secret 与 prompt 正文 | `external/connector.test.ts` |
 | 外部 CLI：同厂商审核直接拒绝（`SAME_VENDOR_REVIEW_DENIED`），异构是不变式不是披露项 | `external/connector.test.ts` |
@@ -268,11 +270,30 @@ base URL 存的是**完整地址含版本路径** —— 智谱是 `/api/paas/v4
 重验 → 重封存 → 再审」的互动。防死循环是两半设计：
 
 - **自动轮次每循环硬上限**：2 次审核 + 1 次整改，流程写成直线，结构上走不满；
-- **跨循环只能由人推进**：循环以 `COUNTER_EXHAUSTED` / `NO_PROGRESS` / `NO_DELTA`
-  收场时，界面出现「要再循环一轮吗」——你可以授权再跑一轮，也可以直接人工审查补丁。
-  平台**绝不自己"再试一次"**。累计计数（审核轮次 / 整改次数 / 用户续期次数）
-  只增不清，每次续期都落一条授权事件；续到第 2 次界面会明确提示
+- **跨循环只能由人推进**：循环以 `COUNTER_EXHAUSTED` / `NO_PROGRESS` / `NO_DELTA` /
+  `REVIEWER_INCONCLUSIVE` 收场时，界面出现「要再循环一轮吗」——你可以授权再跑一轮，
+  也可以直接人工审查补丁。平台**绝不自己"再试一次"**。累计计数（审核轮次 / 整改次数 /
+  用户续期次数）只增不清，每次续期都落一条授权事件；续到第 2 次界面会明确提示
   "连续不收敛通常该人工接手了"。
+
+**"没给出结论" ≠ "通过"。** 一轮审核怎么收场，由两条规则决定，都指向同一个原则 ——
+**平台能数的东西优先于模型的自评**：
+
+| 情形 | 收场 |
+|---|---|
+| 有阻断发现 | 整改，**不管 verdict 写的是什么** |
+| 零阻断 + `PASS` / `CHANGES_REQUESTED` | `REVIEWER_PASSED`（提示性发现不驱动整改） |
+| 零阻断 + `INCONCLUSIVE` | `REVIEWER_INCONCLUSIVE` |
+
+第一行挡的是 `verdict: 'PASS'` 短路掉一条 CRITICAL 阻断发现 —— verdict 是模型对这轮的
+一句总结，findings 是它逐条列出的证据，两者矛盾时可信的是后者。
+
+第三行挡的是一条更隐蔽的假绿：外部审核方输出不可解析、schema 不过、模型用满 8 轮没调
+`submit_review`，三处都诚实地记了 `{verdict:'INCONCLUSIVE', findings:[]}`，然后被
+`blocking.length === 0` 折成 `REVIEWER_PASSED`，界面显示 **"审核方未发现阻断问题"**。
+`connector.ts` 里花了整段注释堵住"`CHANGES_REQUESTED` + 读不出的 findings 被当成没意见"，
+紧挨着的同形路却没堵。现在它有自己的收场、自己的文案（"审核方未给出可用结论 —— 这不是通过"），
+而且**续期入口是开着的** ——"没拿到结论"的下一步恰恰就是再跑一轮。
 
 #### 一写一审的三条出口：API（推荐）/ CLI / 桌面应用
 

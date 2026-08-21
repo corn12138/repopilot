@@ -458,6 +458,43 @@ describe('外部作者 e2e：Codex 写、平台归一化、真验证、人收口
     expect(candidateDirsUnder(runId)).toEqual([]);
   });
 
+  /*
+   * 出站同意的运行期闸门（此前只有 ModelGateway 那条路有）。
+   *
+   * 用户在 task.create 时看到并同意的披露里，写的是"Codex · 0.0.1 @ <path>"。
+   * 从那一刻到真正 spawn 之间，这台机器上的 CLI 被换掉/升级了 —— 再照常调用，
+   * 就等于把整仓副本（REPOSITORY_FULL_COPY_VIA_CLI）交给一个用户从未在披露上见过的东西。
+   * 这与 gateway 的 ROUTE_DRIFT 同形，只是外部这条路上一直缺席。
+   */
+  it('同意之后 CLI 被升级 → 身份漂移，调用在 spawn 之前被拦，candidate 一个都不建', async () => {
+    const { promptLog } = installFakeCodex(`printf "export const STATUS = 'fixed';\n" > src/app.js`);
+    harness.script(IMPL, [() => planCall()]);
+    const hostPath = makeFixtureRepo();
+    // 披露与同意在这一步冻结（identityDigest = 路径 + "fakecodex 0.0.1"）
+    const { runId } = await harness.createRun({ hostPath, authorConnectorId: 'codex-cli' });
+
+    // 用户在批准计划之前把 Codex 升了一版：同一个路径，版本变了
+    const exe = process.env.REPOPILOT_CODEX_CLI_PATH!;
+    writeFileSync(
+      exe,
+      `#!/bin/sh\n` +
+        `for a in "$@"; do if [ "$a" = "--version" ]; then echo "fakecodex 9.9.9"; exit 0; fi; done\n` +
+        `PROMPT=$(cat)\n` +
+        `printf '%s\\n=====\\n' "$PROMPT" >> "${'${promptLog}'}"\n` +
+        `printf "export const STATUS = 'fixed';\\n" > src/app.js\n`,
+    );
+    chmodSync(exe, 0o755);
+
+    await harness.approvePlan(runId);
+    const done = await harness.waitForStatus(runId, ['BLOCKED', 'FAILED']);
+    expect(done.statusReason).toMatch(/披露不一致|路径或版本已变/);
+    // 拦在动工作区之前：没有 candidate 目录、主线一代没动
+    expect(candidateDirsUnder(runId)).toEqual([]);
+    expect(done.workspaceGeneration).toBe(0);
+    // 也没有真的把简报送出去 —— 拦下来的意思是子进程压根没起
+    expect(existsSync(promptLog)).toBe(false);
+  });
+
   it('作者与审核方同厂商 → task.create 直接拒绝（异构是不变式，作者侧同样成立）', async () => {
     installFakeCodex('true');
     const hostPath = makeFixtureRepo();

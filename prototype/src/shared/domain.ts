@@ -850,6 +850,15 @@ export interface CrossReviewRound {
  */
 export type CrossReviewStopReason =
   | 'REVIEWER_PASSED' // 审核方无阻断发现
+  /**
+   * 审核方**没有给出可用结论**（输出不可解析 / schema 不过 / 用满轮次未提交）。
+   *
+   * 它必须与 REVIEWER_PASSED 分开：两者的 findings 都是空的，但成因相反 ——
+   * 一个是"看过了，没问题"，一个是"没看成"。此前它们折在同一个 stopReason 上，
+   * 界面把"没看成"显示为"审核方未发现阻断问题"，正是本项目在
+   * external/connector.ts 里花整段注释反对的那类归因错误。
+   */
+  | 'REVIEWER_INCONCLUSIVE'
   | 'COUNTER_EXHAUSTED' // 用满 2 次审核 + 1 次整改
   | 'NO_DELTA' // 整改后补丁 digest 没变
   | 'NO_PROGRESS' // 阻断项没减少或出现重复指纹

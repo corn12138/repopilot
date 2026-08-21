@@ -96,7 +96,7 @@ describe('buildDisclosure', () => {
     expect(d.policy).toEqual({ retention: 'UNKNOWN', training: 'UNKNOWN', region: 'UNKNOWN' });
   });
 
-  it('外部 CLI 作者：channel=EXTERNAL_CLI、origin=null（端点由 CLI 决定）、数据类别含整仓副本；不贡献路由 digest', () => {
+  it('外部 CLI 作者：channel=EXTERNAL_CLI、origin=null（端点由 CLI 决定）、数据类别含整仓副本', () => {
     const d = buildDisclosure({ ...base, author: { connector: connector('CODEX_CLI') }, reviewer: { kind: 'EXTERNAL_CLI', connector: connector('CLAUDE_CLI') } });
     expect(d.destinations.map((x) => [x.role, x.channel, x.origin])).toEqual([
       ['IMPLEMENTER', 'MODEL_API', 'https://api.deepseek.example/v1'],
@@ -104,8 +104,24 @@ describe('buildDisclosure', () => {
       ['AUTHOR', 'EXTERNAL_CLI', null],
     ]);
     expect(d.destinations[2]!.dataClasses).toContain('REPOSITORY_FULL_COPY_VIA_CLI');
-    // 同意覆盖的 ModelGateway 路由只有实现方那一条；外部 CLI 不经网关
-    expect(consentedResolutionDigests(d)).toEqual(['sha256:route-deepseek']);
+  });
+
+  /*
+   * 外部 CLI 不经 ModelGateway，但**同意仍然要覆盖它** —— 否则用户点头的那份披露
+   * 对拿到整仓副本的那个选手没有任何运行期约束力。它没有网络 route，就用身份：
+   * identityDigest = binaryPath + version。
+   */
+  it('外部 CLI 目的地贡献 identityDigest：同意覆盖集合里必须有它，否则运行期闸门无从比对', () => {
+    const d = buildDisclosure({ ...base, author: { connector: connector('CODEX_CLI') }, reviewer: { kind: 'EXTERNAL_CLI', connector: connector('CLAUDE_CLI') } });
+    expect(consentedResolutionDigests(d)).toEqual(['sha256:route-deepseek', 'sha256:id', 'sha256:id']);
+  });
+
+  it('升级 CLI 或换二进制 → identityDigest 变 → 披露 digest 变 → 旧同意自动失效', () => {
+    const before = buildDisclosure({ ...base, author: { connector: connector('CODEX_CLI') } });
+    const upgraded = { ...connector('CODEX_CLI'), version: '1.1', identityDigest: 'sha256:id-v1.1' };
+    const after = buildDisclosure({ ...base, author: { connector: upgraded } });
+    expect(after.digest).not.toBe(before.digest);
+    expect(consentedResolutionDigests(before)).not.toContain('sha256:id-v1.1');
   });
 
   it('模型 API 审核方：同意覆盖实现方与审核方两条路由', () => {
