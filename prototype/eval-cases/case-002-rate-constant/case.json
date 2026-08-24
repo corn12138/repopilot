@@ -1,0 +1,7 @@
+{
+  "caseId": "case-002-rate-constant",
+  "title": "费率常量为零",
+  "goal": "修复 node check.mjs 失败：src/util.js 的 rate 应为 0.2，使 app.js 的 total 为 120",
+  "acceptance": ["node check.mjs 退出 0"],
+  "commands": [{ "label": "node check.mjs", "argv": ["node", "check.mjs"] }]
+}

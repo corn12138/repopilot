@@ -1,0 +1,7 @@
+{
+  "caseId": "case-001-status-flag",
+  "title": "状态标志未翻转",
+  "goal": "修复 node check.mjs 失败：src/app.js 的 STATUS 仍是 broken，应为 fixed",
+  "acceptance": ["node check.mjs 退出 0"],
+  "commands": [{ "label": "node check.mjs", "argv": ["node", "check.mjs"] }]
+}
