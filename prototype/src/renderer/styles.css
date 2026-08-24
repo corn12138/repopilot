@@ -1645,3 +1645,112 @@ select:focus-visible {
 .egress-row .summary {
   word-break: break-all;
 }
+
+/* ---------------------------------------------------------------------------
+ * IDE 布局：编辑器面板活跃时进入三/四栏（侧栏 | [文件树] | 编辑器 | 运行面板）。
+ * 显式指定每个面板的 grid-column —— 不依赖 DOM 顺序的自动放置，
+ * 这样文件树开关不会让编辑器换位置。
+ * ------------------------------------------------------------------------- */
+.app.ide {
+  grid-template-columns: 264px minmax(360px, 1.15fr) minmax(340px, 1fr);
+}
+.app.ide.with-files {
+  grid-template-columns: 264px 280px minmax(360px, 1.15fr) minmax(340px, 1fr);
+}
+.app.ide > .sidebar { grid-column: 1; grid-row: 1; }
+.app.ide > .editorpane { grid-column: 2; grid-row: 1; }
+.app.ide > .main { grid-column: 3; grid-row: 1; min-width: 0; }
+.app.ide.with-files > .filepanel { grid-column: 2; grid-row: 1; border-left: none; }
+.app.ide.with-files > .editorpane { grid-column: 3; }
+.app.ide.with-files > .main { grid-column: 4; }
+
+.editorpane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+  border-left: 1px solid var(--border-hairline);
+  border-right: 1px solid var(--border-hairline);
+  background: var(--surface-canvas);
+}
+/* 顶部留出与侧栏一致的窗口拖拽带 */
+.editorpane-drag {
+  height: 30px;
+  flex: none;
+  -webkit-app-region: drag;
+}
+.editorpane-tabs {
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  flex: none;
+  background: var(--surface-panel);
+  border-bottom: 1px solid var(--border-hairline);
+  min-height: 32px;
+  scrollbar-width: thin;
+}
+.editorpane-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  border-right: 1px solid var(--border-hairline);
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+.editorpane-tab.active {
+  color: var(--text-primary);
+  background: var(--surface-canvas);
+  box-shadow: inset 0 2px 0 var(--accent-interactive);
+}
+.editorpane-tab-close {
+  padding: 0 3px;
+  font-size: 10px;
+  line-height: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-tertiary);
+}
+.editorpane-tab-close:hover { color: var(--text-primary); }
+.editorpane-pathbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-hairline);
+  flex: none;
+}
+.editorpane-pathbar button { padding: 1px 8px; font-size: 10.5px; }
+.editorpane-bytes { color: var(--text-tertiary); font-size: 10.5px; }
+.editorpane-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.editorpane-empty {
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 24px;
+  margin: 0;
+}
+.editorpane-truncated {
+  flex: none;
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--state-warning-fg);
+  border-bottom: 1px solid var(--border-hairline);
+}
+.codeview {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.codeview .cm-editor { height: 100%; }

@@ -26,6 +26,7 @@ import {
 import { Composer } from './views/TaskForm';
 import { RunDetail } from './views/RunDetail';
 import { FileTreePanel } from './views/FileTree';
+import { EditorPane } from './views/Editor';
 import { SettingsView } from './views/Settings';
 import { EvidenceView } from './views/Evidence';
 
@@ -61,6 +62,9 @@ export function App() {
   /** 右侧文件树开关 + 刷新令牌（Agent 改完文件后自增，让树重新拉取） */
   const [filesOpen, setFilesOpen] = useState(false);
   const [filesKey, setFilesKey] = useState(0);
+  // 编辑器标签页（只读查看器）。路径列表 + 活动项；换快照/项目时整体作废
+  const [editorTabs, setEditorTabs] = useState<string[]>([]);
+  const [activeEditorTab, setActiveEditorTab] = useState<string | null>(null);
   /** 设置页作为一个独立视图，而不是"没选项目时的兜底" */
   const [showSettings, setShowSettings] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
@@ -314,6 +318,30 @@ export function App() {
     ? (selectedRun?.snapshotId ?? null)
     : (importedProject?.snapshot.snapshotId ?? null);
   const canShowFiles = Boolean(fileSnapshotId);
+  const editorActive = editorTabs.length > 0 && canShowFiles && coreStatus === 'READY';
+
+  // 快照一换，旧标签指向的坐标系就没了 —— 整体关闭，不带着过期路径进新世界
+  useEffect(() => {
+    setEditorTabs([]);
+    setActiveEditorTab(null);
+  }, [fileSnapshotId]);
+
+  const openFileInEditor = useCallback((path: string) => {
+    setEditorTabs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+    setActiveEditorTab(path);
+  }, []);
+
+  const closeEditorTab = useCallback((path: string) => {
+    setEditorTabs((prev) => {
+      const next = prev.filter((t) => t !== path);
+      setActiveEditorTab((cur) => {
+        if (cur !== path) return cur;
+        const idx = prev.indexOf(path);
+        return next[Math.min(idx, next.length - 1)] ?? null;
+      });
+      return next;
+    });
+  }, []);
 
   /** 当前项目下、除正看着的这个之外还在进行中的运行 —— composer 用它提示，防止"以为没反应"再建一个 */
   const activeProjectRun = useMemo(() => {
@@ -329,7 +357,7 @@ export function App() {
   }, [runs, selectedProject, selectedRunId]);
 
   return (
-    <div className={`app ${filesOpen && canShowFiles ? 'with-files' : ''}`}>
+    <div className={`app ${editorActive ? 'ide' : ''} ${filesOpen && canShowFiles ? 'with-files' : ''}`}>
       <aside className="sidebar">
         <div className="sidebar-head">
           <h1>RepoPilot</h1>
@@ -567,6 +595,18 @@ export function App() {
         )}
       </main>
 
+      {editorActive && fileSnapshotId && (
+        <EditorPane
+          snapshotId={fileSnapshotId}
+          runId={selectedRunId}
+          refreshKey={filesKey}
+          tabs={editorTabs}
+          active={activeEditorTab}
+          onActivate={setActiveEditorTab}
+          onClose={closeEditorTab}
+        />
+      )}
+
       {filesOpen && fileSnapshotId && coreStatus === 'READY' && (
         <FileTreePanel
           snapshotId={fileSnapshotId}
@@ -574,6 +614,7 @@ export function App() {
           workspaceGeneration={selectedRun?.workspaceGeneration ?? null}
           refreshKey={filesKey}
           onClose={() => setFilesOpen(false)}
+          onOpenFile={openFileInEditor}
         />
       )}
     </div>

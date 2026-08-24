@@ -142,6 +142,7 @@ export function FileTreePanel({
   workspaceGeneration = null,
   refreshKey,
   onClose,
+  onOpenFile,
 }: {
   snapshotId: string;
   runId: string | null;
@@ -150,6 +151,8 @@ export function FileTreePanel({
   /** 变化时重新拉取；用于 Agent 改完文件后刷新 */
   refreshKey: number;
   onClose: () => void;
+  /** 在编辑器面板打开文件（双击行 / 预览头部按钮）。不传则只有内嵌预览 */
+  onOpenFile?: (path: string) => void;
 }) {
   const treeRequestsRef = useRef<LatestRequestGuard<TreeRequestOwner> | null>(null);
   const fileRequestsRef = useRef<LatestRequestGuard<FileRequestOwner> | null>(null);
@@ -380,7 +383,14 @@ export function FileTreePanel({
           }}
         >
           <span className="tree-caret">{isDir ? (isOpen ? '▾' : '▸') : ''}</span>
-          <span className={`tree-name ${changed ? 'changed' : ''}`}>{node.name}</span>
+          <span
+            className={`tree-name ${changed ? 'changed' : ''}`}
+            onDoubleClick={() => {
+              if (!isDir && onOpenFile && treeResult) onOpenFile(node.path);
+            }}
+          >
+            {node.name}
+          </span>
           {changed && !isDir && <span className="tree-dot" />}
         </button>
         {isDir && isOpen && sortedChildren(node).map((c) => renderNode(c, depth + 1))}
@@ -503,6 +513,11 @@ export function FileTreePanel({
             {staleTreeResult && <Badge tone="warn">上一代</Badge>}
             {file.changed && <Badge tone="ok">已改动</Badge>}
             <span style={{ color: 'var(--text-tertiary)', fontSize: 10.5 }}>{file.bytes} B</span>
+            {onOpenFile && (
+              <button onClick={() => onOpenFile(file.path)} title="在编辑器面板打开（只读）">
+                编辑器
+              </button>
+            )}
             <button onClick={closeFile} title="收起">
               ✕
             </button>
