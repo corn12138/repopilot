@@ -270,6 +270,21 @@ export function Composer({
     (!hasCustom || !risk || risk.risk === 'R1' || (risk.approvable && approvedNow)) &&
     !submitting;
 
+  /** 按 canSubmit 的判定顺序给出第一条拦住「开始」的原因；能发时为 null */
+  const blockedReason = submitting
+    ? null
+    : goal.trim().length === 0
+      ? '先写下要修什么'
+      : effectiveModelId.length === 0
+        ? '先在「设置 · API」配置一个模型'
+        : !(reviewerLines.length === 0 || (reviewerLines.length === 1 && reviewerResolved))
+          ? '审核方填写有误（多行或不在候选里）'
+          : !consented
+            ? '先确认上方的数据出站披露'
+            : hasCustom && risk && risk.risk !== 'R1' && !(risk.approvable && approvedNow)
+              ? '自定义命令需要先批准'
+              : null;
+
   const submit = async () => {
     if (!canSubmit) return;
     setSubmitting(true);
@@ -466,6 +481,13 @@ export function Composer({
                 <li>高置信度凭据（AWS key / 私钥 / token）在命令输出里会被脱敏，在文件里会拒绝读入，出站前再扫一遍</li>
               </ul>
             </details>
+            {/* 披露一变勾选即作废（digest 对不上）。作废不能静默 —— 说清"你确认的是旧披露" */}
+            {consentedDigest !== null && !consented && (
+              <span className="composer-disclosure-error" role="status">
+                披露内容已变化（路由 / 审核方 / 作者 / 快照之一变了）——
+                你此前的确认针对的是旧披露，请重新阅读上面这份并再次勾选。
+              </span>
+            )}
             {/* 选了审核方但披露里没有 REVIEWER 目的地 = 创建时会被降级为不审核。降级不能静默 */}
             {reviewerProfileId && reviewerResolved && !disclosure.destinations.some((d) => d.role === 'REVIEWER') && (
               <span className="composer-disclosure-error" role="status">
@@ -742,7 +764,17 @@ export function Composer({
             </option>
           ))}
         </select>
-        <button className="primary" disabled={!canSubmit} onClick={() => void submit()}>
+        {blockedReason && (
+          <span className="composer-hint" role="status">
+            {blockedReason}
+          </span>
+        )}
+        <button
+          className="primary"
+          disabled={!canSubmit}
+          title={blockedReason ?? undefined}
+          onClick={() => void submit()}
+        >
           {submitting ? '创建中…' : '开始'}
         </button>
       </div>

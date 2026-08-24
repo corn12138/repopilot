@@ -227,9 +227,13 @@ describe('外部作者与外部 CLI 审核方：可达且传对字段', () => {
 describe('出站披露与同意：不点头不能发；目的地一变同意作废', () => {
   it('填了目标但没勾同意 → 开始按钮禁用；勾了才能发；载荷带 egressConsentDigest', async () => {
     render(composer());
+    // 目标为空时：按钮旁的原因提示指向"写目标"，不是让用户自己猜
+    expect(screen.getByText('先写下要修什么')).toBeTruthy();
     fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
     await screen.findByRole('checkbox', { name: /我确认：本任务会把数据发往/ });
     expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(true);
+    // 目标有了、同意还没勾：原因跟着切换到披露
+    expect(screen.getByText('先确认上方的数据出站披露')).toBeTruthy();
     const block = screen.getByTestId('egress-disclosure');
     expect(block.textContent).toContain('DeepSeek · deepseek-chat');
     expect(block.textContent).toContain('官方 · https://api.deepseek.com');
@@ -251,8 +255,14 @@ describe('出站披露与同意：不点头不能发；目的地一变同意作�
     await waitFor(() => expect(screen.getByTestId('egress-disclosure').textContent).toContain('Codex · 0.1（本机 CLI）'));
     const box = screen.getByRole('checkbox', { name: /我确认：本任务会把数据发往/ }) as HTMLInputElement;
     expect(box.checked).toBe(false);
+    // 作废不静默：必须说清"你确认的是旧披露"，而不是让勾选凭空消失
+    expect(screen.getByText(/披露内容已变化/).textContent).toContain('针对的是旧披露');
     fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
     expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(true);
+    // 重新勾选 → 解释消失、按钮恢复
+    fireEvent.click(box);
+    await waitFor(() => expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(false));
+    expect(screen.queryByText(/披露内容已变化/)).toBeNull();
   });
 
   it('披露取不到 → 显示原因且不能发（fail-closed）', async () => {
@@ -263,7 +273,12 @@ describe('出站披露与同意：不点头不能发；目的地一变同意作�
     });
     render(composer());
     fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
-    await waitFor(() => expect(screen.getByRole('status').textContent).toContain('无法取得出站披露：Core 不可用'));
+    // 页面上可以有多个 status 区（披露错误 + 开始按钮旁的原因提示），按内容找目标那条
+    await waitFor(() =>
+      expect(screen.getAllByRole('status').map((n) => n.textContent).join('\n')).toContain(
+        '无法取得出站披露：Core 不可用',
+      ),
+    );
     expect(screen.queryByRole('checkbox', { name: /我确认/ })).toBeNull();
     expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(true);
   });

@@ -37,6 +37,8 @@ interface ComputedProbe {
   readonly focusVisibleRules: number;
   readonly reducedMotionBlocks: number;
   readonly styleSheetRules: number;
+  /** 同意勾选框在真实级联下的实测宽度 —— 全局 input{width:100%} 曾把它拉成整行 */
+  readonly consentCheckboxWidth: number;
 }
 
 /** 在渲染进程里量一次；返回的都是**计算后**的值，不是源文件里的字面量。 */
@@ -100,6 +102,26 @@ const PROBE_SCRIPT = `(() => {
     focusVisibleRules,
     reducedMotionBlocks,
     styleSheetRules,
+    consentCheckboxWidth: (() => {
+      // 出站同意勾选框的宽度是被全局 input { width:100% } 咬过的地方（2026-08-24）：
+      // 勾选框盒子被拉成整行、图形悬在行中央、披露文字被挤出容器。
+      // jsdom 没有布局，这类破版只有真实引擎里量得出来 —— 注入同 class 的哨兵实测。
+      const label = document.createElement('label');
+      label.className = 'composer-consent';
+      label.style.position = 'fixed';
+      label.style.left = '-9999px';
+      label.style.width = '800px';
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      const text = document.createElement('span');
+      text.textContent = '哨兵';
+      label.appendChild(box);
+      label.appendChild(text);
+      document.body.appendChild(label);
+      const w = box.getBoundingClientRect().width;
+      label.remove();
+      return w;
+    })(),
   };
 })()`;
 
@@ -255,6 +277,18 @@ export async function probeRenderedStyles(webContents: WebContents): Promise<Ren
     } else {
       failures.push(
         `.chat-scroll 的 clientHeight=${normal.scrollClientHeight}，跟随逻辑没有可用几何`,
+      );
+    }
+
+    // 4.5 同意勾选框必须是内容宽 —— 全局 input{width:100%} 的级联回归在这里守
+    if (normal.consentCheckboxWidth > 0 && normal.consentCheckboxWidth <= 40) {
+      passes.push(
+        `同意勾选框实测宽度 ${normal.consentCheckboxWidth.toFixed(1)}px（未被全局 input 宽度规则拉伸）`,
+      );
+    } else {
+      failures.push(
+        `同意勾选框实测宽度 ${normal.consentCheckboxWidth.toFixed(1)}px —— ` +
+          `全局 input { width:100% } 又咬到它了：勾选框会悬在行中央、披露文字被挤出容器`,
       );
     }
 

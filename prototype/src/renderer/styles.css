@@ -1159,6 +1159,10 @@ ul.plain li {
   color: var(--text-secondary);
   margin: 6px 0 8px;
   line-height: 1.55;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-hairline);
+  border-radius: 10px;
+  padding: 8px 12px;
 }
 .composer-consent {
   display: flex;
@@ -1169,6 +1173,17 @@ ul.plain li {
 .composer-consent input {
   margin-top: 2px;
   flex: none;
+  /*
+   * 根因修复：全局 `input { width: 100% }` 会把勾选框的盒子拉成整行宽，
+   * Chromium 把勾选图形画在盒子正中 —— 勾选框悬在行中央、披露文字被挤出容器
+   * 在右缘一字一行竖排。勾选框的宽度必须回到内容宽。
+   */
+  width: auto;
+}
+.composer-consent > span {
+  min-width: 0;
+  /* 长 origin URL 也能断行，不许把行撑破 */
+  overflow-wrap: anywhere;
 }
 .composer-disclosure-detail {
   margin: 4px 0 0 22px;
@@ -1182,6 +1197,8 @@ ul.plain li {
 }
 .composer-disclosure-error {
   color: var(--state-warning-fg);
+  display: block;
+  margin-top: 5px;
 }
 .composer-box textarea {
   width: 100%;
