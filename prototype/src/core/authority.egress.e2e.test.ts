@@ -434,3 +434,152 @@ describe('Slice H：出站前的人机契约', () => {
     ).rejects.not.toThrow(new RegExp(SECRET));
   });
 });
+
+/**
+ * 厂商同异：三态判定，取证到哪一步说到哪一步。
+ *
+ * 这组用例锁的是 A2A 评审 §4.4 点名的洞的修复：
+ *   - 中转 provider 上的模型此前"推不出厂商 → 跳过异构断言"，同厂商组合静默放行；
+ *   - 更糟的是绑定处把 heterogeneous 硬编码 true —— 把"没查"写成"已证异构"。
+ * 修复后：模型 id 能证明的就证明（openrouter 的 anthropic/claude 就是 Anthropic），
+ * 证明不了的落 UNVERIFIABLE 进披露与事件，绝不冒充任何一边。
+ */
+describe('厂商同异三态：中转路由可证则证，不可证则如实 UNVERIFIABLE', () => {
+  function installFakeClaude(): void {
+    const bin = mkdtempSync(join(tmpdir(), 'repopilot-fakeclaude-'));
+    tempDirs.add(bin);
+    const exe = join(bin, 'claude');
+    writeFileSync(
+      exe,
+      `#!/bin/sh\n` +
+        `for a in "$@"; do if [ "$a" = "--version" ]; then echo "fakeclaude 0.0.1"; exit 0; fi; done\n` +
+        `cat > /dev/null\n` +
+        `echo '{"verdict":"PASS","findings":[]}'\n`,
+    );
+    chmodSync(exe, 0o755);
+    process.env.REPOPILOT_CLAUDE_CLI_PATH = exe;
+  }
+
+  const OPENROUTER = 'openrouter.ai';
+
+  afterEach(() => {
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.REPOPILOT_CLAUDE_CLI_PATH;
+  });
+
+  async function importFixture(): Promise<{ projectId: string; snapshotId: string; profileId: string }> {
+    const hostPath = makeFixtureRepo();
+    const reg = await harness.call<{ project: { projectId: string } }>('__project.register', { hostPath });
+    const imported = await harness.call<{ snapshot: { snapshotId: string }; profile: { profileId: string } }>(
+      'project.import',
+      { projectId: reg.project.projectId },
+    );
+    return { projectId: reg.project.projectId, snapshotId: imported.snapshot.snapshotId, profileId: imported.profile.profileId };
+  }
+
+  async function createWith(input: {
+    ids: { projectId: string; snapshotId: string; profileId: string };
+    digest: string;
+    reviewerConnectorId?: string;
+    reviewerModelProfileId?: string;
+  }): Promise<string> {
+    const { run } = await harness.call<{ run: RunView }>('task.create', {
+      projectId: input.ids.projectId,
+      snapshotId: input.ids.snapshotId,
+      profileId: input.ids.profileId,
+      modelProfileId: 'profile_openrouter',
+      egressConsentDigest: input.digest,
+      goal: '修复 node check.mjs 失败：src/app.js 的 STATUS 仍是 broken',
+      taskClass: 'BUILD_FAILURE_FIX',
+      allowedPaths: [],
+      acceptance: [],
+      verificationCommandIds: [],
+      ...(input.reviewerConnectorId ? { reviewerConnectorId: input.reviewerConnectorId } : {}),
+      ...(input.reviewerModelProfileId ? { reviewerModelProfileId: input.reviewerModelProfileId } : {}),
+    });
+    return run.runId;
+  }
+
+  it('openrouter 上的 claude 模型 + Claude CLI 审核 → 模型名证明同厂商：预览与创建一致地降级，不再静默放行', async () => {
+    installFakeClaude();
+    process.env.OPENROUTER_API_KEY = 'sk-e2e-relay';
+    process.env.ANTHROPIC_API_KEY = 'sk-e2e-claude-cli';
+    harness.script(OPENROUTER, [() => planCall()]);
+    const ids = await importFixture();
+    await harness.call('model.updateProfile', { profileId: 'profile_openrouter', modelId: 'anthropic/claude-sonnet-4.5' });
+
+    const { disclosure } = await harness.call<{
+      disclosure: { digest: string; destinations: { role: string }[]; crossReviewParity: { kind: string } | null };
+    }>('egress.disclosure', {
+      snapshotId: ids.snapshotId,
+      modelProfileId: 'profile_openrouter',
+      reviewerConnectorId: 'claude-cli',
+    });
+    // 预览镜像 createTask 的降级判定：审核方不在披露里、parity 为 null ——
+    // 否则用户确认"含审核方"的 digest，创建时重算成"无审核方"，CONSENT_STALE 永远对不上
+    expect(disclosure.destinations.some((d) => d.role === 'REVIEWER')).toBe(false);
+    expect(disclosure.crossReviewParity).toBeNull();
+
+    const runId = await createWith({ ids, digest: disclosure.digest, reviewerConnectorId: 'claude-cli' });
+    const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+    const degrade = events.find((e) => e.kind === 'NOTE' && e.summary.includes('降级为不审核'));
+    expect(degrade).toBeDefined();
+    expect(degrade!.summary).toContain('同为 ANTHROPIC');
+  });
+
+  it('推不出厂商的路由 + Claude CLI 审核 → UNVERIFIABLE 进披露与事件；heterogeneous 不再谎报 true', async () => {
+    installFakeClaude();
+    process.env.OPENROUTER_API_KEY = 'sk-e2e-relay';
+    process.env.ANTHROPIC_API_KEY = 'sk-e2e-claude-cli';
+    harness.script(OPENROUTER, [() => planCall()]);
+    const ids = await importFixture();
+    await harness.call('model.updateProfile', { profileId: 'profile_openrouter', modelId: 'openrouter/auto' });
+
+    const { disclosure } = await harness.call<{
+      disclosure: { digest: string; destinations: { role: string }[]; crossReviewParity: { kind: string; detail: string } | null };
+    }>('egress.disclosure', {
+      snapshotId: ids.snapshotId,
+      modelProfileId: 'profile_openrouter',
+      reviewerConnectorId: 'claude-cli',
+    });
+    expect(disclosure.destinations.some((d) => d.role === 'REVIEWER')).toBe(true);
+    expect(disclosure.crossReviewParity?.kind).toBe('UNVERIFIABLE');
+    expect(disclosure.crossReviewParity?.detail).toContain('openrouter');
+
+    const runId = await createWith({ ids, digest: disclosure.digest, reviewerConnectorId: 'claude-cli' });
+    const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+    const note = events.find((e) => e.kind === 'NOTE' && e.summary.includes('已启用交叉审核'));
+    expect(note).toBeDefined();
+    expect(note!.summary).toContain('无法判定');
+    // 回归锁：此前这里是 heterogeneous: true（"没查"被写成"已证异构"）
+    expect(note!.payload.heterogeneous).toBe(false);
+    expect((note!.payload.vendorParity as { kind: string }).kind).toBe('UNVERIFIABLE');
+  });
+
+  it('openrouter 上的 claude + anthropic 官方审核 → 模型对模型同厂商：不拦，但披露与事件都写"同厂商"（此前按 providerId 标成异构）', async () => {
+    process.env.OPENROUTER_API_KEY = 'sk-e2e-relay';
+    process.env.ANTHROPIC_API_KEY = 'sk-e2e-reviewer';
+    harness.script(OPENROUTER, [() => planCall()]);
+    const ids = await importFixture();
+    await harness.call('model.updateProfile', { profileId: 'profile_openrouter', modelId: 'anthropic/claude-sonnet-4.5' });
+
+    const { disclosure } = await harness.call<{
+      disclosure: { digest: string; destinations: { role: string }[]; crossReviewParity: { kind: string } | null };
+    }>('egress.disclosure', {
+      snapshotId: ids.snapshotId,
+      modelProfileId: 'profile_openrouter',
+      reviewerModelProfileId: 'profile_anthropic',
+    });
+    expect(disclosure.destinations.some((d) => d.role === 'REVIEWER')).toBe(true);
+    expect(disclosure.crossReviewParity?.kind).toBe('SAME_VENDOR');
+
+    const runId = await createWith({ ids, digest: disclosure.digest, reviewerModelProfileId: 'profile_anthropic' });
+    const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+    const note = events.find((e) => e.kind === 'NOTE' && e.summary.includes('已启用交叉审核'));
+    expect(note).toBeDefined();
+    expect(note!.summary).toContain('同厂商');
+    expect(note!.payload.heterogeneous).toBe(false);
+    expect((note!.payload.vendorParity as { kind: string }).kind).toBe('SAME_VENDOR');
+  });
+});

@@ -933,6 +933,9 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
           stopReason: string;
           rounds: unknown[];
           heterogeneous: boolean;
+          vendorParity?: { kind: string; detail: string };
+          reviewerIdentity?: { kind: string; profileId?: string };
+          reviewerProfileId: string;
         } | null;
       }>('crossreview.get', { runId });
       expect(crossReview).not.toBeNull();
@@ -940,7 +943,12 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
       expect(crossReview!.reviewerInvocations).toBe(2);
       expect(crossReview!.remediations).toBe(1);
       expect(crossReview!.rounds).toHaveLength(2);
+      // deepseek 官方写、moonshot 官方审：两侧厂商都有证据 → 已证异构（三态里的第一态）
       expect(crossReview!.heterogeneous).toBe(true);
+      expect(crossReview!.vendorParity?.kind).toBe('HETEROGENEOUS');
+      // 身份是判别联合；reviewerProfileId 只是它的遗留展示派生
+      expect(crossReview!.reviewerIdentity).toEqual({ kind: 'MODEL_API', profileId: 'profile_moonshot-cn' });
+      expect(crossReview!.reviewerProfileId).toBe('profile_moonshot-cn');
 
       // 整改后重新封存：两次 PATCH_SEALED，digest 不同，第二次标注 remediated
       const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });

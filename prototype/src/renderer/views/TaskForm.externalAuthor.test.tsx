@@ -118,10 +118,13 @@ function disclosureFor(payload: Record<string, unknown>) {
     ...(payload.authorConnectorId ? [{ role: 'AUTHOR', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: ['REPOSITORY_FULL_COPY_VIA_CLI'] }] : []),
   ];
   return {
-    disclosureVersion: 1,
+    disclosureVersion: 2,
     snapshotId: 'snapshot-1',
     snapshotFileCount: 12,
     destinations,
+    crossReviewParity: payload.reviewerConnectorId
+      ? { kind: 'HETEROGENEOUS', detail: '实现方 deepseek/deepseek-chat 属 DeepSeek，审核方 Codex 属 OpenAI' }
+      : null,
     policy: { retention: 'UNKNOWN', training: 'UNKNOWN', region: 'UNKNOWN' },
     digest: `sha256:disclosure-${destinations.map((d) => d.role).join('+')}`,
   };

@@ -832,9 +832,21 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
       title="交叉审核（第二个模型只读）"
       hint={`${record.reviewerInvocations} 轮审核 · ${record.remediations} 次整改${(record.userContinuations ?? 0) > 0 ? ` · 用户续期 ${record.userContinuations} 次` : ''} · ${findings.length} 条发现 · 阻断 ${blocking}`}
       right={
-        <Badge tone={record.heterogeneous ? 'info' : 'warn'}>
-          {record.heterogeneous ? '异构审核方' : '同源审核方'}
-        </Badge>
+        record.vendorParity ? (
+          // 三态如实展示：无法判定不折成"异构"也不折成"同源"
+          <Badge tone={record.vendorParity.kind === 'HETEROGENEOUS' ? 'info' : 'warn'}>
+            {record.vendorParity.kind === 'HETEROGENEOUS'
+              ? '异构审核方'
+              : record.vendorParity.kind === 'SAME_VENDOR'
+                ? '同厂商审核方'
+                : '厂商无法判定'}
+          </Badge>
+        ) : (
+          // 旧持久化记录只有布尔字段，按当年记下的展示，不重写历史
+          <Badge tone={record.heterogeneous ? 'info' : 'warn'}>
+            {record.heterogeneous ? '异构审核方' : '同源审核方'}
+          </Badge>
+        )
       }
     >
       {/* 这条免责必须显眼：审核只是第二意见，绝不代表可以接受 */}
@@ -848,6 +860,12 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
         <dd>{verdicts}</dd>
         <dt>结束原因</dt>
         <dd>{record.stopReason ? (STOP_REASON_LABEL[record.stopReason] ?? record.stopReason) : '进行中'}</dd>
+        {record.vendorParity && (
+          <>
+            <dt>厂商同异</dt>
+            <dd>{record.vendorParity.detail}</dd>
+          </>
+        )}
       </dl>
 
       {findings.length === 0 ? (

@@ -4,6 +4,7 @@ import type {
   EgressDestination,
   ModelConnectionProfile,
   ModelRouteResolution,
+  VendorParity,
 } from '@shared/domain';
 import { digestOf } from '@shared/ids';
 import type { ExternalConnectorProfile } from './external/connector';
@@ -28,6 +29,11 @@ export interface DisclosureInput {
     | { kind: 'MODEL_API'; profile: ModelConnectionProfile; resolution: ModelRouteResolution }
     | { kind: 'EXTERNAL_CLI'; connector: ExternalConnectorProfile }
     | null;
+  /**
+   * 写审双方的厂商同异判定（调用方用 model/vendor.ts 的同一套推断算好传入，
+   * 保持本函数"输入全部是已解析事实"的纯函数性质）。无审核方时为 null。
+   */
+  readonly reviewerParity: VendorParity | null;
   readonly author: { connector: ExternalConnectorProfile } | null;
 }
 
@@ -105,10 +111,12 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
     });
   }
   const body = {
-    disclosureVersion: 1 as const,
+    disclosureVersion: 2 as const,
     snapshotId: input.snapshotId,
     snapshotFileCount: input.snapshotFileCount,
     destinations,
+    // TD §9.14：非异构（含无法判定）必须显式披露 —— 判定属于用户点头的对象，digest 覆盖它
+    crossReviewParity: input.reviewer ? input.reviewerParity : null,
     policy: { retention: 'UNKNOWN' as const, training: 'UNKNOWN' as const, region: 'UNKNOWN' as const },
   };
   return { ...body, digest: digestOf(body) };

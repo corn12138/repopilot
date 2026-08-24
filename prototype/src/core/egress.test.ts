@@ -62,6 +62,7 @@ const base = {
   snapshotFileCount: 12,
   implementer: { profile: profile('deepseek'), resolution: resolution('deepseek') },
   reviewer: null,
+  reviewerParity: null,
   author: null,
 };
 
@@ -70,6 +71,23 @@ describe('buildDisclosure', () => {
     const a = buildDisclosure(base);
     const b = buildDisclosure({ ...base, implementer: { ...base.implementer, resolution: { ...resolution('deepseek'), resolutionId: 'res_other', frozenAt: '2030-01-01T00:00:00.000Z' } } });
     expect(a.digest).toBe(b.digest);
+  });
+
+  it('厂商同异判定进披露：parity 变化 → digest 变化；无审核方时强制为 null', () => {
+    const withReviewer = {
+      ...base,
+      reviewer: { kind: 'MODEL_API' as const, profile: profile('moonshot'), resolution: resolution('moonshot') },
+    };
+    const parity = (kind: 'HETEROGENEOUS' | 'SAME_VENDOR' | 'UNVERIFIABLE') =>
+      ({ kind, detail: `判定 ${kind}` }) as const;
+    const a = buildDisclosure({ ...withReviewer, reviewerParity: parity('HETEROGENEOUS') });
+    const b = buildDisclosure({ ...withReviewer, reviewerParity: parity('UNVERIFIABLE') });
+    expect(a.crossReviewParity?.kind).toBe('HETEROGENEOUS');
+    // 用户点头的对象包含这条判定 —— 判定变了，旧同意必须失效
+    expect(a.digest).not.toBe(b.digest);
+    // 没有审核方却传了 parity → 不进披露：判定只描述真实存在的写审关系
+    const none = buildDisclosure({ ...base, reviewerParity: parity('SAME_VENDOR') });
+    expect(none.crossReviewParity).toBeNull();
   });
 
   it('路由 / 审核方 / 作者 / 快照任一变化 → digest 变化', () => {

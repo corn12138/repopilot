@@ -2,10 +2,11 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { CommandDefinition, CrossReviewVerdict } from '@shared/domain';
+import type { CommandDefinition, CrossReviewVerdict, ModelVendor } from '@shared/domain';
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { buildChildEnv, resolveBinary, runCommand } from '../command';
 import { describeDlpHits, scanSegments } from '../dlp';
+import { vendorLabel } from '../model/vendor';
 
 /**
  * 外部编码代理 CLI 连接器（本机装好的 Claude Code / Codex 当交叉审核选手）。
@@ -49,10 +50,6 @@ import { describeDlpHits, scanSegments } from '../dlp';
  * CLI 只是"你已经装了那就也能用"的补充。doctor 的推荐顺序按这个来。
  */
 
-export type ExternalVendor = 'ANTHROPIC' | 'OPENAI';
-
-export type ExternalConnectorKind = 'CLAUDE_CLI' | 'CODEX_CLI';
-
 /**
  * 连接器状态（合同 ConnectorState 的诚实子集）。
  * 刻意把"没装"和"装了但不可用"分开 —— 合同枚举里两者都是 BLOCKED，
@@ -72,10 +69,17 @@ export type ExternalConnectorState =
  */
 export type ExternalAgentForm = 'CLI' | 'BUNDLED_CLI' | 'DESKTOP_APP';
 
-export interface ExternalConnectorDescriptor {
+/**
+ * 描述符的形状约束。真正的选手清单是下面的 DESCRIPTORS 常量表 ——
+ * **表是唯一事实源**：ExternalConnectorKind / ExternalConnectorId /
+ * ExternalConnectorDescriptor 全部由表派生，加第三家 CLI = 在表里加一个条目，
+ * 不需要再去别处扩枚举。表刻意留在代码里（而不是配置文件）：argv 形态是
+ * 安全评审对象，"不接受运行时拼接的任意 argv"这条不因注册表化而放宽。
+ */
+interface ExternalConnectorDescriptorShape {
   readonly connectorId: string;
-  readonly kind: ExternalConnectorKind;
-  readonly vendor: ExternalVendor;
+  readonly kind: string;
+  readonly vendor: ModelVendor;
   readonly label: string;
   /**
    * 候选可执行名，按顺序试第一个命中的。多候选是因为同一工具在不同安装方式下
@@ -113,7 +117,7 @@ export interface ExternalConnectorDescriptor {
   readonly credentialEnvVar: string;
 }
 
-const DESCRIPTORS: readonly ExternalConnectorDescriptor[] = [
+const DESCRIPTORS = [
   {
     connectorId: 'claude-cli',
     kind: 'CLAUDE_CLI',
@@ -178,12 +182,24 @@ const DESCRIPTORS: readonly ExternalConnectorDescriptor[] = [
     ],
     credentialEnvVar: 'OPENAI_API_KEY',
   },
-];
+] as const satisfies readonly ExternalConnectorDescriptorShape[];
+
+export type ExternalConnectorKind = (typeof DESCRIPTORS)[number]['kind'];
+export type ExternalConnectorId = (typeof DESCRIPTORS)[number]['connectorId'];
+
+/**
+ * 对外的描述符类型：kind 收窄到由表派生的闭集，其余字段保持形状宽型 ——
+ * 探测/调用函数接受**构造出来的变体**（测试用假二进制路径替换 binaries 等），
+ * 不把入参锁死在两个内置字面量上。
+ */
+export interface ExternalConnectorDescriptor extends ExternalConnectorDescriptorShape {
+  readonly kind: ExternalConnectorKind;
+}
 
 export interface ExternalConnectorProfile {
   readonly connectorId: string;
   readonly kind: ExternalConnectorKind;
-  readonly vendor: ExternalVendor;
+  readonly vendor: ModelVendor;
   readonly label: string;
   readonly state: ExternalConnectorState;
   /** 实际检测到的形态；什么都没检测到为 null */
@@ -261,7 +277,7 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
         detail: `检测到桌面应用 ${appPath}，但 bundle 里没有可自动化的非交互 CLI`,
         remediation:
           `桌面应用只能靠 GUI 自动化驱动，那既被合同禁止也会动用你的登录态 —— ` +
-          `请改用${d.vendor === 'OPENAI' ? ' OpenAI' : ' Anthropic'} API 做交叉审核（更顺，也可记账），` +
+          `请改用 ${vendorLabel(d.vendor)} API 做交叉审核（更顺，也可记账），` +
           `或安装其 CLI 后设 ${d.binaryPathEnv} 指向它`,
       };
     }
@@ -387,7 +403,7 @@ export interface ExternalInvocationManifest {
   readonly attemptId: string;
   readonly role: 'READ_ONLY_REVIEWER' | 'CANDIDATE_AUTHOR';
   readonly connectorId: string;
-  readonly vendor: ExternalVendor;
+  readonly vendor: ModelVendor;
   readonly identityDigest: string | null;
   readonly inputDigest: string;
   readonly state: ExternalInvocationState;
@@ -411,7 +427,7 @@ export interface ExternalReviewResult {
 
 export class SameVendorReviewDenied extends Error {
   readonly code = 'SAME_VENDOR_REVIEW_DENIED';
-  constructor(readonly vendor: ExternalVendor) {
+  constructor(readonly vendor: ModelVendor) {
     super(`审核方与实现方同为 ${vendor}：异构是硬不变式，同厂商审核被拒绝`);
   }
 }
@@ -420,10 +436,13 @@ export class SameVendorReviewDenied extends Error {
  * 异构不变式。合同原话：`authorVendor != reviewerVendor` 是 canonical invariant，
  * 同 vendor 必须返回 SAME_VENDOR_REVIEW_DENIED —— **单纯披露"非异构"不能继续**。
  * 所以这里抛错而不是加个 warning 字段。
+ *
+ * 只在**双方厂商都有证据**时调用（KNOWN vs KNOWN）。推不出厂商的一侧不进这里 ——
+ * 那不是"放行"，是落成 VendorParity 的 UNVERIFIABLE 如实披露（见 model/vendor.ts）。
  */
 export function assertHeterogeneousVendor(
-  authorVendor: ExternalVendor,
-  reviewerVendor: ExternalVendor,
+  authorVendor: ModelVendor,
+  reviewerVendor: ModelVendor,
 ): void {
   if (authorVendor === reviewerVendor) throw new SameVendorReviewDenied(authorVendor);
 }

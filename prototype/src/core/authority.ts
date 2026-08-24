@@ -8,6 +8,8 @@ import type {
   DataEgressDisclosure,
   CommandApproval,
   PatchExportGrant,
+  CrossReviewerIdentity,
+  VendorParity,
   FailureClass,
   ModelConnectionProfile,
   LedgerCharge,
@@ -33,7 +35,13 @@ import type {
   ToolRisk,
   VerificationRun,
 } from '@shared/domain';
-import { CROSS_REVIEW_LIMITS, EMPTY_LEDGER, applyLedgerCharge, isTerminal } from '@shared/domain';
+import {
+  CROSS_REVIEW_LIMITS,
+  EMPTY_LEDGER,
+  applyLedgerCharge,
+  isTerminal,
+  legacyReviewerProfileId,
+} from '@shared/domain';
 import { sha256 } from '@shared/ids';
 import type {
   ImportOutcome,
@@ -78,8 +86,14 @@ import {
   probeConnector,
   runExternalCliReview,
   type ExternalConnectorProfile,
-  type ExternalVendor,
 } from './external/connector';
+import {
+  inferModelVendor,
+  knownVendorSide,
+  vendorParityOf,
+  type VendorInference,
+  type VendorSide,
+} from './model/vendor';
 import { runExternalCliAuthor } from './external/author';
 import { verificationInputsFromCommands } from './coverage';
 import { describeDlpHits, scanSegments } from './dlp';
@@ -250,14 +264,15 @@ export type ReviewerBinding =
   | {
       readonly kind: 'MODEL_API';
       readonly resolution: ModelRouteResolution;
-      readonly heterogeneous: boolean;
+      /** 写审双方厂商同异的三态判定（写方 = 外部作者在场时是作者，否则是实现方模型） */
+      readonly parity: VendorParity;
       readonly label: string;
     }
   | {
       readonly kind: 'EXTERNAL_CLI';
       readonly connector: ExternalConnectorProfile;
       readonly apiKey: string;
-      readonly heterogeneous: boolean;
+      readonly parity: VendorParity;
       readonly label: string;
     };
 
@@ -1224,10 +1239,19 @@ export class RunAuthority {
       } else {
         try {
           const reviewerResolution = this.gateway.freezeRoute(input.reviewerModelProfileId);
+          /*
+           * 同异按**厂商**判，不按 providerId：anthropic 官方与 openrouter 上的 claude
+           * 是两个 provider、同一个厂商 —— 此前按 providerId 会把它标成"异构"。
+           * 模型对模型的同厂商是披露项不是拦截项（硬拦只对外部代理，合同如此），
+           * 但披露必须如实：证明同源写同源，证明不了写无法判定。
+           */
           reviewer = {
             kind: 'MODEL_API',
             resolution: reviewerResolution,
-            heterogeneous: reviewerResolution.providerId !== resolution.providerId,
+            parity: vendorParityOf(
+              this.routeSide('实现方', resolution),
+              this.routeSide('审核方', reviewerResolution),
+            ),
             label: `${reviewerResolution.providerId}/${reviewerResolution.modelId}`,
           };
         } catch (err) {
@@ -1241,6 +1265,16 @@ export class RunAuthority {
     let author: AuthorBinding | null = null;
     if (input.authorConnectorId) {
       author = this.bindCliAuthor(input.authorConnectorId, reviewer);
+      // 外部作者在场时"写的一方"是作者不是实现方模型 —— 厂商同异按真正动手写的那一方重算
+      if (reviewer) {
+        reviewer = {
+          ...reviewer,
+          parity: vendorParityOf(
+            this.connectorSide('外部作者', author.connector),
+            this.reviewerSideOf(reviewer),
+          ),
+        };
+      }
     }
 
     /*
@@ -1258,6 +1292,7 @@ export class RunAuthority {
           : reviewer.kind === 'MODEL_API'
             ? { kind: 'MODEL_API', profile: this.requireProfile(reviewer.resolution.profileId), resolution: reviewer.resolution }
             : { kind: 'EXTERNAL_CLI', connector: reviewer.connector },
+      reviewerParity: reviewer?.parity ?? null,
       author: author ? { connector: author.connector } : null,
     });
     if (!input.egressConsentDigest) {
@@ -1483,16 +1518,21 @@ export class RunAuthority {
     if (reviewerDegradeNote) {
       this.emit(record, 'NOTE', reviewerDegradeNote);
     } else if (reviewer) {
-      // 审核方 route 的事实进事件，供审计
+      // 审核方 route 的事实进事件，供审计。厂商同异三态如实写：无法判定不折成任何一边
       this.emit(
         record,
         'NOTE',
         `已启用交叉审核：审核方 ${reviewer.label}（${reviewer.kind === 'EXTERNAL_CLI' ? '外部 CLI' : '模型 API'}）` +
-          `${reviewer.heterogeneous ? '，与实现方异构' : '，与实现方同源，第二意见价值有限'}`,
+          (reviewer.parity.kind === 'HETEROGENEOUS'
+            ? '，写审双方厂商异构'
+            : reviewer.parity.kind === 'SAME_VENDOR'
+              ? `，写审双方同厂商，第二意见价值有限 —— ${reviewer.parity.detail}`
+              : `，写审双方厂商同异无法判定 —— ${reviewer.parity.detail}`),
         {
           reviewerKind: reviewer.kind,
           reviewerLabel: reviewer.label,
-          heterogeneous: reviewer.heterogeneous,
+          heterogeneous: reviewer.parity.kind === 'HETEROGENEOUS',
+          vendorParity: reviewer.parity,
           ...(reviewer.kind === 'MODEL_API'
             ? { reviewerRoute: { providerId: reviewer.resolution.providerId, modelId: reviewer.resolution.modelId } }
             : { connectorId: reviewer.connector.connectorId, identityDigest: reviewer.connector.identityDigest }),
@@ -1748,6 +1788,43 @@ export class RunAuthority {
     return out;
   }
 
+  /**
+   * 模型路由的厂商推断。证据优先级在 model/vendor.ts：模型命名空间 > 模型家族名 >
+   * 单一厂商官方 provider。此前这里只认 providerId 为 'anthropic'/'openai' 两个字符串，
+   * 走中转（openrouter / aihubmix / …）一律推不出 —— openrouter 上的 claude 模型配
+   * Claude CLI 审核这种**可以证明**的同厂商组合被静默放行（A2A 评审 §4.4 点名的洞）。
+   */
+  private routeVendor(resolution: ModelRouteResolution): VendorInference {
+    const profile = this.gateway.getProfile(resolution.profileId);
+    return inferModelVendor({
+      providerId: resolution.providerId,
+      providerKind: profile?.kind ?? null,
+      modelId: resolution.modelId,
+    });
+  }
+
+  private routeSide(role: string, resolution: ModelRouteResolution): VendorSide {
+    return {
+      label: `${role} ${resolution.providerId}/${resolution.modelId}`,
+      inference: this.routeVendor(resolution),
+    };
+  }
+
+  /** 本机 CLI 的厂商来自静态描述符 —— 身份确定，不需要推断 */
+  private connectorSide(role: string, connector: ExternalConnectorProfile): VendorSide {
+    return knownVendorSide({
+      label: `${role} ${connector.label}`,
+      vendor: connector.vendor,
+      evidence: `本机连接器 ${connector.connectorId}`,
+    });
+  }
+
+  private reviewerSideOf(reviewer: ReviewerBinding): VendorSide {
+    return reviewer.kind === 'EXTERNAL_CLI'
+      ? this.connectorSide('审核方', reviewer.connector)
+      : this.routeSide('审核方', reviewer.resolution);
+  }
+
   private bindCliReviewer(
     connectorId: string,
     implementer: ModelRouteResolution,
@@ -1757,9 +1834,16 @@ export class RunAuthority {
     const connector = probeConnector(d);
     if (connector.state !== 'READY') throw new Error(connector.detail);
 
-    // 实现方的 vendor 由它的 providerId 推断；推不出来就当作与任何人都异构
-    const implementerVendor = vendorOfProvider(implementer.providerId);
-    if (implementerVendor) assertHeterogeneousVendor(implementerVendor, connector.vendor);
+    /*
+     * 证明同厂商才拦；证明不了**不是放行两个字能带过的** —— 必须落成 UNVERIFIABLE
+     * 如实进披露与记录。此前这里推不出厂商时跳过断言、还把 heterogeneous 硬编码 true，
+     * 等于把"没查"写成"已证异构"：静默过滤和静默通过是同一类问题。
+     */
+    const implementerSide = this.routeSide('实现方', implementer);
+    if (implementerSide.inference.kind === 'KNOWN') {
+      assertHeterogeneousVendor(implementerSide.inference.vendor, connector.vendor);
+    }
+    const parity = vendorParityOf(implementerSide, this.connectorSide('审核方', connector));
 
     const apiKey = this.gateway.credentialForVendor(connector.credentialEnvVar);
     if (!apiKey) {
@@ -1771,7 +1855,7 @@ export class RunAuthority {
       kind: 'EXTERNAL_CLI',
       connector,
       apiKey,
-      heterogeneous: true, // 上面已断言，同厂商到不了这里
+      parity,
       label: `${connector.label} ${connector.version ?? ''}`.trim(),
     };
   }
@@ -1800,7 +1884,20 @@ export class RunAuthority {
     if (input.reviewerConnectorId) {
       const d = descriptorOfConnector(input.reviewerConnectorId);
       if (!d) throw platformError('BAD_REQUEST', `未知的外部连接器：${input.reviewerConnectorId}`);
-      reviewer = { kind: 'EXTERNAL_CLI', connector: probeConnector(d) };
+      const connector = probeConnector(d);
+      /*
+       * 与 createTask 的 bindCliReviewer 降级判定逐条对齐：连接器不可用、缺该厂商凭据、
+       * 或与实现方**证明**同厂商（SAME_VENDOR_REVIEW_DENIED）时，createTask 会把审核方
+       * 降级为不审核 —— 披露必须按降级后的事实算。否则用户确认的是"含审核方"的 digest，
+       * createTask 重算的是"无审核方"的 digest，CONSENT_STALE 会永远对不上。
+       * Renderer 侧负责把"选了但不在披露里"这件事说给用户听，这里不静默。
+       */
+      const implementerInference = this.routeVendor(implementer.resolution);
+      const denied =
+        connector.state !== 'READY' ||
+        !this.gateway.credentialForVendor(connector.credentialEnvVar) ||
+        (implementerInference.kind === 'KNOWN' && implementerInference.vendor === connector.vendor);
+      reviewer = denied ? null : { kind: 'EXTERNAL_CLI', connector };
     } else if (input.reviewerModelProfileId && input.reviewerModelProfileId !== input.modelProfileId) {
       try {
         reviewer = {
@@ -1819,11 +1916,24 @@ export class RunAuthority {
       if (!d) throw platformError('BAD_REQUEST', `未知的外部连接器：${input.authorConnectorId}`);
       author = { connector: probeConnector(d) };
     }
+    // 厂商同异判定与 createTask 同一套输入、同一个函数 —— 展示的与校验的只可能因输入不同而不同
+    let reviewerParity: VendorParity | null = null;
+    if (reviewer) {
+      reviewerParity = vendorParityOf(
+        author
+          ? this.connectorSide('外部作者', author.connector)
+          : this.routeSide('实现方', implementer.resolution),
+        reviewer.kind === 'EXTERNAL_CLI'
+          ? this.connectorSide('审核方', reviewer.connector)
+          : this.routeSide('审核方', reviewer.resolution),
+      );
+    }
     return buildDisclosure({
       snapshotId: snapshot.snapshotId,
       snapshotFileCount: snapshot.fileCount,
       implementer,
       reviewer,
+      reviewerParity,
       author,
     });
   }
@@ -1843,13 +1953,16 @@ export class RunAuthority {
     if (connector.state !== 'READY') {
       throw platformError('BAD_REQUEST', `外部作者 ${d.label} 不可用：${connector.detail}`, connector.remediation ?? undefined);
     }
-    // 异构不变式对"作者 vs 审核方"同样成立：Codex 写就不能 Codex 审
+    /*
+     * 异构不变式对"作者 vs 审核方"同样成立：Codex 写就不能 Codex 审。
+     * 审核方是模型 API 时厂商走同一套推断 —— 此前只认官方 providerId，
+     * aihubmix 上的 gpt-5.1 审 Codex 写的代码这种可证明的同厂商组合会被静默放行。
+     */
     if (reviewer) {
-      const reviewerVendor =
-        reviewer.kind === 'EXTERNAL_CLI' ? reviewer.connector.vendor : vendorOfProvider(reviewer.resolution.providerId);
-      if (reviewerVendor) {
+      const reviewerSide = this.reviewerSideOf(reviewer);
+      if (reviewerSide.inference.kind === 'KNOWN') {
         try {
-          assertHeterogeneousVendor(connector.vendor, reviewerVendor);
+          assertHeterogeneousVendor(connector.vendor, reviewerSide.inference.vendor);
         } catch (err) {
           throw platformError('BAD_REQUEST', (err as Error).message, '换一个不同厂商的审核方，或不启用交叉审核');
         }
@@ -2065,7 +2178,11 @@ export class RunAuthority {
       const round = {
         round: i.round,
         reviewedPatchDigest: i.patch.digest,
-        reviewerResolutionId: `external:${reviewer.connector.connectorId}`,
+        // 前缀形式只由 legacyReviewerProfileId 一处派生，这里不再手拼字符串
+        reviewerResolutionId: legacyReviewerProfileId({
+          kind: 'EXTERNAL_CLI',
+          connectorId: reviewer.connector.connectorId,
+        }),
         startedAt,
         finishedAt: nowIso(),
       };
@@ -2121,7 +2238,8 @@ export class RunAuthority {
     this.emit(record, 'CROSS_REVIEW_STARTED', `交叉审核开始：${reviewer.label}`, {
       reviewerKind: reviewer.kind,
       reviewerLabel: reviewer.label,
-      heterogeneous: reviewer.heterogeneous,
+      heterogeneous: reviewer.parity.kind === 'HETEROGENEOUS',
+      vendorParity: reviewer.parity,
       limits: CROSS_REVIEW_LIMITS,
       ...(isContinuation ? { continuation: (prior?.userContinuations ?? 0) + 1 } : {}),
     });
@@ -2239,14 +2357,17 @@ export class RunAuthority {
     // 续期时累计而非覆盖：counter 只增不清（PRD-XAGENT-004），轮次跨循环连续编号
     const priorRounds = prior?.rounds ?? [];
     const renumbered = rounds.map((r, i) => ({ ...r, round: priorRounds.length + i + 1 }));
+    // 身份是判别联合；reviewerProfileId 只是它的遗留展示派生，前缀约定不再散落
+    const reviewerIdentity: CrossReviewerIdentity =
+      reviewer.kind === 'MODEL_API'
+        ? { kind: 'MODEL_API', profileId: reviewer.resolution.profileId }
+        : { kind: 'EXTERNAL_CLI', connectorId: reviewer.connector.connectorId };
     const cr: CrossReviewRecord = {
       enabled: true,
-      // 外部 CLI 没有 profileId，用连接器 id 占同一个字段（前缀区分来源）
-      reviewerProfileId:
-        reviewer.kind === 'MODEL_API'
-          ? reviewer.resolution.profileId
-          : `external:${reviewer.connector.connectorId}`,
-      heterogeneous: reviewer.heterogeneous,
+      reviewerIdentity,
+      reviewerProfileId: legacyReviewerProfileId(reviewerIdentity),
+      heterogeneous: reviewer.parity.kind === 'HETEROGENEOUS',
+      vendorParity: reviewer.parity,
       rounds: [...priorRounds, ...renumbered],
       reviewerInvocations: (prior?.reviewerInvocations ?? 0) + rounds.length,
       remediations: (prior?.remediations ?? 0) + remediations,
@@ -3590,17 +3711,6 @@ export class CoreError extends Error {
   constructor(readonly payload: PlatformError) {
     super(payload.message);
   }
-}
-
-/**
- * 从 providerId 推断厂商。只认得出官方那几个 —— 中转站和自定义 provider
- * 背后是谁无法证明，返回 null 表示"无法证明同厂商"，此时不拦。
- * 宁可放过一次同源审核（价值有限但无害），也不误拦一次合法的异构审核。
- */
-function vendorOfProvider(providerId: string): ExternalVendor | null {
-  if (providerId === 'anthropic') return 'ANTHROPIC';
-  if (providerId === 'openai') return 'OPENAI';
-  return null;
 }
 
 export function platformError(

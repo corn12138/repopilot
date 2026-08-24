@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EMPTY_LEDGER, applyLedgerCharge } from './domain';
+import { EMPTY_LEDGER, applyLedgerCharge, legacyReviewerProfileId } from './domain';
 
 /**
  * 账本的诚实性。核心是 token 字段的三态：
@@ -58,5 +58,16 @@ describe('applyLedgerCharge：null 不是 0，undefined 不是 null', () => {
     const l = applyLedgerCharge(legacy, { modelTurns: 1, inputTokens: null, outputTokens: null }, 60);
     expect(l.unknownUsageTurns).toBe(1);
     expect(Number.isNaN(l.inputTokens)).toBe(false);
+  });
+});
+
+describe('legacyReviewerProfileId：前缀约定只在这一处存在', () => {
+  it('MODEL_API → 原样的 profileId；EXTERNAL_CLI → external: 前缀', () => {
+    expect(legacyReviewerProfileId({ kind: 'MODEL_API', profileId: 'profile_moonshot-cn' })).toBe(
+      'profile_moonshot-cn',
+    );
+    expect(legacyReviewerProfileId({ kind: 'EXTERNAL_CLI', connectorId: 'claude-cli' })).toBe(
+      'external:claude-cli',
+    );
   });
 });

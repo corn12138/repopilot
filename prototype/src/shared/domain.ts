@@ -868,6 +868,64 @@ export type CrossReviewStopReason =
   | 'ERROR';
 
 /**
+ * 模型/代理的**厂商**（模型家族的所有者）。
+ *
+ * 与 provider 是两个维度：provider 回答"数据送到谁的服务器"，vendor 回答"模型出自谁家"。
+ * 中转 provider（openrouter / aihubmix 等）承载多家 vendor 的模型；官方 provider 也可能
+ * 托管别家模型（火山方舟上有 DeepSeek 与 Kimi）。异构审核不变式关心的是 vendor ——
+ * 同家族模型共享盲区，写和审出自同一家时"第二意见"名不副实。
+ */
+export type ModelVendor =
+  | 'ANTHROPIC'
+  | 'OPENAI'
+  | 'GOOGLE'
+  | 'META'
+  | 'MISTRAL'
+  | 'XAI'
+  | 'DEEPSEEK'
+  | 'MOONSHOT'
+  | 'ZHIPU'
+  | 'ALIBABA'
+  | 'BYTEDANCE'
+  | 'MINIMAX';
+
+/**
+ * 「写的一方」与「审的一方」厂商同异的判定 —— 三态，不是布尔。
+ *
+ * 无法判定必须是独立状态：折成"异构"是谎报（此前 EXTERNAL_CLI 绑定在推不出实现方
+ * 厂商时硬编码 heterogeneous=true，正是这个错），折成"同源"是误拦合法组合。
+ * 与 INCONCLUSIVE ≠ PASS 是同一条原则：没证据的方向上不编造结论。
+ */
+export interface VendorParity {
+  readonly kind: 'HETEROGENEOUS' | 'SAME_VENDOR' | 'UNVERIFIABLE';
+  /** 人读的证据：双方各归入哪个家族依据什么，或为什么归不出来 */
+  readonly detail: string;
+}
+
+/**
+ * 审核方身份 —— 判别联合，不是字符串前缀约定。
+ * 第三种选手类型（比如将来的远程审核方通道）= 新增一个分支，
+ * 编译器会点名所有消费处；靠 `external:` 前缀只会长出第三个前缀。
+ */
+export type CrossReviewerIdentity =
+  | { readonly kind: 'MODEL_API'; readonly profileId: string }
+  | { readonly kind: 'EXTERNAL_CLI'; readonly connectorId: string };
+
+/**
+ * 旧字段 reviewerProfileId / 轮次 reviewerResolutionId 的派生规则。
+ * `external:` 前缀约定只允许在这一处存在 —— 它已经降级为展示/追溯字符串，
+ * 判定一律走 CrossReviewerIdentity 的判别分支。
+ */
+export function legacyReviewerProfileId(id: CrossReviewerIdentity): string {
+  switch (id.kind) {
+    case 'MODEL_API':
+      return id.profileId;
+    case 'EXTERNAL_CLI':
+      return `external:${id.connectorId}`;
+  }
+}
+
+/**
  * 整个交叉审核过程的聚合记录，挂在 Run 上、进 state.json。
  *
  * counter 是"任务级聚合"：换窗口、换模型、恢复 session 都不能重置它
@@ -875,9 +933,17 @@ export type CrossReviewStopReason =
  */
 export interface CrossReviewRecord {
   readonly enabled: boolean;
+  /** 遗留展示字段，由 reviewerIdentity 经 legacyReviewerProfileId 派生；判定不要用它 */
   readonly reviewerProfileId: string;
-  /** 两条 route 是否异构（不同 provider）—— 同源审核价值有限，如实标注 */
+  /** 审核方身份（判别联合）。可选：旧持久化记录只有 reviewerProfileId 字符串 */
+  readonly reviewerIdentity?: CrossReviewerIdentity;
+  /**
+   * true 仅表示**已证明**写审双方厂商互异。无法判定时必须为 false，
+   * 且 vendorParity.kind = 'UNVERIFIABLE' —— 不许把"不知道"写成"已异构"。
+   */
   readonly heterogeneous: boolean;
+  /** 厂商同异三态判定与证据。可选：旧持久化记录只有 heterogeneous 布尔 */
+  readonly vendorParity?: VendorParity;
   readonly rounds: readonly CrossReviewRound[];
   /** 已消耗的 reviewer invocation 次数。累计值：跨用户续期只增不清 */
   readonly reviewerInvocations: number;
@@ -1082,10 +1148,17 @@ export interface EgressPolicyKnowledge {
  * 同一个 digest，Core 重算比对 —— 用户同意的是**这一份**，不是"同意出站"这个动作。
  */
 export interface DataEgressDisclosure {
-  readonly disclosureVersion: 1;
+  /** v2：新增 crossReviewParity —— 披露形状变了，版本如实跟着变 */
+  readonly disclosureVersion: 2;
   readonly snapshotId: string;
   readonly snapshotFileCount: number;
   readonly destinations: readonly EgressDestination[];
+  /**
+   * 写审双方的厂商同异判定（无审核方时为 null）。
+   * TD §9.14 要求"若供应商相同必须显式披露非异构审核"——判定属于披露的一部分，
+   * 用户点头之前就该看见，而不是任务创建之后才在事件流里出现。
+   */
+  readonly crossReviewParity: VendorParity | null;
   readonly policy: EgressPolicyKnowledge;
   readonly digest: Digest;
 }

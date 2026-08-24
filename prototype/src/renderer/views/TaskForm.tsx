@@ -450,10 +450,29 @@ export function Composer({
                     {d.dataClasses.map((c) => DATA_CLASS_LABEL[c] ?? c).join('、')}
                   </li>
                 ))}
+                {disclosure.crossReviewParity && (
+                  <li>
+                    <b>写审厂商</b>：
+                    {disclosure.crossReviewParity.kind === 'HETEROGENEOUS'
+                      ? '已证异构'
+                      : disclosure.crossReviewParity.kind === 'SAME_VENDOR'
+                        ? '同厂商，第二意见价值有限'
+                        : '无法判定'}
+                    {' —— '}
+                    {disclosure.crossReviewParity.detail}
+                  </li>
+                )}
                 <li>快照 {disclosure.snapshotId.slice(0, 12)} 共 {disclosure.snapshotFileCount} 个文件；只有被读取的片段会离开本机，每次出站在运行页"数据出站"里逐笔可查</li>
                 <li>高置信度凭据（AWS key / 私钥 / token）在命令输出里会被脱敏，在文件里会拒绝读入，出站前再扫一遍</li>
               </ul>
             </details>
+            {/* 选了审核方但披露里没有 REVIEWER 目的地 = 创建时会被降级为不审核。降级不能静默 */}
+            {reviewerProfileId && reviewerResolved && !disclosure.destinations.some((d) => d.role === 'REVIEWER') && (
+              <span className="composer-disclosure-error" role="status">
+                所选交叉审核方不在本次披露里：该组合会在创建时降级为不审核 ——
+                连接器不可用、缺该厂商凭据，或与写方证明同厂商而被异构不变式拒绝。
+              </span>
+            )}
           </>
         ) : (
           <span className="composer-disclosure-error" role="status">
