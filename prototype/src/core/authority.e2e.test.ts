@@ -950,6 +950,27 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
       expect(crossReview!.reviewerIdentity).toEqual({ kind: 'MODEL_API', profileId: 'profile_moonshot-cn' });
       expect(crossReview!.reviewerProfileId).toBe('profile_moonshot-cn');
 
+      // 证据聚合把这次 Run 的事实收进来（同文件内其他用例的 Run 也在同一 data root，断言用下界）
+      const { summary } = await harness.call<{
+        summary: {
+          northStar: { executingAttempts: number; rate: number | null };
+          funnel: { plansGenerated: number };
+          crossReview: { runsWithReview: number; groups: { reviewerKey: string; parity: string; verdicts: Record<string, number> }[] };
+          notComputable: { metric: string; unblocks: string }[];
+        };
+      }>('evidence.summary', {});
+      expect(summary.northStar.executingAttempts).toBeGreaterThanOrEqual(1);
+      expect(summary.funnel.plansGenerated).toBeGreaterThanOrEqual(1);
+      expect(summary.crossReview.runsWithReview).toBeGreaterThanOrEqual(1);
+      const group = summary.crossReview.groups.find(
+        (g) => g.reviewerKey === 'profile_moonshot-cn' && g.parity === 'HETEROGENEOUS',
+      );
+      expect(group).toBeDefined();
+      expect(group!.verdicts.CHANGES_REQUESTED).toBeGreaterThanOrEqual(1);
+      expect(group!.verdicts.PASS).toBeGreaterThanOrEqual(1);
+      // 观察性聚合永不宣称回答了 ASM-019 —— defect delta 必须在"算不出"清单里点名 SPK-010
+      expect(summary.notComputable.some((n) => n.metric.includes('defect delta') && n.unblocks.includes('SPK-010'))).toBe(true);
+
       // 整改后重新封存：两次 PATCH_SEALED，digest 不同，第二次标注 remediated
       const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
       const sealed = events.filter((e) => e.kind === 'PATCH_SEALED');

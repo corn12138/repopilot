@@ -265,6 +265,11 @@ export interface RequestMap {
   /** 交叉审核记录（第二个模型的只读发现）；没启用或没跑过为 null */
   'crossreview.get': { req: { runId: string }; res: { crossReview: CrossReviewRecord | null } };
   /**
+   * 跨 Run 证据摘要（PRD §11 里平台事实撑得住的子集）。
+   * 只聚合已观察到的事实；算不出的指标在 notComputable 里点名原因。
+   */
+  'evidence.summary': { req: Record<string, never>; res: { summary: EvidenceSummary } };
+  /**
    * 用户显式授权再跑一轮交叉审核循环（2 审 + 1 改）。
    * 只在 AWAITING_PATCH_REVIEW 且上一循环以 COUNTER_EXHAUSTED / NO_PROGRESS /
    * NO_DELTA 收场时可用；恢复态（无活执行器）与时间预算耗尽会被拒。
@@ -406,6 +411,129 @@ export interface ReviewerOption {
   readonly available: boolean;
   /** 不可用的原因 / 修复建议；可用时为 null */
   readonly reason: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// 证据聚合（evidence.summary）—— PRD §11 指标里平台事实撑得住的那个子集
+// ---------------------------------------------------------------------------
+
+/**
+ * 跨 Run 证据摘要。每个数字都来自平台观察到的事实（账本 / append-only 事件 /
+ * 封存记录），**不从模型或审核方的自报计算**（PRD §11.2 交叉审核行的纪律）。
+ *
+ * 两条结构性约束（PRD §11.1）：
+ *   1. 北极星必须与漏斗同时发布 —— 不得只展示接受率而隐藏前置阶段的失败；
+ *   2. 算不出来的指标必须点名并给原因（notComputable），而不是从清单里消失。
+ */
+export interface EvidenceFunnel {
+  readonly runsCreated: number;
+  readonly plansGenerated: number;
+  readonly attemptsStarted: number;
+  /** 进入过 EXECUTING 的 Attempt 数 —— 北极星的分母（PRD §11.1） */
+  readonly attemptsEnteredExecuting: number;
+  readonly patchesSealed: number;
+  readonly decisions: { readonly ACCEPT: number; readonly REJECT: number; readonly REQUEST_CHANGES: number };
+}
+
+export interface EvidenceNorthStar {
+  /** SUCCEEDED：接受 + 验证通过 + 验证输入未被触碰（setStatus 不变式强制） */
+  readonly acceptedVerified: number;
+  readonly acceptedUnverified: number;
+  readonly executingAttempts: number;
+  /** 分母为 0 时为 null —— 不写 0% 也不写 100% */
+  readonly rate: number | null;
+}
+
+export interface EvidenceReviewerGroup {
+  /** 展示用 key：legacy reviewerProfileId（模型 profileId / external:connectorId） */
+  readonly reviewerKey: string;
+  /** 旧持久化记录没有判别联合身份时为 LEGACY_UNKNOWN —— 不做前缀猜测 */
+  readonly reviewerKind: 'MODEL_API' | 'EXTERNAL_CLI' | 'LEGACY_UNKNOWN';
+  /** 旧记录只有布尔 heterogeneous 时为 LEGACY_BOOLEAN */
+  readonly parity: 'HETEROGENEOUS' | 'SAME_VENDOR' | 'UNVERIFIABLE' | 'LEGACY_BOOLEAN';
+  readonly runs: number;
+  readonly rounds: number;
+  /** INCONCLUSIVE 与 PASS 分列 —— "没看成"永远不折进"没问题" */
+  readonly verdicts: { readonly PASS: number; readonly CHANGES_REQUESTED: number; readonly INCONCLUSIVE: number };
+  readonly findings: number;
+  readonly blockingFindings: number;
+  readonly remediations: number;
+  readonly userContinuations: number;
+  /** 同一指纹在多轮重复出现的 Run 数 —— no-progress 的观察信号（指纹是平台算的） */
+  readonly runsWithRepeatedFingerprint: number;
+  readonly stopReasons: Readonly<Record<string, number>>;
+  /** 审后 Run 的现状分布（人工接管之后去了哪）：status 计数 */
+  readonly outcomes: Readonly<Record<string, number>>;
+}
+
+export interface EvidencePurposeCost {
+  readonly manifests: number;
+  readonly sent: number;
+  /** 出站前被闸门拦下（blockReason 非空） */
+  readonly blocked: number;
+  /** 连接都没建立（非阻断、未发出） */
+  readonly failedBeforeSend: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  /** 已发出但用量未知的清单数 —— 未知就是未知，不折成 0 */
+  readonly usageUnknown: number;
+}
+
+export interface EvidenceCost {
+  readonly ledger: {
+    readonly modelTurns: number;
+    readonly toolCalls: number;
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly unknownUsageTurns: number;
+    readonly elapsedMs: number;
+  };
+  /** 按 ModelInvocationPurpose 拆分（来源 egress.jsonl 逐笔清单；外部 CLI 不经网关，不在此列） */
+  readonly byPurpose: Readonly<Record<string, EvidencePurposeCost>>;
+  readonly egressLogUnparseableLines: number;
+  readonly acceptedRuns: number;
+  readonly acceptedAvgInputTokens: number | null;
+  readonly acceptedAvgOutputTokens: number | null;
+  readonly acceptedAvgElapsedMs: number | null;
+  /** 均值样本里带未知用量轮次的 Run 数 —— 均值的可信度声明 */
+  readonly acceptedRunsWithUnknownUsage: number;
+}
+
+export interface EvidenceNotComputable {
+  readonly metric: string;
+  readonly reason: string;
+  readonly unblocks: string;
+}
+
+export interface EvidenceSummary {
+  readonly generatedAt: string;
+  readonly dataQuality: {
+    readonly totalRuns: number;
+    readonly intact: number;
+    readonly eventsAhead: number;
+    readonly damaged: number;
+    readonly restored: number;
+    /** 被排除出全部聚合的 Run 数（= damaged），排除必须报数 */
+    readonly excludedFromMetrics: number;
+  };
+  readonly funnel: EvidenceFunnel;
+  readonly northStar: EvidenceNorthStar;
+  readonly outcomes: {
+    readonly byStatus: Readonly<Record<string, number>>;
+    readonly byFailureClass: Readonly<Record<string, number>>;
+  };
+  readonly verification: {
+    readonly baseline: { readonly passed: number; readonly failed: number };
+    readonly postMutation: { readonly passed: number; readonly failed: number };
+    /** verificationInputsTouched 非空的补丁数 —— 这些"验证通过"不构成修复证明 */
+    readonly coverageWeakenedPatches: number;
+  };
+  readonly crossReview: {
+    readonly runsWithReview: number;
+    readonly groups: readonly EvidenceReviewerGroup[];
+  };
+  readonly cost: EvidenceCost;
+  readonly notComputable: readonly EvidenceNotComputable[];
 }
 
 export interface RetentionPolicyView {

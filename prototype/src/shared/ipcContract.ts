@@ -185,6 +185,8 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
 
   'patch.get': { fields: { runId: ID }, timeoutMs: QUICK },
   'crossreview.get': { fields: { runId: ID }, timeoutMs: QUICK },
+  // 聚合读全部 Run 的内存事件缓存 + egress.jsonl；只读，无副作用
+  'evidence.summary': { fields: NONE, timeoutMs: QUICK },
   'crossreview.reviewers': { fields: NONE, timeoutMs: SLOW },
   'crossreview.continue': { fields: { runId: ID }, timeoutMs: SLOW },
   'patch.decide': {

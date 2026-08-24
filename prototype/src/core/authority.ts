@@ -99,6 +99,7 @@ import { verificationInputsFromCommands } from './coverage';
 import { describeDlpHits, scanSegments } from './dlp';
 import { commandArgvDigest, isApprovableCause, classifyUserCommand, userCommandAdmission } from './commandRisk';
 import { buildDisclosure, consentedResolutionDigests, type DisclosureInput } from './egress';
+import { buildEvidenceSummary, readEgressLog } from './evidence';
 import { applyCandidate } from './external/normalize';
 import { EventStore, readJson, writeJsonAtomic } from './store';
 import {
@@ -751,6 +752,22 @@ export class RunAuthority {
         const rec = this.require(String(payload.runId));
         return { events: rec.events.after(Number(payload.afterSeq ?? 0)) };
       }
+
+      case 'evidence.summary':
+        // 全部输入都是平台已持有的事实（内存态 Run + egress.jsonl），只读聚合
+        return {
+          summary: buildEvidenceSummary(
+            [...this.runs.values()].map((r) => ({
+              view: r.view,
+              verifications: r.verifications,
+              crossReview: r.crossReview,
+              patch: r.patch,
+              priorPatches: r.priorPatches,
+              events: r.events.all(),
+            })),
+            readEgressLog(),
+          ),
+        };
 
       case 'run.toolCalls': {
         const rec = this.require(String(payload.runId));

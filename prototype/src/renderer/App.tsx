@@ -27,6 +27,7 @@ import { Composer } from './views/TaskForm';
 import { RunDetail } from './views/RunDetail';
 import { FileTreePanel } from './views/FileTree';
 import { SettingsView } from './views/Settings';
+import { EvidenceView } from './views/Evidence';
 
 interface ImportRequest {
   subPath?: string;
@@ -62,6 +63,7 @@ export function App() {
   const [filesKey, setFilesKey] = useState(0);
   /** 设置页作为一个独立视图，而不是"没选项目时的兜底" */
   const [showSettings, setShowSettings] = useState(false);
+  const [showEvidence, setShowEvidence] = useState(false);
 
   const coreStatusRef = useRef(coreStatus);
   coreStatusRef.current = coreStatus;
@@ -82,10 +84,10 @@ export function App() {
    * 也应该回到底部，而不是继承上一次的未读计数。计数来源是 durable events 的数量 ——
    * 它对应时间线上真实存在的行，不是估算出来的进度。
    */
-  const followOwnerKey = showSettings ? '__settings__' : selectedRunId;
+  const followOwnerKey = showSettings ? '__settings__' : showEvidence ? '__evidence__' : selectedRunId;
   const follow = useStickToBottom<HTMLDivElement>({
     ownerKey: followOwnerKey,
-    itemCount: showSettings ? 0 : (selectedRunDetail?.events.length ?? 0),
+    itemCount: showSettings || showEvidence ? 0 : (selectedRunDetail?.events.length ?? 0),
   });
 
   const report = useCallback((err: unknown) => {
@@ -241,6 +243,7 @@ export function App() {
   const openProject = useCallback(
     (project: ProjectRef) => {
       setShowSettings(false);
+      setShowEvidence(false);
       setSelectedProject(project);
       setSelectedRunId(null);
       void importProject(project);
@@ -257,6 +260,7 @@ export function App() {
   const openRun = useCallback(
     (run: RunView) => {
       setShowSettings(false);
+      setShowEvidence(false);
       setError(null);
       setSelectedRunId(run.runId);
       if (selectedProject?.projectId !== run.projectId) {
@@ -349,7 +353,7 @@ export function App() {
               <div key={p.projectId} className="project-group">
                 <button
                   disabled={coreStatus !== 'READY'}
-                  className={`list-item ${isCurrent && !selectedRunId && !showSettings ? 'active' : ''}`}
+                  className={`list-item ${isCurrent && !selectedRunId && !showSettings && !showEvidence ? 'active' : ''}`}
                   onClick={() => openProject(p)}
                 >
                   <div className="name">{p.name}</div>
@@ -389,11 +393,23 @@ export function App() {
             className={showSettings ? 'primary' : ''}
             onClick={() => {
               setShowSettings(true);
+              setShowEvidence(false);
               setError(null);
             }}
           >
             ⚙ 设置 · API
             {enabledModelCount === 0 && <span style={{ color: 'var(--state-warning-fg)' }}> ⚠</span>}
+          </button>
+          <button
+            className={showEvidence ? 'primary' : ''}
+            onClick={() => {
+              setShowEvidence(true);
+              setShowSettings(false);
+              setError(null);
+            }}
+            title="跨 Run 证据聚合（观察性事实，不构成 A/B 结论）"
+          >
+            📊 证据
           </button>
           <button
             disabled={!canShowFiles || coreStatus !== 'READY'}
@@ -443,7 +459,9 @@ export function App() {
               aria-disabled={coreStatus !== 'READY'}
               style={{ border: 0, margin: 0, padding: 0, minInlineSize: 0 }}
             >
-              {showSettings ? (
+              {showEvidence ? (
+                <EvidenceView onError={(message, detail) => setError({ message, detail })} />
+              ) : showSettings ? (
                 <SettingsView
                   checks={checks}
                   profiles={modelProfiles}
