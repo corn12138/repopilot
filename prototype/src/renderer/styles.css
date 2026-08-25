@@ -1771,3 +1771,105 @@ select:focus-visible {
   overflow: hidden;
 }
 .codeview .cm-editor { height: 100%; }
+
+/* ---------------------------------------------------------------------------
+ * P0 降噪（交互评审 2026-08-25）：列表层状态点、历史折叠、首屏折叠区。
+ * 状态点做色 + 形双编码（PRD-NFR-ACC-001：状态不能只依赖颜色）：
+ * 正常终态/进行中 = 实心圆；失败类 = 实心方；中断类 = 空心圆；待人决定另带文字 chip。
+ * ------------------------------------------------------------------------- */
+.run-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.run-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.run-dot.ok { background: var(--state-verified-fg); }
+.run-dot.info { background: var(--accent-interactive); }
+.run-dot.purple { background: var(--state-unknown-fg); }
+.run-dot.err {
+  background: var(--state-failed-fg);
+  border-radius: 1.5px; /* 方形：与成功的圆形做形状区分，不只靠红绿 */
+}
+.run-dot.warn {
+  background: transparent;
+  border: 1.5px solid var(--state-warning-fg); /* 空心：中断/未验证类 */
+}
+.run-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.run-await {
+  flex: none;
+  font-size: 10px;
+  color: var(--state-unknown-fg);
+  border: 1px solid var(--state-unknown-tint-border);
+  background: var(--state-unknown-tint-bg);
+  border-radius: 5px;
+  padding: 0 5px;
+}
+.run-time {
+  flex: none;
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+.run-history {
+  margin: 2px 0 4px;
+}
+.run-history > summary {
+  cursor: pointer;
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+  padding: 3px 9px 3px 20px;
+  list-style-position: inside;
+}
+.run-history > summary:hover { color: var(--text-secondary); }
+
+.notice-fold,
+.import-details {
+  margin-top: 10px;
+}
+.notice-fold > summary,
+.import-details > summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  padding: 6px 10px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  user-select: none;
+}
+.notice-fold[open] > summary,
+.import-details[open] > summary {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.notice-fold > summary:hover,
+.import-details > summary:hover { color: var(--text-primary); }
+.notice-fold-err {
+  margin-left: 8px;
+  font-size: 10.5px;
+  color: var(--state-failed-fg);
+}
+.notice-fold > .banner { margin-top: 0; margin-bottom: 1px; border-radius: 0; }
+.notice-fold > .banner:last-child { border-bottom-left-radius: 8px; border-bottom-right-radius: 8px; margin-bottom: 0; }
+.import-details > .kv,
+.import-details > .field {
+  border: 1px solid var(--border-hairline);
+  border-top: none;
+  border-bottom-left-radius: 8px;
+  border-bottom-right-radius: 8px;
+  padding: 10px 12px;
+  margin: 0;
+}
+.import-details > .kv { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.import-details > .field { margin-top: 0 !important; }

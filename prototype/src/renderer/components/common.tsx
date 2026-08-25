@@ -33,23 +33,45 @@ const RUN_STATUS_TEXT: Record<RunStatus, string> = {
   INTERRUPTED: '被打断',
 };
 
+/** 状态 → 色调。一处定义，Badge 与列表层状态点两处消费 —— 复制会漂移 */
+export function runStatusTone(status: RunStatus): 'ok' | 'warn' | 'err' | 'purple' | 'info' {
+  return status === 'SUCCEEDED'
+    ? 'ok'
+    : // 接受了但没验证 —— 视觉上必须与 SUCCEEDED 区分开
+      status === 'ACCEPTED_UNVERIFIED'
+      ? 'warn'
+      : status === 'FAILED' || status === 'TIMED_OUT'
+        ? 'err'
+        : status === 'BLOCKED' || status === 'CANCELLED' || status === 'INTERRUPTED'
+          ? 'warn'
+          : status === 'AWAITING_PLAN_APPROVAL' || status === 'AWAITING_PATCH_REVIEW'
+            ? 'purple'
+            : 'info';
+}
+
+export function runStatusText(status: RunStatus): string {
+  return RUN_STATUS_TEXT[status] ?? status;
+}
+
+/**
+ * 相对时间：只给列表层用（"多久之前"一眼可读）。
+ * 绝对时间仍在详情页 —— 相对时间是降噪手段，不是事实的替代。
+ */
+export function relativeTime(iso: string, now: number = Date.now()): string {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '';
+  const s = Math.max(0, Math.floor((now - t) / 1000));
+  if (s < 60) return '刚刚';
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  if (s < 7 * 86400) return `${Math.floor(s / 86400)} 天前`;
+  return iso.slice(5, 10);
+}
+
 export function RunStatusBadge({ status }: { status: RunStatus }) {
-  const tone =
-    status === 'SUCCEEDED'
-      ? 'ok'
-      : // 接受了但没验证 —— 视觉上必须与 SUCCEEDED 区分开
-        status === 'ACCEPTED_UNVERIFIED'
-        ? 'warn'
-        : status === 'FAILED' || status === 'TIMED_OUT'
-          ? 'err'
-          : status === 'BLOCKED' || status === 'CANCELLED' || status === 'INTERRUPTED'
-            ? 'warn'
-            : status === 'AWAITING_PLAN_APPROVAL' || status === 'AWAITING_PATCH_REVIEW'
-              ? 'purple'
-              : 'info';
   return (
     <span title={status}>
-      <Badge tone={tone}>{RUN_STATUS_TEXT[status] ?? status}</Badge>
+      <Badge tone={runStatusTone(status)}>{RUN_STATUS_TEXT[status] ?? status}</Badge>
     </span>
   );
 }

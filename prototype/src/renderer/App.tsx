@@ -13,7 +13,18 @@ import type {
 } from '@shared/domain';
 import { TERMINAL_RUN_STATUSES } from '@shared/domain';
 import { RequestError, call, setCoreEpoch, subscribe } from './bridge';
-import { Badge, Banner, Card, DoctorBadge, RestoredBadge, RunStatusBadge } from './components/common';
+import {
+  Badge,
+  Banner,
+  Card,
+  DoctorBadge,
+  RestoredBadge,
+  RunStatusBadge,
+  relativeTime,
+  runStatusText,
+  runStatusTone,
+} from './components/common';
+import { isTerminal } from '@shared/domain';
 import { isOwnedReady } from './ownedAsync';
 import { useApprovalAction, type ApprovalActionController } from './useApprovalAction';
 import { useStickToBottom } from './useStickToBottom';
@@ -387,21 +398,52 @@ export function App() {
                   <div className="name">{p.name}</div>
                   <div className="meta">{p.displayPath}</div>
                 </button>
-                {projectRuns.map((r) => (
-                  <button
-                    key={r.runId}
-                    disabled={coreStatus !== 'READY'}
-                    className={`run-item ${selectedRunId === r.runId ? 'active' : ''}`}
-                    onClick={() => openRun(r)}
-                    title={r.title}
-                  >
-                    <div className="row" style={{ gap: 6, marginBottom: 2 }}>
-                      <RunStatusBadge status={r.status} />
-                      <RestoredBadge run={r} />
-                    </div>
-                    <div className="title">{r.title || r.runId}</div>
-                  </button>
-                ))}
+                {(() => {
+                  /*
+                   * 列表层降噪（交互评审 P0-#1）：一行 = 状态点 + 标题 + 相对时间。
+                   * 证据徽章（状态落后于事件 / 损坏）移到详情页头部 —— 移动，不是删除；
+                   * 行内保留在 title 提示与 aria-label 里，可及性不因降噪而降级。
+                   * 待人决定的状态额外带文字 chip：等用户的东西不允许只靠颜色。
+                   */
+                  const runRow = (r: RunView) => {
+                    const evidenceNote =
+                      r.evidence === 'DAMAGED' ? '证据损坏' : r.evidence === 'EVENTS_AHEAD' ? '状态落后于事件' : null;
+                    const awaiting = r.status === 'AWAITING_PLAN_APPROVAL' || r.status === 'AWAITING_PATCH_REVIEW';
+                    const label = `${runStatusText(r.status)}${evidenceNote ? `｜${evidenceNote}` : ''}｜${r.title || r.runId}`;
+                    return (
+                      <button
+                        key={r.runId}
+                        disabled={coreStatus !== 'READY'}
+                        className={`run-item ${selectedRunId === r.runId ? 'active' : ''}`}
+                        onClick={() => openRun(r)}
+                        title={label}
+                        aria-label={label}
+                      >
+                        <span className={`run-dot ${runStatusTone(r.status)}`} aria-hidden="true" />
+                        <span className="run-title">{r.title || r.runId}</span>
+                        {awaiting && <span className="run-await">待你决定</span>}
+                        <span className="run-time">{relativeTime(r.updatedAt)}</span>
+                      </button>
+                    );
+                  };
+                  const activeRuns = projectRuns.filter((r) => !isTerminal(r.status));
+                  const doneRuns = projectRuns.filter((r) => isTerminal(r.status));
+                  const recentDone = doneRuns.slice(0, 5);
+                  const olderDone = doneRuns.slice(5);
+                  return (
+                    <>
+                      {activeRuns.map(runRow)}
+                      {recentDone.map(runRow)}
+                      {olderDone.length > 0 && (
+                        // 折叠 + 报数 = 合规省略：更早的终态 Run 收起，但数量如实
+                        <details className="run-history">
+                          <summary>更早的 {olderDone.length} 条</summary>
+                          {olderDone.map(runRow)}
+                        </details>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
             );
           })}
@@ -744,6 +786,8 @@ function ChatHead({ run, events }: { run: RunView; events: RunEvent[] }) {
   return (
     <div className="chat-head">
       <RunStatusBadge status={run.status} />
+      {/* 证据状态从列表层移到这里 —— 详情页是它的层级归属（交互评审 P0-#1） */}
+      <RestoredBadge run={run} />
       <span className="chat-head-title" title={run.runId}>
         {run.title || run.runId}
       </span>
@@ -1094,82 +1138,131 @@ function SnapshotPanel({
         {profile.supportStatus === 'VERIFIED' && <Badge tone="purple">首切片标准形态</Badge>}
       </div>
 
-      <dl className="kv">
-        <dt>base</dt>
-        <dd>
-          {snapshot.baseKind === 'NO_VCS'
-            ? '（不在 git 管理下）'
-            : `${snapshot.baseSha.slice(0, 12)} (${snapshot.branch})${
-                snapshot.baseKind === 'DIRTY_WORKTREE' ? ' + 未提交改动' : ''
-              }`}
-        </dd>
-        <dt>tree digest</dt>
-        <dd>{snapshot.treeDigest.slice(0, 26)}…</dd>
-        <dt>检测信号</dt>
-        <dd>{profile.detectedSignals.join(', ') || '（无）'}</dd>
-        <dt>可用命令</dt>
-        <dd>
-          {Object.values(profile.commands)
-            .map((c) => `${c.commandId} → ${c.label}`)
-            .join('  |  ') || '（无，可在创建任务时自己填）'}
-        </dd>
-        <dt>排除文件</dt>
-        <dd>
-          <ExcludedSummary excluded={snapshot.excludedPaths} />
-        </dd>
-        <dt>未跟踪文件</dt>
-        <dd>
-          {snapshot.untrackedCount === 0
-            ? '0 个'
-            : `${snapshot.untrackedCount} 个 —— 一个都没进快照（快照只含 tracked 文件）`}
-        </dd>
-      </dl>
-
-      {snapshot.untrackedCount > 0 && (
-        <Banner tone="warn">
-          导入范围内有 {snapshot.untrackedCount} 个未跟踪文件，它们**没有**进入快照。
-          如果你要修的改动在这些文件里，先 <code>git add</code> 再重新导入 —— 否则 Agent
-          看不到它们，基于这份快照产生的补丁也不会包含它们。
-        </Banner>
-      )}
-
       {/*
-        形态层面的缺席各自一条：LFS / 子模块 / 未检出 / 大小写碰撞的下一步动作完全不同，
-        合并成一句"共排除 N 个"等于什么也没说。LFS 单独用 err 色 —— 它是唯一一条
-        会破坏用户真实仓库的形态（指针被当源码改，补丁在宿主上 apply 会成功）。
+        首屏摘要化（交互评审 P0-#3/#4）：上面的徽章行回答"这是什么、能验证什么"；
+        警示合并进「注意事项（N）」折叠条 —— 折叠 + 报数 = 合规省略，原文一字不少；
+        含 err 级（LFS / 枚举截断）时默认展开：必须处理的事不许被收起来藏住。
+        digest / 检测信号 / 排除清单 / 导入范围是导入审计报告，收进「导入详情」。
       */}
-      {SHAPE_BANNERS.map(({ reason, tone, text }) => {
-        const hits = snapshot.excludedPaths.filter((e) => e.reason === reason);
-        if (hits.length === 0) return null;
+      {(() => {
+        const notices: { key: string; tone: 'warn' | 'err'; body: React.ReactNode }[] = [];
+        if (snapshot.untrackedCount > 0) {
+          notices.push({
+            key: 'untracked',
+            tone: 'warn',
+            body: (
+              <>
+                导入范围内有 {snapshot.untrackedCount} 个未跟踪文件，它们**没有**进入快照。
+                如果你要修的改动在这些文件里，先 <code>git add</code> 再重新导入 —— 否则 Agent
+                看不到它们，基于这份快照产生的补丁也不会包含它们。
+              </>
+            ),
+          });
+        }
+        /*
+          形态层面的缺席各自一条：LFS / 子模块 / 未检出 / 大小写碰撞的下一步动作完全不同，
+          合并成一句"共排除 N 个"等于什么也没说。LFS 单独用 err 色 —— 它是唯一一条
+          会破坏用户真实仓库的形态（指针被当源码改，补丁在宿主上 apply 会成功）。
+        */
+        for (const { reason, tone, text } of SHAPE_BANNERS) {
+          const hits = snapshot.excludedPaths.filter((e) => e.reason === reason);
+          if (hits.length === 0) continue;
+          notices.push({
+            key: reason,
+            tone,
+            body: (
+              <>
+                <b>{hits.length} 项</b>因「{EXCLUSION_LABEL[reason]}」未进入快照（例如{' '}
+                <code>{hits.slice(0, 3).map((e) => e.path).join('、')}</code>
+                {hits.length > 3 ? ' 等' : ''}）。{text}
+              </>
+            ),
+          });
+        }
+        if (snapshot.excludedPaths.some((e) => e.reason === 'ENUMERATION_TRUNCATED')) {
+          notices.push({
+            key: 'truncated',
+            tone: 'err',
+            body: (
+              <>
+                文件枚举在上限处被截断，这份快照**不完整**。fileCount、tree digest
+                与给模型的仓库信息都只反映被收进来的那一部分。
+              </>
+            ),
+          });
+        }
+        if (snapshot.baseKind !== 'CLEAN_COMMIT') {
+          notices.push({
+            key: 'base',
+            tone: 'warn',
+            body: (
+              <>
+                {snapshot.baseKind === 'NO_VCS'
+                  ? '该项目不在版本控制下：基线是导入当时的目录内容，没有可回溯的 commit。'
+                  : `基线是工作区快照而非干净 commit。补丁依然可验证，但别人无法从 ${snapshot.baseSha.slice(0, 12)} 重建出同样的 base。`}
+              </>
+            ),
+          });
+        }
+        if (notices.length === 0) return null;
+        const hasErr = notices.some((n) => n.tone === 'err');
         return (
-          <Banner key={reason} tone={tone}>
-            <b>{hits.length} 项</b>因「{EXCLUSION_LABEL[reason]}」未进入快照（例如{' '}
-            <code>{hits.slice(0, 3).map((e) => e.path).join('、')}</code>
-            {hits.length > 3 ? ' 等' : ''}）。{text}
-          </Banner>
+          <details className="notice-fold" open={hasErr} data-testid="snapshot-notices">
+            <summary>
+              注意事项（{notices.length}）
+              {hasErr && <span className="notice-fold-err">含必须处理项</span>}
+            </summary>
+            {notices.map((n) => (
+              <Banner key={n.key} tone={n.tone}>
+                {n.body}
+              </Banner>
+            ))}
+          </details>
         );
-      })}
+      })()}
 
-      {snapshot.excludedPaths.some((e) => e.reason === 'ENUMERATION_TRUNCATED') && (
-        <Banner tone="err">
-          文件枚举在上限处被截断，这份快照**不完整**。fileCount、tree digest
-          与给模型的仓库信息都只反映被收进来的那一部分。
-        </Banner>
-      )}
-
-      {snapshot.baseKind !== 'CLEAN_COMMIT' && (
-        <Banner tone="warn">
-          {snapshot.baseKind === 'NO_VCS'
-            ? '该项目不在版本控制下：基线是导入当时的目录内容，没有可回溯的 commit。'
-            : `基线是工作区快照而非干净 commit。补丁依然可验证，但别人无法从 ${snapshot.baseSha.slice(0, 12)} 重建出同样的 base。`}
-        </Banner>
-      )}
-
-      <SubPackagePicker
-        candidates={candidates}
-        current={snapshot.subPath}
-        onPick={(subPath) => onImport({ subPath })}
-      />
+      <details className="import-details" data-testid="import-details">
+        <summary>
+          导入详情 · base{' '}
+          {snapshot.baseKind === 'NO_VCS' ? '（无 VCS）' : snapshot.baseSha.slice(0, 12)} ·{' '}
+          {commandCount} 个命令
+        </summary>
+        <dl className="kv">
+          <dt>base</dt>
+          <dd>
+            {snapshot.baseKind === 'NO_VCS'
+              ? '（不在 git 管理下）'
+              : `${snapshot.baseSha.slice(0, 12)} (${snapshot.branch})${
+                  snapshot.baseKind === 'DIRTY_WORKTREE' ? ' + 未提交改动' : ''
+                }`}
+          </dd>
+          <dt>tree digest</dt>
+          <dd>{snapshot.treeDigest.slice(0, 26)}…</dd>
+          <dt>检测信号</dt>
+          <dd>{profile.detectedSignals.join(', ') || '（无）'}</dd>
+          <dt>可用命令</dt>
+          <dd>
+            {Object.values(profile.commands)
+              .map((c) => `${c.commandId} → ${c.label}`)
+              .join('  |  ') || '（无，可在创建任务时自己填）'}
+          </dd>
+          <dt>排除文件</dt>
+          <dd>
+            <ExcludedSummary excluded={snapshot.excludedPaths} />
+          </dd>
+          <dt>未跟踪文件</dt>
+          <dd>
+            {snapshot.untrackedCount === 0
+              ? '0 个'
+              : `${snapshot.untrackedCount} 个 —— 一个都没进快照（快照只含 tracked 文件）`}
+          </dd>
+        </dl>
+        <SubPackagePicker
+          candidates={candidates}
+          current={snapshot.subPath}
+          onPick={(subPath) => onImport({ subPath })}
+        />
+      </details>
     </Card>
   );
 }

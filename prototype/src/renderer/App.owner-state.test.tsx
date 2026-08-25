@@ -411,12 +411,12 @@ describe('App owner-bound async rendering', () => {
 
     render(<App />);
     act(() => bridge.push({ type: 'core.status', status: 'READY', detail: 'ready', epoch: 1 }));
-    fireEvent.click(await screen.findByTitle('Run A'));
+    fireEvent.click(await screen.findByTitle(/｜Run A$/));
     expect(await screen.findByText('A secret plan')).toBeTruthy();
     expect(screen.getAllByRole('button', { name: '批准并执行' }).length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getByRole('button', { name: '刷新' }));
-    fireEvent.click(screen.getByTitle('Run B'));
+    fireEvent.click(screen.getByTitle(/｜Run B$/));
 
     const loading = await screen.findByRole('status');
     expect(loading.getAttribute('aria-busy')).toBe('true');
@@ -475,7 +475,7 @@ describe('App owner-bound async rendering', () => {
 
     render(<App />);
     act(() => bridge.push({ type: 'core.status', status: 'READY', detail: 'ready', epoch: 1 }));
-    fireEvent.click(await screen.findByTitle('File Owner Run'));
+    fireEvent.click(await screen.findByTitle(/｜File Owner Run$/));
     expect(await screen.findByText('历史快照计划')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /文件/ }));
 
@@ -514,7 +514,7 @@ describe('App owner-bound async rendering', () => {
 
     render(<App />);
     act(() => bridge.push({ type: 'core.status', status: 'READY', detail: 'ready', epoch: 1 }));
-    fireEvent.click(await screen.findByTitle('Approval Run'));
+    fireEvent.click(await screen.findByTitle(/｜Approval Run$/));
     expect(await screen.findByText('共享审批计划')).toBeTruthy();
     expect(screen.getAllByRole('button', { name: '批准并执行' })).toHaveLength(2);
 
@@ -584,7 +584,7 @@ describe('App 时间线跟随', () => {
 
     render(<App />);
     act(() => bridge.push({ type: 'core.status', status: 'READY', detail: 'ready', epoch: 1 }));
-    fireEvent.click(await screen.findByTitle('Follow Run'));
+    fireEvent.click(await screen.findByTitle(/｜Follow Run$/));
     await screen.findByText('第一条事件');
 
     const scroller = document.querySelector('.chat-scroll');
