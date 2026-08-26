@@ -79,6 +79,9 @@ export function App() {
   /** 设置页作为一个独立视图，而不是"没选项目时的兜底" */
   const [showSettings, setShowSettings] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
+  // 设置与证据都是全屏视图：选中 Run 的顶栏/新事件提示/审批停靠条/Composer 一律让位。
+  // 只判 showSettings 会让证据页下仍可发任务、批准计划（交互评审 v0.2 N1）。
+  const fullScreenView = showSettings || showEvidence;
 
   const coreStatusRef = useRef(coreStatus);
   coreStatusRef.current = coreStatus;
@@ -499,7 +502,7 @@ export function App() {
       </aside>
 
       <main className="main">
-        {!showSettings && selectedRun && (
+        {!fullScreenView && selectedRun && (
           <ChatHead
             key={`chat-${selectedRun.runId}`}
             run={selectedRun}
@@ -588,7 +591,7 @@ export function App() {
           离底阅读时不抢滚动，只告诉用户积压了多少条。role=status 让它被播报，
           按钮本身是真按钮，因此 Tab / Enter / Space 与点击是同一条路径。
         */}
-        {!showSettings && selectedRun && follow.pendingCount > 0 && (
+        {!fullScreenView && selectedRun && follow.pendingCount > 0 && (
           <div className="follow-nudge" role="status" aria-live="polite">
             {/* 外层高度为 0，内层绝对定位 —— 提示出现和消失都不推动时间线或停靠条。 */}
             <div className="follow-nudge-inner">
@@ -600,7 +603,7 @@ export function App() {
         )}
 
         {/* 审批停靠条：等用户的决定永远压在可视区，不随时间线滚走 */}
-        {!showSettings && selectedRun && selectedRunDetail && coreStatus === 'READY' && (
+        {!fullScreenView && selectedRun && selectedRunDetail && coreStatus === 'READY' && (
           <ApprovalDock
             key={`dock-${selectedRun.runId}`}
             run={selectedRun}
@@ -611,7 +614,7 @@ export function App() {
           />
         )}
 
-        {!showSettings && selectedProject && importedProject && (
+        {!fullScreenView && selectedProject && importedProject && (
           <fieldset
             disabled={coreStatus !== 'READY'}
             aria-disabled={coreStatus !== 'READY'}
