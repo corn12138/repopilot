@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from 'vitest';
-import { relativeTime, runStatusText, runStatusTone } from './common';
+import { afterEach, describe, expect, it } from 'vitest';
+import { cleanup, render, screen } from '@testing-library/react';
+import { relativeTime, RestoredBadge, runStatusText, runStatusTone } from './common';
 
 describe('relativeTime：列表层的"多久之前"', () => {
   const now = Date.parse('2026-08-25T12:00:00.000Z');
@@ -40,5 +41,27 @@ describe('runStatusTone：与 RunStatusBadge 同一映射（一处定义两处�
 describe('runStatusText', () => {
   it('未知状态原样返回，不静默替换成别的文案', () => {
     expect(runStatusText('SOME_FUTURE_STATUS' as never)).toBe('SOME_FUTURE_STATUS');
+  });
+});
+
+describe('RestoredBadge：恢复 Run 的"落后一拍"不再常开黄牌（交互评审 v0.2 N4）', () => {
+  afterEach(() => cleanup());
+
+  it('restored + EVENTS_AHEAD → 信息级「已从磁盘恢复」，落后细节进 title', () => {
+    render(<RestoredBadge run={{ restored: true, evidence: 'EVENTS_AHEAD' }} />);
+    expect(screen.getByText('已从磁盘恢复')).toBeTruthy();
+    expect(screen.queryByText('状态落后于事件')).toBeNull();
+    expect(screen.getByTitle(/以时间线为准/)).toBeTruthy();
+  });
+
+  it('未恢复（可能还活着）的 EVENTS_AHEAD 仍是黄牌 —— 降级只给设计内常态', () => {
+    render(<RestoredBadge run={{ restored: false, evidence: 'EVENTS_AHEAD' }} />);
+    expect(screen.getByText('状态落后于事件')).toBeTruthy();
+  });
+
+  it('证据损坏永远是红牌，恢复与否都不降级', () => {
+    render(<RestoredBadge run={{ restored: true, evidence: 'DAMAGED' }} />);
+    expect(screen.getByText('证据损坏')).toBeTruthy();
+    expect(screen.queryByText('已从磁盘恢复')).toBeNull();
   });
 });

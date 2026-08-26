@@ -95,7 +95,18 @@ export function ResolutionBadge({ resolution }: { resolution: ToolCallResolution
 /** 恢复态与证据完整性徽标。两者都必须一眼可见，否则用户会把只读当成能续跑。 */
 export function RestoredBadge({ run }: { run: { restored: boolean; evidence: string } }) {
   if (run.evidence === 'DAMAGED') return <Badge tone="err">证据损坏</Badge>;
-  if (run.evidence === 'EVENTS_AHEAD') return <Badge tone="warn">状态落后于事件</Badge>;
+  if (run.evidence === 'EVENTS_AHEAD') {
+    // 恢复的 Run 落后一拍是设计内常态：主导事实是「从磁盘恢复」，落后细节进
+    // title 与详情页说明。常开的黄徽章会让真警报失去信号（交互评审 v0.2 N4）。
+    if (run.restored) {
+      return (
+        <span title="状态快照落后于事件流（详情页有说明）；时间线完整，以时间线为准">
+          <Badge tone="info">已从磁盘恢复</Badge>
+        </span>
+      );
+    }
+    return <Badge tone="warn">状态落后于事件</Badge>;
+  }
   if (run.restored) return <Badge tone="info">已从磁盘恢复</Badge>;
   return null;
 }

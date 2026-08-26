@@ -1634,6 +1634,23 @@ select:focus-visible {
 }
 
 /* 数据出站面板：发出去的与被拦下的并列；拦下的一行带警示色边 */
+/* 卡内安静折叠：数据出站明细 / 省略明细 —— 报数常驻在外，细节点开（交互评审 v0.2 N3/N5） */
+.egress-details > summary,
+.transcript-omissions-detail > summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  user-select: none;
+}
+.egress-details > summary:hover,
+.transcript-omissions-detail > summary:hover {
+  color: var(--text-primary);
+}
+.egress-details[open] > summary,
+.transcript-omissions-detail[open] > summary {
+  margin-bottom: 8px;
+}
+
 .egress-consent {
   margin-bottom: 10px;
 }

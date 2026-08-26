@@ -151,21 +151,30 @@ function OmissionNotice({
           </button>
         )}
       </div>
-      {omitted.length > 0 && (
-        <ul className="transcript-omissions-list">
-          {omitted.map((o) => (
-            <li key={o.key}>
-              {o.count} 条 · {o.reason}
-              {!o.recoverable && <span className="transcript-omissions-hard">（正文不可恢复）</span>}
-            </li>
-          ))}
-        </ul>
-      )}
-      {mergedTotal > 0 && (
-        <div className="transcript-omissions-merged">
-          另有 {mergedTotal} 条事件没有单独成行，但内容已并入对应的行或卡片：
-          {merged.map((o) => o.reason).join('；')}
-        </div>
+      {/*
+        报数常驻一行，分类明细收进展开层（交互评审 v0.2 N5）——
+        解释"省略了什么"的文字不应该比被省略的内容更占注意力。
+      */}
+      {(omitted.length > 0 || mergedTotal > 0) && (
+        <details className="transcript-omissions-detail">
+          <summary>省略明细</summary>
+          {omitted.length > 0 && (
+            <ul className="transcript-omissions-list">
+              {omitted.map((o) => (
+                <li key={o.key}>
+                  {o.count} 条 · {o.reason}
+                  {!o.recoverable && <span className="transcript-omissions-hard">（正文不可恢复）</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {mergedTotal > 0 && (
+            <div className="transcript-omissions-merged">
+              另有 {mergedTotal} 条事件没有单独成行，但内容已并入对应的行或卡片：
+              {merged.map((o) => o.reason).join('；')}
+            </div>
+          )}
+        </details>
       )}
     </div>
   );
@@ -534,12 +543,18 @@ function TurnBlock({ item }: { item: Extract<Item, { kind: 'turn' }> }) {
     .filter(Boolean);
   const summary = names.length > 0 ? [...new Set(names)].join(' / ') : '没有工具调用';
 
+  // 「deepseek-v4-pro (in=12938 out=1485)」：行上留模型名，per-call token 计量
+  // 进 title（交互评审 v0.2 N5）—— 总量在用量面板，逐笔在数据出站，这里不再第三遍。
+  const meter = /^(.*?)\s*\((in=.*?)\)\s*$/.exec(item.detail);
+  const detailText = meter ? meter[1]! : item.detail;
+  const detailTitle = meter ? `${meter[1]!} · ${meter[2]!}` : undefined;
+
   return (
     <details className="turn" open={failed > 0}>
       <summary className="turn-head">
         <span className="turn-index">#{item.index}</span>
         <span className="turn-purpose">{item.purpose}</span>
-        <span className="turn-detail">{item.detail}</span>
+        <span className="turn-detail" title={detailTitle}>{detailText}</span>
         <span className="spacer" />
         {calls.length > 0 && (
           <span className={`turn-count ${failed > 0 ? 'bad' : ''}`}>

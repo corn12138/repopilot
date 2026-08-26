@@ -282,3 +282,45 @@ describe('ATTEMPT_STARTED：新一次尝试是看得见的分隔', () => {
     expect(screen.getByText('src/two.ts')).toBeTruthy();
   });
 });
+
+describe('详情页降噪（交互评审 v0.2 N5）：报数常驻，计量与明细各退一层', () => {
+  afterEach(() => {
+    seq = 0;
+    cleanup();
+  });
+
+  it('轮次行的 per-call token 收进 title，行上留模型名', () => {
+    const events = [event('MODEL_INVOCATION', 'PLANNING 调用 deepseek-v4-pro (in=12938 out=1485)')];
+    render(<Transcript events={events} toolCalls={[]} />);
+
+    // 行上不再有第三遍 token 计量（总量在用量面板，逐笔在数据出站）
+    expect(screen.queryByText(/in=12938/)).toBeNull();
+    const detail = screen.getByText('deepseek-v4-pro');
+    expect(detail.getAttribute('title')).toContain('in=12938 out=1485');
+  });
+
+  it('没有 token 后缀的轮次行原样保留，不误伤', () => {
+    const events = [event('MODEL_INVOCATION', 'PLANNING 调用 本地模型')];
+    render(<Transcript events={events} toolCalls={[]} />);
+    const detail = screen.getByText('本地模型');
+    expect(detail.getAttribute('title')).toBeNull();
+  });
+
+  it('省略披露：报数一行常驻，分类明细收进「省略明细」折叠层且默认收起', () => {
+    const events = [
+      event('RUN_CREATED', '任务已创建'),
+      event('STATUS_CHANGED', '进入规划', { to: 'PLANNING' }),
+      event('STATUS_CHANGED', '进入执行', { to: 'EXECUTING' }),
+      event('STATUS_CHANGED', '进入验证', { to: 'VERIFYING' }),
+    ];
+    render(<Transcript events={events} toolCalls={[]} />);
+
+    // 报数在折叠层外，一直可见
+    expect(screen.getByText('时间线省略了 3 条事件')).toBeTruthy();
+    const fold = screen.getByText('省略明细').closest('details')!;
+    expect(fold.open).toBe(false);
+    // 明细仍在 DOM（降层级不删事实），展开按钮也仍在折叠层外
+    expect(screen.getByText(/常规阶段流转/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: '展开这 3 条' })).toBeTruthy();
+  });
+});

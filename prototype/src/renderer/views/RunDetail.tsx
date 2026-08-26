@@ -18,8 +18,6 @@ import {
   Banner,
   Card,
   DiffView,
-  RestoredBadge,
-  RunStatusBadge,
   timeOf,
 } from '../components/common';
 import {
@@ -133,7 +131,7 @@ export function RunDetail({
     <div className="rp-enter">
       <Card
         title="运行"
-        hint={run.runId}
+        hint={`${run.runId} · gen-${run.workspaceGeneration}`}
         right={
           <div className="row">
             <button onClick={onRefresh}>刷新</button>
@@ -161,24 +159,16 @@ export function RunDetail({
             </Banner>
           </div>
         )}
-        <div className="row wrap" style={{ marginBottom: 12 }}>
-          <RunStatusBadge status={run.status} />
-          {run.failureClass && <FailureClassBadge failureClass={run.failureClass} />}
-          <RestoredBadge run={run} />
-          <Badge>gen-{run.workspaceGeneration}</Badge>
-          <Badge>模型轮次 {run.ledger.modelTurns}/{run.limits.maxModelTurns}</Badge>
-          <Badge>工具调用 {run.ledger.toolCalls}/{run.limits.maxToolCalls}</Badge>
-          <Badge>自修复 {run.ledger.selfFixRounds}/{run.limits.maxSelfFixRounds}</Badge>
-          <Badge>
-            token {run.ledger.inputTokens + run.ledger.outputTokens}/{run.limits.maxTotalTokens}
-          </Badge>
-          {(run.ledger.unknownUsageTurns ?? 0) > 0 && (
-            <span title="这些轮次 provider 没有回报用量，上面的 token 数没有把它们算进去 —— 未知不折算成 0">
-              <Badge tone="warn">{run.ledger.unknownUsageTurns} 轮用量未知</Badge>
-            </span>
-          )}
-          <Badge>{Math.round(run.ledger.elapsedMs / 1000)}s</Badge>
-        </div>
+        {/*
+          每个事实只有一个主场（交互评审 v0.2 N2）：状态与证据徽章归 ChatHead，
+          四项 m/n 计量与墙钟归用量面板（顶栏用量 chip 点开），gen 收进卡片 hint。
+          这张卡只保留别处没有的判定：失败归类。
+        */}
+        {run.failureClass && (
+          <div className="row wrap" style={{ marginBottom: 12 }}>
+            <FailureClassBadge failureClass={run.failureClass} />
+          </div>
+        )}
 
         {run.evidence === 'DAMAGED' && (
           <Banner tone="err">
@@ -190,7 +180,12 @@ export function RunDetail({
             </div>
           </Banner>
         )}
-        {run.evidence === 'EVENTS_AHEAD' && (
+        {/*
+          恢复的 Run 落后一拍是设计内的正常终局，不是警报（交互评审 v0.2 N4）：
+          黄色横幅只留给"活动 Run 真的落后了"；恢复态的落后细节并入恢复说明，
+          seq 数字保留在小字里 —— 降层级，不删事实。
+        */}
+        {run.evidence === 'EVENTS_AHEAD' && !run.restored && (
           <Banner tone="warn">
             <strong>状态快照落后于事件流。</strong>
             {run.evidenceDetail && <div style={{ marginTop: 4 }}>{run.evidenceDetail}</div>}
@@ -199,13 +194,19 @@ export function RunDetail({
             </div>
           </Banner>
         )}
-        {run.restored && run.evidence === 'INTACT' && (
+        {run.restored && run.evidence !== 'DAMAGED' && (
           <Banner tone="info">
             该 Run 是从磁盘恢复的。历史、验证记录和补丁都是真的，
             {run.status === 'AWAITING_PATCH_REVIEW'
               ? '补丁仍可接受与导出（这不需要运行中的执行器）。'
               : '但没有运行中的执行器，不能续跑。'}
             工作区文件树不可用 —— 那份隔离副本随进程一起结束了。
+            {run.evidence === 'EVENTS_AHEAD' && (
+              <div style={{ marginTop: 6, fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                状态快照停在事件流之前{run.evidenceDetail ? `（${run.evidenceDetail}）` : ''}——
+                时间线是完整的，以时间线为准。
+              </div>
+            )}
           </Banner>
         )}
 
@@ -996,8 +997,23 @@ function EgressPanel({ events }: { events: RunEvent[] }) {
   const sentCount = rows.filter((r) => r.sent).length;
   const blockedCount = rows.filter((r) => r.sent === false).length;
 
+  /*
+   * 报数常驻卡片头，逐笔明细默认收起（交互评审 v0.2 N3）：同样这些调用在
+   * 「对话」卡里已按轮呈现，这里是审计账本，不是每次打开详情的默认视野。
+   * 0 笔且无同意记录时不成卡 —— 报数仍在，一行说清。
+   */
+  if (rows.length === 0 && !consent) {
+    return (
+      <div className="help" style={{ padding: '4px 2px' }}>
+        数据出站 · 0 次 —— 这个 Run 没有任何出站记录，也没有出站同意（早于该合同的历史 Run）。
+      </div>
+    );
+  }
+
   return (
     <Card title="数据出站" hint={`${sentCount} 次已发出 · ${blockedCount} 次未发出`}>
+      <details className="egress-details">
+        <summary>出站同意与逐笔明细</summary>
       {consent ? (
         <div className="egress-consent" data-testid="egress-consent">
           <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
@@ -1031,6 +1047,7 @@ function EgressPanel({ events }: { events: RunEvent[] }) {
           ))}
         </div>
       )}
+      </details>
     </Card>
   );
 }

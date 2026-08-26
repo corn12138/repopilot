@@ -522,3 +522,99 @@ describe('REQUEST_CHANGES 的界面：历史补丁看得见，恢复态开不了
     expect(request.title).toContain('预算与本次共用');
   });
 });
+
+describe('详情页降噪（交互评审 v0.2 N2/N3/N4）：每个事实只有一个主场', () => {
+  beforeEach(() => {
+    requestMock.mockReset();
+    requestMock.mockImplementation(async () => ({ crossReview: null }));
+  });
+  afterEach(() => cleanup());
+
+  function renderDetail(run: RunView, events: unknown[] = []) {
+    return render(
+      <RunDetail
+        run={run}
+        events={events as never}
+        toolCalls={[]}
+        approvals={[]}
+        plan={null}
+        patch={null}
+        priorPatches={[]}
+        verifications={[]}
+        approvalAction={{
+          ownerRunId: run.runId,
+          pending: [],
+          error: null,
+          isPending: () => false,
+          decide: vi.fn(async () => false),
+          retry: vi.fn(async () => false),
+          clearError: vi.fn(),
+        } satisfies ApprovalActionController}
+        onError={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+  }
+
+  it('运行卡不再重复状态徽章与 m/n 计量（它们的主场是顶栏与用量面板），gen 收进 hint', () => {
+    renderDetail(makeRun('run-quiet', 'FAILED'));
+    expect(screen.queryByText(/模型轮次/)).toBeNull();
+    expect(screen.queryByText(/自修复/)).toBeNull();
+    expect(screen.queryByText('失败')).toBeNull(); // 状态徽章在 ChatHead，不在卡上
+    expect(screen.getByText('run-quiet · gen-1')).toBeTruthy();
+  });
+
+  it('恢复 Run 的"落后一拍"不再是黄色横幅：并入恢复说明，seq 细节保留', () => {
+    renderDetail({
+      ...makeRun('run-rest', 'FAILED'),
+      restored: true,
+      evidence: 'EVENTS_AHEAD',
+      evidenceDetail: '事件流已到 seq 94，状态快照停在 seq 93',
+    });
+    expect(screen.queryByText('状态快照落后于事件流。')).toBeNull();
+    expect(screen.getByText(/以时间线为准/)).toBeTruthy();
+    expect(screen.getByText(/seq 94/)).toBeTruthy(); // 报数不删，只降层级
+  });
+
+  it('未恢复（可能还活着）的 EVENTS_AHEAD 仍然黄色横幅告警', () => {
+    renderDetail({ ...makeRun('run-live', 'EXECUTING'), evidence: 'EVENTS_AHEAD' });
+    expect(screen.getByText('状态快照落后于事件流。')).toBeTruthy();
+  });
+
+  it('0 笔出站且无同意记录：不成卡，一行报数说清', () => {
+    renderDetail(makeRun('run-empty', 'FAILED'));
+    expect(screen.queryByText('数据出站')).toBeNull(); // 卡片标题不在
+    expect(screen.getByText(/数据出站 · 0 次/)).toBeTruthy(); // 报数仍在
+  });
+
+  it('有出站时：报数在卡片头常驻，逐笔明细默认收在「出站同意与逐笔明细」里', () => {
+    const run = makeRun('run-rows', 'FAILED');
+    renderDetail(run, [
+      {
+        runId: run.runId,
+        attemptId: run.attemptId,
+        at: '2026-08-19T00:00:00.000Z',
+        seq: 1,
+        kind: 'MODEL_INVOCATION',
+        summary: 'PLANNING 调用',
+        payload: {
+          manifest: {
+            purpose: 'PLANNING',
+            providerId: 'deepseek',
+            modelId: 'deepseek-chat',
+            origin: 'https://api.deepseek.com/v1',
+            sent: true,
+            blockReason: null,
+            inputTokens: 120,
+            outputTokens: 45,
+            errorKind: null,
+          },
+        },
+      },
+    ]);
+    expect(screen.getByText(/1 次已发出 · 0 次未发出/)).toBeTruthy();
+    const fold = screen.getByText('出站同意与逐笔明细').closest('details')!;
+    expect(fold.open).toBe(false);
+    expect(screen.getByTestId('egress-rows')).toBeTruthy(); // 明细仍在 DOM，不删事实
+  });
+});
