@@ -24,6 +24,7 @@ type Item =
   | { kind: 'command'; seq: number; at: string; call: ToolCallView; outcome: CommandOutcome | null }
   | { kind: 'verify'; seq: number; at: string; phase: string; passed: boolean; commands: CommandOutcome[] }
   | { kind: 'status'; seq: number; at: string; text: string; tone: 'ok' | 'err' | 'warn' | 'info' }
+  | { kind: 'phase'; seq: number; at: string; label: string; text: string }
   /** 一轮模型思考 + 它引发的全部工具调用 */
   | {
       kind: 'turn';
@@ -61,8 +62,17 @@ interface Projection {
   readonly omissions: Omission[];
 }
 
-/** 常规阶段流转：默认折叠，因为它们不需要用户做任何决定。 */
-const ROUTINE_STATUS = new Set(['PLANNING', 'EXECUTING', 'VERIFYING']);
+/**
+ * 相位锚点（交互评审 v0.1 #6 / v0.2 P2）：进入规划/执行/验证/交叉审核不再是
+ * "被折叠的常规事件"，而是时间线的分组结构 —— 一条安静的分隔行，
+ * 让人一眼看出"现在读到的是哪个阶段"。原始 summary 收进 title。
+ */
+const PHASE_LABEL: Record<string, string> = {
+  PLANNING: '规划',
+  EXECUTING: '执行',
+  VERIFYING: '验证',
+  CROSS_REVIEWING: '交叉审核',
+};
 
 /**
  * 这些事件不单独成行，但内容在同一个 Run 视图里有归宿：
@@ -87,11 +97,7 @@ export function Transcript({
   events: readonly RunEvent[];
   toolCalls: readonly ToolCallView[];
 }) {
-  const [showRoutine, setShowRoutine] = useState(false);
-  const { items, omissions } = useMemo(
-    () => build(events, toolCalls, showRoutine),
-    [events, toolCalls, showRoutine],
-  );
+  const { items, omissions } = useMemo(() => build(events, toolCalls), [events, toolCalls]);
 
   if (items.length === 0 && omissions.length === 0) {
     return <div className="empty">还没有内容。任务开始后这里会实时出现。</div>;
@@ -102,11 +108,7 @@ export function Transcript({
       {items.map((item) => (
         <Row key={`${item.kind}-${item.seq}`} item={item} />
       ))}
-      <OmissionNotice
-        omissions={omissions}
-        expanded={showRoutine}
-        onToggle={() => setShowRoutine((v) => !v)}
-      />
+      <OmissionNotice omissions={omissions} />
     </div>
   );
 }
@@ -117,39 +119,18 @@ export function Transcript({
  * 刻意放在时间线末尾而不是折叠进某一行：用户需要在读完之后仍然知道
  * 「我没看到的是哪些、有多少、为什么」，而不是靠发现某个小三角才知道有东西被藏了。
  */
-function OmissionNotice({
-  omissions,
-  expanded,
-  onToggle,
-}: {
-  omissions: readonly Omission[];
-  expanded: boolean;
-  onToggle: () => void;
-}) {
+function OmissionNotice({ omissions }: { omissions: readonly Omission[] }) {
   const omitted = omissions.filter((o) => o.level === 'omitted');
   const merged = omissions.filter((o) => o.level === 'merged');
   const omittedTotal = omitted.reduce((sum, o) => sum + o.count, 0);
   const mergedTotal = merged.reduce((sum, o) => sum + o.count, 0);
-  const recoverable = omitted.filter((o) => o.recoverable).reduce((sum, o) => sum + o.count, 0);
-  // 展开后仍要留住入口，否则用户没法把噪音收回去。
-  if (omittedTotal === 0 && mergedTotal === 0 && !expanded) return null;
+  if (omittedTotal === 0 && mergedTotal === 0) return null;
 
   return (
     <div className="transcript-omissions">
       <div className="transcript-omissions-head">
-        <span>
-          {omittedTotal > 0
-            ? `时间线省略了 ${omittedTotal} 条事件`
-            : expanded
-              ? '常规阶段流转已全部展开'
-              : '没有事件被省略'}
-        </span>
+        <span>{omittedTotal > 0 ? `时间线省略了 ${omittedTotal} 条事件` : '没有事件被省略'}</span>
         <span className="spacer" />
-        {(recoverable > 0 || expanded) && (
-          <button className="linklike" onClick={onToggle} aria-pressed={expanded}>
-            {expanded ? '重新折叠常规阶段流转' : `展开这 ${recoverable} 条`}
-          </button>
-        )}
       </div>
       {/*
         报数常驻一行，分类明细收进展开层（交互评审 v0.2 N5）——
@@ -180,11 +161,7 @@ function OmissionNotice({
   );
 }
 
-function build(
-  events: readonly RunEvent[],
-  toolCalls: readonly ToolCallView[],
-  includeRoutineStatus: boolean,
-): Projection {
+function build(events: readonly RunEvent[], toolCalls: readonly ToolCallView[]): Projection {
   const byId = new Map(toolCalls.map((t) => [t.toolCallId, t]));
   const items: Item[] = [];
   const seenTool = new Set<string>();
@@ -192,7 +169,6 @@ function build(
   let turnIndex = 0;
 
   // 省略计数：每一个 `break` 掉的事件都必须落到某个计数器里，不允许静默丢弃。
-  let routineStatus = 0;
   let unmatchedTool = 0;
   let duplicateTool = 0;
   /** 平台自己发起的验证命令：有 ToolCall 记录，但正文由验证块呈现，这里只报数 */
@@ -341,9 +317,9 @@ function build(
 
       case 'STATUS_CHANGED': {
         const to = String(e.payload.to ?? '');
-        // 常规阶段流转默认折叠，但必须报数 —— 折叠不等于可以假装它不存在。
-        if (ROUTINE_STATUS.has(to) && !includeRoutineStatus) {
-          routineStatus += 1;
+        // 进入某个工作相位 → 分组锚点；终态与待决状态仍是完整的状态行
+        if (PHASE_LABEL[to]) {
+          items.push({ kind: 'phase', seq: e.seq, at: e.at, label: PHASE_LABEL[to], text: e.summary });
           break;
         }
         items.push({
@@ -379,15 +355,6 @@ function build(
   }
 
   const omissions: Omission[] = [];
-  if (routineStatus > 0) {
-    omissions.push({
-      key: 'routine-status',
-      count: routineStatus,
-      reason: '常规阶段流转（PLANNING / EXECUTING / VERIFYING），默认折叠以突出需要你决定的事件',
-      recoverable: true,
-      level: 'omitted',
-    });
-  }
   if (unmatchedTool > 0) {
     omissions.push({
       key: 'unmatched-tool',
@@ -501,6 +468,15 @@ function Row({ item }: { item: Item }) {
         </div>
       );
 
+    case 'phase':
+      // 相位锚点：分组结构，不是又一条消息 —— 安静的分隔行，原文在 title
+      return (
+        <div className="phase-anchor" role="separator" title={item.text} aria-label={`进入${item.label}阶段`}>
+          <span className="phase-anchor-label">{item.label}</span>
+          <span className="msg-time">{timeOf(item.at)}</span>
+        </div>
+      );
+
     case 'command':
       return <TerminalBlock call={item.call} at={item.at} />;
 
@@ -551,7 +527,9 @@ function TurnBlock({ item }: { item: Extract<Item, { kind: 'turn' }> }) {
 
   // 「deepseek-v4-pro (in=12938 out=1485)」：行上留模型名，per-call token 计量
   // 进 title（交互评审 v0.2 N5）—— 总量在用量面板，逐笔在数据出站，这里不再第三遍。
-  const meter = /^(.*?)\s*\((in=.*?)\)\s*$/.exec(item.detail);
+  // 括号必须同时接受全角与半角：Core 的真实 summary 用的是全角（in=…），
+  // 只匹配半角曾让这条降噪在真机上从未生效 —— 测试也用半角，恰好互相印证成假绿
+  const meter = /^(.*?)\s*[（(](in=.*?)[)）]\s*$/.exec(item.detail);
   const detailText = meter ? meter[1]! : item.detail;
   const detailTitle = meter ? `${meter[1]!} · ${meter[2]!}` : undefined;
 
@@ -579,9 +557,34 @@ function TurnBlock({ item }: { item: Extract<Item, { kind: 'turn' }> }) {
   );
 }
 
+/**
+ * 终端输出的行数上限（交互评审 v0.1 #6 / v0.2 N10）。
+ * 真机实测单块可达 ~1900px，是详情页滚动成本的主源。折叠 + 报数 = 合规省略：
+ * 默认前 N 行，剩余行数如实报出，一键展开、可收回 —— 完整输出永远可达。
+ * 少量超出（不足 CLAMP+SLACK）不值得折：为省两行放一个按钮，比两行更吵。
+ */
+const TERM_CLAMP_LINES = 14;
+const TERM_CLAMP_SLACK = 4;
+
+function TermOutput({ text, dim = false }: { text: string; dim?: boolean }) {
+  const [showAll, setShowAll] = useState(false);
+  const lines = text.split('\n');
+  const clampable = lines.length > TERM_CLAMP_LINES + TERM_CLAMP_SLACK;
+  const shown = clampable && !showAll ? lines.slice(0, TERM_CLAMP_LINES).join('\n') : text;
+  return (
+    <>
+      <pre className={`term-body ${dim ? 'dim' : ''}`}>{shown}</pre>
+      {clampable && (
+        <button className="term-expand" onClick={() => setShowAll((v) => !v)} aria-expanded={showAll}>
+          {showAll ? `收起到前 ${TERM_CLAMP_LINES} 行` : `还有 ${lines.length - TERM_CLAMP_LINES} 行 —— 展开全部`}
+        </button>
+      )}
+    </>
+  );
+}
+
 function TerminalBlock({ call, at }: { call: ToolCallView; at: string }) {
   const outcome = (call.preview ?? '').trim();
-  const failed = call.resolution === 'FAILED';
   return (
     <div className="term">
       <div className="term-head">
@@ -593,7 +596,7 @@ function TerminalBlock({ call, at }: { call: ToolCallView; at: string }) {
         <span className="msg-time">{timeOf(at)}</span>
       </div>
       {outcome ? (
-        <pre className="term-body">{outcome}</pre>
+        <TermOutput text={outcome} />
       ) : (
         <pre className="term-body dim">{call.resolution ? '（无输出）' : '执行中…'}</pre>
       )}
@@ -625,6 +628,16 @@ function PreviewFooter({ call }: { call: ToolCallView }) {
   );
 }
 
+/** 命令终局的词典（判别联合的六个终态说人话，raw 进 title —— v0.2 N7 同一红线） */
+const COMMAND_OUTCOME_TEXT: Record<string, string> = {
+  EXIT_ZERO: '退出 0',
+  EXIT_NONZERO: '非零退出',
+  SIGNAL: '被信号终止',
+  TIMEOUT: '超时',
+  CANCELLED: '已取消',
+  SPAWN_ERROR: '无法启动',
+};
+
 function CommandOutput({ outcome }: { outcome: CommandOutcome }) {
   const body = [outcome.stderrPreview, outcome.stdoutPreview].filter(Boolean).join('\n').trim();
   return (
@@ -632,11 +645,11 @@ function CommandOutput({ outcome }: { outcome: CommandOutcome }) {
       <div className="term-cmd">
         <span className="term-prompt">$</span> {outcome.argv.join(' ') || outcome.commandId}
         <span className="spacer" />
-        <span className={outcome.outcome === 'EXIT_ZERO' ? 'ok' : 'err'}>
-          {outcome.outcome} · {outcome.durationMs}ms
+        <span className={outcome.outcome === 'EXIT_ZERO' ? 'ok' : 'err'} title={outcome.outcome}>
+          {COMMAND_OUTCOME_TEXT[outcome.outcome] ?? outcome.outcome} · {outcome.durationMs}ms
         </span>
       </div>
-      {body && <pre className="term-body">{body}</pre>}
+      {body && <TermOutput text={body} />}
     </>
   );
 }
@@ -662,7 +675,7 @@ function ToolBlock({ call, at }: { call: ToolCallView; at: string }) {
           (call.preview.includes('\n@@') || call.preview.startsWith('@@') ? (
             <DiffView diff={call.preview} />
           ) : (
-            <pre className="term-body">{call.preview}</pre>
+            <TermOutput text={call.preview} />
           ))}
         <PreviewFooter call={call} />
       </div>

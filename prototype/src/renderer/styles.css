@@ -864,6 +864,23 @@ ul.plain li {
   font-size: 11px;
   color: var(--text-secondary);
 }
+/* 终端输出行数上限的展开/收起（v0.2 N10）：安静一行，报数在按钮文案里 */
+.term-expand {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--surface-code);
+  border: none;
+  border-top: 1px dashed var(--border-hairline);
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.term-expand:hover {
+  color: var(--text-primary);
+}
+
 .term-cmd {
   display: flex;
   gap: 6px;
@@ -1608,6 +1625,36 @@ select:focus-visible {
 }
 
 /* --------------------------------------------------------- 省略披露 */
+/* 相位锚点（v0.1 #6）：时间线的分组结构 —— 一条安静的分隔行，不与消息争音量 */
+.phase-anchor {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 4px;
+  color: var(--text-tertiary);
+}
+.phase-anchor::before,
+.phase-anchor::after {
+  content: '';
+  height: 1px;
+  background: var(--border-hairline);
+}
+.phase-anchor::before {
+  width: 18px;
+  flex: none;
+}
+.phase-anchor::after {
+  flex: 1;
+}
+.phase-anchor-label {
+  font-size: 10.5px;
+  letter-spacing: 0.8px;
+  flex: none;
+}
+.phase-anchor .msg-time {
+  flex: none;
+}
+
 .transcript-omissions {
   margin-top: 14px;
   padding: 8px 10px;

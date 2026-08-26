@@ -51,7 +51,7 @@ describe('Transcript 省略披露', () => {
     cleanup();
   });
 
-  it('折叠常规阶段流转时报出数量与原因，并能就地展开和收回', () => {
+  it('阶段流转渲染为相位锚点（v0.1 #6）：分组结构，不再折叠也不再计入省略', () => {
     const events = [
       event('RUN_CREATED', '任务已创建：修构建'),
       event('STATUS_CHANGED', '进入规划', { to: 'PLANNING' }),
@@ -61,22 +61,17 @@ describe('Transcript 省略披露', () => {
     ];
     render(<Transcript events={events} toolCalls={[]} />);
 
-    expect(screen.getByText('时间线省略了 3 条事件')).toBeTruthy();
-    expect(screen.getByText(/常规阶段流转（PLANNING \/ EXECUTING \/ VERIFYING）/)).toBeTruthy();
-    // 折叠状态下这三条不该出现在时间线里。
-    expect(screen.queryByText('进入执行')).toBeNull();
-
-    const expand = screen.getByRole('button', { name: '展开这 3 条' });
-    expect(expand.getAttribute('aria-pressed')).toBe('false');
-    fireEvent.click(expand);
-
-    expect(screen.getByText('进入执行')).toBeTruthy();
-    expect(screen.getByText('常规阶段流转已全部展开')).toBeTruthy();
-    const collapse = screen.getByRole('button', { name: '重新折叠常规阶段流转' });
-    expect(collapse.getAttribute('aria-pressed')).toBe('true');
-
-    fireEvent.click(collapse);
-    expect(screen.getByText('时间线省略了 3 条事件')).toBeTruthy();
+    // 三个相位各有一条锚点分隔行，原始 summary 收进 title
+    const anchors = screen.getAllByRole('separator');
+    expect(anchors.map((a) => a.textContent?.slice(0, 4))).toEqual(
+      expect.arrayContaining([expect.stringContaining('规划'), expect.stringContaining('执行'), expect.stringContaining('验证')]),
+    );
+    expect(screen.getByLabelText('进入执行阶段').title).toBe('进入执行');
+    // 终态仍是完整的状态行，不降级成锚点
+    expect(screen.getByText('已成功')).toBeTruthy();
+    // 相位事件都被渲染了 —— 不再有省略报数，也没有展开按钮
+    expect(screen.queryByText(/时间线省略了/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /展开这/ })).toBeNull();
   });
 
   it('把无法展示正文的省略与可展开的省略分开报数', () => {
@@ -289,14 +284,19 @@ describe('详情页降噪（交互评审 v0.2 N5）：报数常驻，计量与�
     cleanup();
   });
 
-  it('轮次行的 per-call token 收进 title，行上留模型名', () => {
-    const events = [event('MODEL_INVOCATION', 'PLANNING 调用 deepseek-v4-pro (in=12938 out=1485)')];
+  it('轮次行的 per-call token 收进 title，行上留模型名 —— 全角/半角括号都认', () => {
+    // Core 的真实 summary 用全角括号；只测半角曾与只匹配半角的实现互相印证成假绿
+    const events = [
+      event('MODEL_INVOCATION', 'PLANNING 调用 deepseek-v4-pro（in=12938 out=1485）'),
+      event('MODEL_INVOCATION', 'EXECUTING 调用 local-model (in=7 out=9)'),
+    ];
     render(<Transcript events={events} toolCalls={[]} />);
 
     // 行上不再有第三遍 token 计量（总量在用量面板，逐笔在数据出站）
     expect(screen.queryByText(/in=12938/)).toBeNull();
-    const detail = screen.getByText('deepseek-v4-pro');
-    expect(detail.getAttribute('title')).toContain('in=12938 out=1485');
+    expect(screen.queryByText(/in=7/)).toBeNull();
+    expect(screen.getByText('deepseek-v4-pro').getAttribute('title')).toContain('in=12938 out=1485');
+    expect(screen.getByText('local-model').getAttribute('title')).toContain('in=7 out=9');
   });
 
   it('没有 token 后缀的轮次行原样保留，不误伤', () => {
@@ -309,18 +309,64 @@ describe('详情页降噪（交互评审 v0.2 N5）：报数常驻，计量与�
   it('省略披露：报数一行常驻，分类明细收进「省略明细」折叠层且默认收起', () => {
     const events = [
       event('RUN_CREATED', '任务已创建'),
-      event('STATUS_CHANGED', '进入规划', { to: 'PLANNING' }),
-      event('STATUS_CHANGED', '进入执行', { to: 'EXECUTING' }),
-      event('STATUS_CHANGED', '进入验证', { to: 'VERIFYING' }),
+      // 有事件、没有对应的 ToolCallView：正文不可恢复的省略
+      event('MODEL_INVOCATION', 'agent 调用 修复'),
+      event('TOOL_CALL_PROPOSED', '提议工具调用', { toolCallId: 'missing-1' }),
+      event('CLEANUP_SUMMARY', '清理完成'),
     ];
     render(<Transcript events={events} toolCalls={[]} />);
 
     // 报数在折叠层外，一直可见
-    expect(screen.getByText('时间线省略了 3 条事件')).toBeTruthy();
+    expect(screen.getByText('时间线省略了 2 条事件')).toBeTruthy();
     const fold = screen.getByText('省略明细').closest('details')!;
     expect(fold.open).toBe(false);
-    // 明细仍在 DOM（降层级不删事实），展开按钮也仍在折叠层外
-    expect(screen.getByText(/常规阶段流转/)).toBeTruthy();
-    expect(screen.getByRole('button', { name: '展开这 3 条' })).toBeTruthy();
+    // 明细仍在 DOM（降层级不删事实）
+    expect(screen.getByText(/工具调用事件存在/)).toBeTruthy();
+    expect(screen.getByText(/CLEANUP_SUMMARY×1/)).toBeTruthy();
+  });
+});
+
+describe('终端输出行数上限（交互评审 v0.2 N10）：折叠 + 报数', () => {
+  afterEach(() => {
+    seq = 0;
+    cleanup();
+  });
+
+  it('超长输出默认前 14 行，剩余行数如实报出，可展开可收回', () => {
+    const long = Array.from({ length: 40 }, (_, i) => `line-${i + 1}`).join('\n');
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTING 调用 模型'),
+      event('TOOL_CALL_PROPOSED', '执行命令', { toolCallId: 'term-1' }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[toolCall({ toolCallId: 'term-1', toolName: 'run_command', preview: long, resolution: 'FAILED' })]}
+      />,
+    );
+
+    expect(screen.getByText(/line-14/)).toBeTruthy();
+    expect(screen.queryByText(/line-15/)).toBeNull();
+    const expand = screen.getByRole('button', { name: '还有 26 行 —— 展开全部' });
+    fireEvent.click(expand);
+    expect(screen.getByText(/line-40/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '收起到前 14 行' }));
+    expect(screen.queryByText(/line-40/)).toBeNull();
+  });
+
+  it('少量超出（不足上限+余量）不折叠，不放没意义的按钮', () => {
+    const short = Array.from({ length: 16 }, (_, i) => `s-${i + 1}`).join('\n');
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTING 调用 模型'),
+      event('TOOL_CALL_PROPOSED', '执行命令', { toolCallId: 'term-2' }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[toolCall({ toolCallId: 'term-2', toolName: 'run_command', preview: short, resolution: 'FAILED' })]}
+      />,
+    );
+    expect(screen.getByText(/s-16/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /展开全部/ })).toBeNull();
   });
 });
