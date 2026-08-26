@@ -39,6 +39,7 @@ export function EditorPane({
   active,
   onActivate,
   onClose,
+  onCollapse,
 }: {
   snapshotId: string;
   runId: string | null;
@@ -48,6 +49,8 @@ export function EditorPane({
   active: string | null;
   onActivate: (path: string) => void;
   onClose: (path: string) => void;
+  /** 显式收起整个编辑器列（标签保留），可选 —— 单测可不接线 */
+  onCollapse?: () => void;
 }) {
   const [states, setStates] = useState<Map<string, TabState>>(new Map());
   // 竞态防护：来源/标签变化后，旧的异步结果不允许写回
@@ -118,7 +121,8 @@ export function EditorPane({
   return (
     <section className="editorpane" aria-label="代码编辑器（只读）">
       <div className="editorpane-drag" aria-hidden="true" />
-      <div className="editorpane-tabs" role="tablist">
+      <div className="editorpane-tabs">
+        <div className="editorpane-tablist" role="tablist">
         {tabs.map((path) => (
           <div
             key={path}
@@ -141,6 +145,17 @@ export function EditorPane({
             </button>
           </div>
         ))}
+        </div>
+        {onCollapse && (
+          <button
+            className="editorpane-collapse"
+            title="收起编辑器（标签保留）"
+            aria-label="收起编辑器"
+            onClick={onCollapse}
+          >
+            ⇥
+          </button>
+        )}
       </div>
 
       {active && (

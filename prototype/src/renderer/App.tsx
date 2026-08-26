@@ -70,12 +70,19 @@ export function App() {
   // Dock 与详情卡必须共享同一个 ref-backed controller，React state 不能充当双入口互斥锁。
   const approvalAction = useApprovalAction(selectedRunId);
 
-  /** 右侧文件树开关 + 刷新令牌（Agent 改完文件后自增，让树重新拉取） */
-  const [filesOpen, setFilesOpen] = useState(false);
+  /**
+   * 左栏 Activity：运行列表 ⇄ 文件树（交互评审 v0.2 P1）。
+   * 文件树从"最右一列、还会换位"改为左栏的第二个关注点 —— 树的惯例位在左，
+   * 编辑器恒在右舞台，对话恒居中，任何面板都不再跳列。
+   */
+  const [sidebarView, setSidebarView] = useState<'runs' | 'files'>('runs');
+  /** 文件树刷新令牌（Agent 改完文件后自增，让树重新拉取） */
   const [filesKey, setFilesKey] = useState(0);
   // 编辑器标签页（只读查看器）。路径列表 + 活动项；换快照/项目时整体作废
   const [editorTabs, setEditorTabs] = useState<string[]>([]);
   const [activeEditorTab, setActiveEditorTab] = useState<string | null>(null);
+  /** 编辑器显式收起：标签保留，右舞台让位给对话（v0.2 N12 的"显式开关"） */
+  const [editorCollapsed, setEditorCollapsed] = useState(false);
   /** 设置页作为一个独立视图，而不是"没选项目时的兜底" */
   const [showSettings, setShowSettings] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
@@ -338,7 +345,8 @@ export function App() {
     ? (selectedRun?.snapshotId ?? null)
     : (importedProject?.snapshot.snapshotId ?? null);
   const canShowFiles = Boolean(fileSnapshotId);
-  const editorActive = editorTabs.length > 0 && canShowFiles && coreStatus === 'READY';
+  const editorActive =
+    editorTabs.length > 0 && !editorCollapsed && canShowFiles && coreStatus === 'READY';
 
   // 快照一换，旧标签指向的坐标系就没了 —— 整体关闭，不带着过期路径进新世界
   useEffect(() => {
@@ -349,6 +357,8 @@ export function App() {
   const openFileInEditor = useCallback((path: string) => {
     setEditorTabs((prev) => (prev.includes(path) ? prev : [...prev, path]));
     setActiveEditorTab(path);
+    // 打开文件就是"我要看编辑器"的显式表达 —— 收起态随之解除
+    setEditorCollapsed(false);
   }, []);
 
   const closeEditorTab = useCallback((path: string) => {
@@ -377,7 +387,9 @@ export function App() {
   }, [runs, selectedProject, selectedRunId]);
 
   return (
-    <div className={`app ${editorActive ? 'ide' : ''} ${filesOpen && canShowFiles ? 'with-files' : ''}`}>
+    // 布局恒定（v0.2 N12）：侧栏 264px 恒左，对话恒居中，编辑器恒右舞台。
+    // 唯一的布局变化是编辑器列的出现/收起 —— 没有任何面板会换位或换宽。
+    <div className={`app ${editorActive ? 'ide' : ''}`}>
       <aside className="sidebar">
         <div className="sidebar-head">
           <h1>RepoPilot</h1>
@@ -387,6 +399,50 @@ export function App() {
           </div>
         </div>
 
+        <div className="sidebar-tabs">
+          <button
+            className={sidebarView === 'runs' ? 'active' : ''}
+            aria-pressed={sidebarView === 'runs'}
+            onClick={() => setSidebarView('runs')}
+          >
+            运行
+          </button>
+          <button
+            className={sidebarView === 'files' ? 'active' : ''}
+            aria-pressed={sidebarView === 'files'}
+            disabled={!canShowFiles || coreStatus !== 'READY'}
+            title={
+              canShowFiles
+                ? '工作区 / 快照文件树'
+                : selectedRunId
+                  ? '该 Run 的证据已损坏，快照归属不可知'
+                  : '先导入一个项目'
+            }
+            onClick={() => setSidebarView('files')}
+          >
+            文件
+          </button>
+        </div>
+
+        {sidebarView === 'files' && fileSnapshotId && coreStatus === 'READY' ? (
+          <FileTreePanel
+            snapshotId={fileSnapshotId}
+            // 恢复的 Run 工作区已回收：读它必然失败。直接回落到快照原貌，
+            // 面板里说明为什么 —— 设计内状态不渲染成错误（交互评审 v0.2 N6）
+            runId={selectedRun?.restored ? null : selectedRunId}
+            workspaceGeneration={selectedRun?.restored ? null : (selectedRun?.workspaceGeneration ?? null)}
+            workspaceRecycled={Boolean(selectedRun?.restored)}
+            refreshKey={filesKey}
+            onClose={() => setSidebarView('runs')}
+            onOpenFile={openFileInEditor}
+          />
+        ) : sidebarView === 'files' ? (
+          <div className="sidebar-scroll">
+            <div style={{ color: 'var(--text-tertiary)', fontSize: 11.5, padding: '10px 8px' }}>
+              {selectedRunId ? '该 Run 的证据已损坏，快照归属不可知。' : '先导入一个项目，文件树才有内容。'}
+            </div>
+          </div>
+        ) : (
         <div className="sidebar-scroll">
           {projects.length === 0 && (
             <div style={{ color: 'var(--text-tertiary)', fontSize: 11.5, padding: '10px 8px' }}>
@@ -478,6 +534,7 @@ export function App() {
             <div className="name">+ 授权本地仓库…</div>
           </button>
         </div>
+        )}
 
         <div className="sidebar-foot">
           <button
@@ -503,20 +560,6 @@ export function App() {
           >
             📊 证据
           </button>
-          <button
-            disabled={!canShowFiles || coreStatus !== 'READY'}
-            className={filesOpen && canShowFiles ? 'primary' : ''}
-            onClick={() => setFilesOpen((v) => !v)}
-            title={
-              canShowFiles
-                ? '文件树'
-                : selectedRunId
-                  ? '该 Run 的证据已损坏，快照归属不可知'
-                  : '先导入一个项目'
-            }
-          >
-            🗂 文件
-          </button>
         </div>
       </aside>
 
@@ -527,6 +570,13 @@ export function App() {
             run={selectedRun}
             events={selectedRunDetail?.events ?? []}
           />
+        )}
+
+        {/* 编辑器收起后标签仍在 —— 给一条可见的回程路，别让状态藏起来 */}
+        {!fullScreenView && editorCollapsed && editorTabs.length > 0 && canShowFiles && (
+          <button className="editor-restore" onClick={() => setEditorCollapsed(false)}>
+            编辑器已收起 · {editorTabs.length} 个标签 —— 点击展开
+          </button>
         )}
 
         <div className="chat-scroll" ref={follow.containerRef}>
@@ -669,20 +719,7 @@ export function App() {
           active={activeEditorTab}
           onActivate={setActiveEditorTab}
           onClose={closeEditorTab}
-        />
-      )}
-
-      {filesOpen && fileSnapshotId && coreStatus === 'READY' && (
-        <FileTreePanel
-          snapshotId={fileSnapshotId}
-          // 恢复的 Run 工作区已回收：读它必然失败。直接回落到快照原貌，
-          // 面板里说明为什么 —— 设计内状态不渲染成错误（交互评审 v0.2 N6）
-          runId={selectedRun?.restored ? null : selectedRunId}
-          workspaceGeneration={selectedRun?.restored ? null : (selectedRun?.workspaceGeneration ?? null)}
-          workspaceRecycled={Boolean(selectedRun?.restored)}
-          refreshKey={filesKey}
-          onClose={() => setFilesOpen(false)}
-          onOpenFile={openFileInEditor}
+          onCollapse={() => setEditorCollapsed(true)}
         />
       )}
     </div>

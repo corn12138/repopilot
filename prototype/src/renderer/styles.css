@@ -230,13 +230,17 @@ textarea {
 
 /* --------------------------------------------------------------- layout */
 
+/*
+ * 布局恒定（交互评审 v0.2 P1 / N12）：只有两种形态 ——
+ *   默认        侧栏 264px | 对话
+ *   编辑器打开   侧栏 264px | 对话 | 编辑器
+ * 文件树住在侧栏（Activity 切换），对话恒居中，编辑器恒右舞台；
+ * 任何面板都不会换列、换宽 —— 空间稳定是 IDE 反射的前提。
+ */
 .app {
   display: grid;
   grid-template-columns: 264px 1fr;
   height: 100%;
-}
-.app.with-files {
-  grid-template-columns: 264px 1fr 340px;
 }
 
 .sidebar {
@@ -262,10 +266,66 @@ textarea {
   margin-top: 2px;
 }
 
+/* 左栏 Activity 切换：运行 ⇄ 文件（v0.2 P1 —— 树的惯例位在左，一次只有一个关注点） */
+.sidebar-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 10px 8px;
+  border-bottom: 1px solid var(--border-hairline);
+  flex: none;
+}
+.sidebar-tabs button {
+  flex: 1;
+  font-size: 11.5px;
+  padding: 4px 0;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.sidebar-tabs button.active {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  border-color: var(--border-hairline);
+}
+.sidebar-tabs button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .sidebar-scroll {
   flex: 1;
   overflow-y: auto;
   padding: 4px 10px 16px;
+}
+
+/* 文件树嵌进侧栏：顶部 38px 的红绿灯让位已由 sidebar-head 承担，去掉自己的 */
+.sidebar .filepanel {
+  border-left: none;
+  flex: 1;
+  min-height: 0;
+}
+.sidebar .filepanel-head {
+  padding: 10px 10px 8px;
+}
+
+/* 编辑器收起后的回程条：贴在主栏顶部，安静但可见 */
+.editor-restore {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-size: 11.5px;
+  padding: 6px 16px;
+  background: var(--surface-panel);
+  border: none;
+  border-bottom: 1px solid var(--border-hairline);
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex: none;
+}
+.editor-restore:hover {
+  color: var(--text-primary);
 }
 
 .section-label {
@@ -1681,22 +1741,15 @@ select:focus-visible {
 }
 
 /* ---------------------------------------------------------------------------
- * IDE 布局：编辑器面板活跃时进入三/四栏（侧栏 | [文件树] | 编辑器 | 运行面板）。
- * 显式指定每个面板的 grid-column —— 不依赖 DOM 顺序的自动放置，
- * 这样文件树开关不会让编辑器换位置。
+ * IDE 布局（v0.2 §5.2 对话恒居中）：编辑器打开时进入三栏 ——
+ * 侧栏 | 对话 | 编辑器。显式指定 grid-column，不依赖 DOM 顺序的自动放置。
  * ------------------------------------------------------------------------- */
 .app.ide {
-  grid-template-columns: 264px minmax(360px, 1.15fr) minmax(340px, 1fr);
-}
-.app.ide.with-files {
-  grid-template-columns: 264px 280px minmax(360px, 1.15fr) minmax(340px, 1fr);
+  grid-template-columns: 264px minmax(400px, 1fr) minmax(420px, 1.05fr);
 }
 .app.ide > .sidebar { grid-column: 1; grid-row: 1; }
-.app.ide > .editorpane { grid-column: 2; grid-row: 1; }
-.app.ide > .main { grid-column: 3; grid-row: 1; min-width: 0; }
-.app.ide.with-files > .filepanel { grid-column: 2; grid-row: 1; border-left: none; }
-.app.ide.with-files > .editorpane { grid-column: 3; }
-.app.ide.with-files > .main { grid-column: 4; }
+.app.ide > .main { grid-column: 2; grid-row: 1; min-width: 0; }
+.app.ide > .editorpane { grid-column: 3; grid-row: 1; }
 
 .editorpane {
   display: flex;
@@ -1705,7 +1758,6 @@ select:focus-visible {
   height: 100%;
   overflow: hidden;
   border-left: 1px solid var(--border-hairline);
-  border-right: 1px solid var(--border-hairline);
   background: var(--surface-canvas);
 }
 /* 顶部留出与侧栏一致的窗口拖拽带 */
@@ -1717,12 +1769,31 @@ select:focus-visible {
 .editorpane-tabs {
   display: flex;
   align-items: stretch;
-  overflow-x: auto;
   flex: none;
   background: var(--surface-panel);
   border-bottom: 1px solid var(--border-hairline);
   min-height: 32px;
+}
+.editorpane-tablist {
+  display: flex;
+  align-items: stretch;
+  overflow-x: auto;
+  flex: 1;
+  min-width: 0;
   scrollbar-width: thin;
+}
+/* 显式收起编辑器列（标签保留）—— v0.2 N12 的"显式开关" */
+.editorpane-collapse {
+  flex: none;
+  border: none;
+  background: none;
+  padding: 0 10px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font-size: 13px;
+}
+.editorpane-collapse:hover {
+  color: var(--text-primary);
 }
 .editorpane-tab {
   display: flex;
