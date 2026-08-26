@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { call } from '../bridge';
-import { Badge } from '../components/common';
+import { Badge, DiffView } from '../components/common';
 import { CodeView } from './CodeView';
 
 /**
@@ -31,6 +31,25 @@ type TabState =
   | { kind: 'READY'; file: LoadedFile }
   | { kind: 'ERROR'; message: string };
 
+/**
+ * 编辑器标签的两种身份（交互评审 v0.2 P2「diff 进编辑器」）：
+ *   file —— 从 files.read 按 generation 门禁读取的只读文件；
+ *   diff —— 补丁里某个文件的改动。内容是封存补丁的一份拷贝（补丁不可变，
+ *           拷贝即事实），不走 files.read，也没有"刷新"—— 封存物没有新版本。
+ * id 是标签的唯一身份：file 用路径本身，diff 用 `diff:` 前缀 ——
+ * 同一个文件的"现状"与"改动"可以并排开着。
+ */
+export type EditorTab =
+  | { readonly id: string; readonly kind: 'file'; readonly path: string; readonly pinned: boolean }
+  | {
+      readonly id: string;
+      readonly kind: 'diff';
+      readonly path: string;
+      readonly pinned: boolean;
+      readonly diff: string;
+      readonly truncated: boolean;
+    };
+
 export function EditorPane({
   snapshotId,
   runId,
@@ -46,12 +65,13 @@ export function EditorPane({
   runId: string | null;
   /** Agent 改动落地后由外层递增，触发来源与内容重读 */
   refreshKey: number;
-  tabs: readonly { path: string; pinned: boolean }[];
+  tabs: readonly EditorTab[];
+  /** 活动标签的 id（file 标签的 id 即路径） */
   active: string | null;
-  onActivate: (path: string) => void;
-  onClose: (path: string) => void;
+  onActivate: (id: string) => void;
+  onClose: (id: string) => void;
   /** 双击标签把预览固定下来（IDE 惯例），可选 —— 单测可不接线 */
-  onPin?: (path: string) => void;
+  onPin?: (id: string) => void;
   /** 显式收起整个编辑器列（标签保留），可选 —— 单测可不接线 */
   onCollapse?: () => void;
 }) {
@@ -108,17 +128,20 @@ export function EditorPane({
     epochRef.current += 1;
     inflightRef.current.clear();
     setStates(new Map());
-    if (active && tabs.some((t) => t.path === active)) void load(active);
+    const tab = tabs.find((t) => t.id === active);
+    if (tab?.kind === 'file') void load(tab.path);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snapshotId, runId, refreshKey]);
 
-  // 激活一个还没内容的标签时加载
+  // 激活一个还没内容的 file 标签时加载；diff 标签自带内容，不走 IPC
   useEffect(() => {
-    if (active && tabs.some((t) => t.path === active) && !states.has(active)) void load(active);
+    const tab = tabs.find((t) => t.id === active);
+    if (tab?.kind === 'file' && !states.has(tab.path)) void load(tab.path);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, tabs]);
 
-  const activeState = active ? states.get(active) : undefined;
+  const activeTab = active !== null ? tabs.find((t) => t.id === active) ?? null : null;
+  const activeState = activeTab?.kind === 'file' ? states.get(activeTab.path) : undefined;
   const basename = (p: string) => p.slice(p.lastIndexOf('/') + 1);
 
   return (
@@ -126,25 +149,33 @@ export function EditorPane({
       <div className="editorpane-drag" aria-hidden="true" />
       <div className="editorpane-tabs">
         <div className="editorpane-tablist" role="tablist">
-        {tabs.map(({ path, pinned }) => (
+        {tabs.map((tab) => (
           <div
-            key={path}
+            key={tab.id}
             role="tab"
-            aria-selected={path === active}
-            className={`editorpane-tab ${path === active ? 'active' : ''} ${pinned ? '' : 'preview'}`}
-            title={pinned ? path : `${path}（预览 —— 双击固定；打开别的文件会复用这个位置）`}
-            onClick={() => onActivate(path)}
+            aria-selected={tab.id === active}
+            className={`editorpane-tab ${tab.id === active ? 'active' : ''} ${tab.pinned ? '' : 'preview'}`}
+            title={
+              tab.kind === 'diff'
+                ? `补丁 diff · ${tab.path}`
+                : tab.pinned
+                  ? tab.path
+                  : `${tab.path}（预览 —— 双击固定；打开别的文件会复用这个位置）`
+            }
+            onClick={() => onActivate(tab.id)}
             onDoubleClick={() => {
-              if (!pinned) onPin?.(path);
+              if (!tab.pinned) onPin?.(tab.id);
             }}
           >
-            <span className="editorpane-tab-name">{basename(path)}</span>
+            <span className="editorpane-tab-name">
+              {tab.kind === 'diff' ? `± ${basename(tab.path)}` : basename(tab.path)}
+            </span>
             <button
               className="editorpane-tab-close"
-              aria-label={`关闭 ${path}`}
+              aria-label={`关闭 ${tab.kind === 'diff' ? `${tab.path} 的 diff` : tab.path}`}
               onClick={(e) => {
                 e.stopPropagation();
-                onClose(path);
+                onClose(tab.id);
               }}
             >
               ✕
@@ -164,10 +195,15 @@ export function EditorPane({
         )}
       </div>
 
-      {active && (
+      {activeTab && (
         <div className="editorpane-pathbar">
-          <code>{active}</code>
+          <code>{activeTab.path}</code>
           <span className="spacer" />
+          {activeTab.kind === 'diff' && (
+            <span title="封存补丁的改动内容 —— 补丁不可变，没有可刷新的新版本">
+              <Badge tone="info">补丁 diff</Badge>
+            </span>
+          )}
           {activeState?.kind === 'READY' && (
             <>
               {activeState.file.source === 'WORKSPACE' && activeState.file.changed && <Badge tone="ok">已改动</Badge>}
@@ -179,34 +215,46 @@ export function EditorPane({
               <span className="editorpane-bytes">{activeState.file.bytes} B</span>
             </>
           )}
-          <button onClick={() => active && void load(active)} title="重新读取">
-            刷新
-          </button>
+          {activeTab.kind === 'file' && (
+            <button onClick={() => void load(activeTab.path)} title="重新读取">
+              刷新
+            </button>
+          )}
         </div>
       )}
 
       <div className="editorpane-body">
-        {!active && (
+        {!activeTab && (
           <p className="editorpane-empty" role="status">
             从文件树打开一个文件。这里是只读视图 —— 改代码的唯一路径仍是任务 → 补丁 → 你来接受。
           </p>
         )}
-        {active && (!activeState || activeState.kind === 'LOADING') && (
+        {activeTab?.kind === 'diff' && (
+          <>
+            {activeTab.truncated && (
+              <div className="editorpane-truncated" role="status">
+                diff 已截断 —— 完整改动请在补丁审查里导出后查看。
+              </div>
+            )}
+            <DiffView diff={activeTab.diff} />
+          </>
+        )}
+        {activeTab?.kind === 'file' && (!activeState || activeState.kind === 'LOADING') && (
           <p className="editorpane-empty" role="status">
-            正在读取 {active}…
+            正在读取 {activeTab.path}…
           </p>
         )}
-        {active && activeState?.kind === 'ERROR' && (
+        {activeTab?.kind === 'file' && activeState?.kind === 'ERROR' && (
           <div className="filepanel-error" role="alert">
             文件读取失败：{activeState.message}
           </div>
         )}
-        {active && activeState?.kind === 'READY' && activeState.file.binary && (
+        {activeTab?.kind === 'file' && activeState?.kind === 'READY' && activeState.file.binary && (
           <p className="editorpane-empty" role="status">
             二进制文件（{activeState.file.bytes} B），不显示内容。
           </p>
         )}
-        {active && activeState?.kind === 'READY' && !activeState.file.binary && (
+        {activeTab?.kind === 'file' && activeState?.kind === 'READY' && !activeState.file.binary && (
           <>
             {activeState.file.truncated && (
               <div className="editorpane-truncated" role="status">

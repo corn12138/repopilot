@@ -621,3 +621,74 @@ describe('详情页降噪（交互评审 v0.2 N2/N3/N4）：每个事实只有�
     expect(screen.getByTestId('egress-rows')).toBeTruthy(); // 明细仍在 DOM，不删事实
   });
 });
+
+describe('diff 进编辑器（交互评审 v0.2 P2）', () => {
+  beforeEach(() => {
+    requestMock.mockReset();
+    requestMock.mockImplementation(async () => ({ crossReview: null }));
+  });
+  afterEach(() => cleanup());
+
+  it('补丁文件行有「在编辑器打开」入口，点击回传 path/diff 且不折叠该行', async () => {
+    const patch = makePatch('p-diff', 'run-diff');
+    const onOpenDiff = vi.fn();
+    render(
+      <RunDetail
+        run={makeRun('run-diff', 'AWAITING_PATCH_REVIEW')}
+        events={[]}
+        toolCalls={[]}
+        approvals={[]}
+        plan={null}
+        patch={patch}
+        priorPatches={[]}
+        verifications={[]}
+        approvalAction={{
+          ownerRunId: 'run-diff',
+          pending: [],
+          error: null,
+          isPending: () => false,
+          decide: vi.fn(async () => false),
+          retry: vi.fn(async () => false),
+          clearError: vi.fn(),
+        } satisfies ApprovalActionController}
+        onError={vi.fn()}
+        onRefresh={vi.fn()}
+        onOpenDiff={onOpenDiff}
+      />,
+    );
+
+    const open = await screen.findByRole('button', { name: '在编辑器打开' });
+    fireEvent.click(open);
+    expect(onOpenDiff).toHaveBeenCalledWith(
+      expect.objectContaining({ path: patch.files[0]!.path, diff: patch.files[0]!.diff }),
+    );
+  });
+
+  it('不接线 onOpenDiff 时不显示入口（单测与旧调用点不受影响）', async () => {
+    render(
+      <RunDetail
+        run={makeRun('run-noop', 'AWAITING_PATCH_REVIEW')}
+        events={[]}
+        toolCalls={[]}
+        approvals={[]}
+        plan={null}
+        patch={makePatch('p-noop', 'run-noop')}
+        priorPatches={[]}
+        verifications={[]}
+        approvalAction={{
+          ownerRunId: 'run-noop',
+          pending: [],
+          error: null,
+          isPending: () => false,
+          decide: vi.fn(async () => false),
+          retry: vi.fn(async () => false),
+          clearError: vi.fn(),
+        } satisfies ApprovalActionController}
+        onError={vi.fn()}
+        onRefresh={vi.fn()}
+      />,
+    );
+    await screen.findByText(/已修复|未经机器验证/);
+    expect(screen.queryByRole('button', { name: '在编辑器打开' })).toBeNull();
+  });
+});

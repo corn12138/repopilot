@@ -42,6 +42,7 @@ export function RunDetail({
   approvalAction,
   onError,
   onRefresh,
+  onOpenDiff,
 }: {
   run: RunView;
   events: RunEvent[];
@@ -55,6 +56,8 @@ export function RunDetail({
   approvalAction: ApprovalActionController;
   onError: (err: unknown) => void;
   onRefresh: () => void;
+  /** 在编辑器里打开补丁文件的 diff（v0.2 P2）；不接线则补丁卡不显示该入口 */
+  onOpenDiff?: (file: { path: string; diff: string; truncated: boolean }) => void;
 }) {
   const [showRaw, setShowRaw] = useState(false);
   const active = !TERMINAL_RUN_STATUSES.includes(run.status);
@@ -201,7 +204,7 @@ export function RunDetail({
             {run.status === 'AWAITING_PATCH_REVIEW'
               ? '补丁仍可接受与导出（这不需要运行中的执行器）。'
               : '但没有运行中的执行器，不能续跑。'}
-            工作区文件树不可用 —— 那份隔离副本随进程一起结束了。
+            文件树显示的是导入时的快照原貌 —— 隔离工作区副本已随进程结束回收。
             {run.evidence === 'EVENTS_AHEAD' && (
               <div style={{ marginTop: 6, fontSize: 11.5, color: 'var(--text-secondary)' }}>
                 状态快照停在事件流之前{run.evidenceDetail ? `（${run.evidenceDetail}）` : ''}——
@@ -273,6 +276,7 @@ export function RunDetail({
               run.status === 'FAILED' || run.status === 'BLOCKED' || run.status === 'CANCELLED'
             }
             onError={onError}
+            onOpenDiff={onOpenDiff}
           />
         </div>
       )}
@@ -438,6 +442,7 @@ function PatchReview({
   salvage,
   restored = false,
   onError,
+  onOpenDiff,
 }: {
   patch: PatchArtifact;
   canDecide: boolean;
@@ -447,6 +452,8 @@ function PatchReview({
   /** 失败/中止现场的挽救补丁：只能检视与导出，永远不能被接受 */
   salvage?: boolean;
   onError: (err: unknown) => void;
+  /** 在编辑器里打开某个文件的 diff（v0.2 P2「diff 也是一种标签」）；不接线则不显示入口 */
+  onOpenDiff?: (file: { path: string; diff: string; truncated: boolean }) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
@@ -563,6 +570,21 @@ function PatchReview({
             <Badge tone={f.changeKind === 'ADDED' ? 'info' : 'default'}>{f.changeKind}</Badge>
             <code>{f.path}</code>
             <span className="spacer" style={{ flex: 1 }} />
+            {onOpenDiff && (
+              <button
+                className="linklike"
+                style={{ fontSize: 11 }}
+                title="在编辑器面板并排查看这份改动"
+                onClick={(e) => {
+                  // summary 的默认行为是折叠切换 —— 打开 diff 不该顺手把行折上
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onOpenDiff({ path: f.path, diff: f.diff, truncated: f.diffTruncated ?? false });
+                }}
+              >
+                在编辑器打开
+              </button>
+            )}
             <span style={{ color: 'var(--state-verified-fg)', fontSize: 11 }}>+{f.addedLines}</span>
             <span style={{ color: 'var(--state-failed-fg)', fontSize: 11 }}>-{f.removedLines}</span>
           </summary>

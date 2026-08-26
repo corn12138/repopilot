@@ -38,7 +38,7 @@ import { Composer } from './views/TaskForm';
 import { CommandPalette, type PaletteCommand } from './views/CommandPalette';
 import { RunDetail } from './views/RunDetail';
 import { FileTreePanel } from './views/FileTree';
-import { EditorPane } from './views/Editor';
+import { EditorPane, type EditorTab } from './views/Editor';
 import { SettingsView } from './views/Settings';
 import { EvidenceView } from './views/Evidence';
 
@@ -87,8 +87,9 @@ export function App() {
    * 编辑器标签页（只读查看器）。换快照/项目时整体作废。
    * 预览/固定模型（v0.1 #7）：树单击产生的预览标签全局至多一个、被下一次预览复用；
    * 双击（树里或标签上）把它固定下来。IDE 惯例 —— 预览是临时的，固定才是"我要留着"。
+   * diff 标签（P2）：补丁文件的改动以 `diff:` 前缀 id 并排打开，内容自带、始终固定。
    */
-  const [editorTabs, setEditorTabs] = useState<{ path: string; pinned: boolean }[]>([]);
+  const [editorTabs, setEditorTabs] = useState<EditorTab[]>([]);
   const [activeEditorTab, setActiveEditorTab] = useState<string | null>(null);
   /** 编辑器显式收起：标签保留，右舞台让位给对话（v0.2 N12 的"显式开关"） */
   const [editorCollapsed, setEditorCollapsed] = useState(false);
@@ -450,19 +451,20 @@ export function App() {
   const openFileInEditor = useCallback((path: string, opts?: { pin?: boolean }) => {
     const pin = opts?.pin ?? false;
     setEditorTabs((prev) => {
-      const existing = prev.find((t) => t.path === path);
+      const existing = prev.find((t) => t.id === path);
       if (existing) {
         // 已开着：双击把预览升级为固定；固定的不降级
         return pin && !existing.pinned
-          ? prev.map((t) => (t.path === path ? { ...t, pinned: true } : t))
+          ? prev.map((t) => (t.id === path ? { ...t, pinned: true } : t))
           : prev;
       }
-      if (pin) return [...prev, { path, pinned: true }];
+      const tab: EditorTab = { id: path, kind: 'file', path, pinned: pin };
+      if (pin) return [...prev, tab];
       // 预览位全局至多一个：有就原位复用，没有才新开
       const previewIdx = prev.findIndex((t) => !t.pinned);
-      if (previewIdx < 0) return [...prev, { path, pinned: false }];
+      if (previewIdx < 0) return [...prev, tab];
       const next = [...prev];
-      next[previewIdx] = { path, pinned: false };
+      next[previewIdx] = tab;
       return next;
     });
     setActiveEditorTab(path);
@@ -470,17 +472,32 @@ export function App() {
     setEditorCollapsed(false);
   }, []);
 
-  const pinEditorTab = useCallback((path: string) => {
-    setEditorTabs((prev) => prev.map((t) => (t.path === path ? { ...t, pinned: true } : t)));
+  /** 补丁文件的改动进编辑器（P2）：内容是封存补丁的拷贝，始终固定标签 */
+  const openDiffInEditor = useCallback(
+    (file: { path: string; diff: string; truncated: boolean }) => {
+      const id = `diff:${file.path}`;
+      setEditorTabs((prev) =>
+        prev.some((t) => t.id === id)
+          ? prev
+          : [...prev, { id, kind: 'diff', path: file.path, pinned: true, diff: file.diff, truncated: file.truncated }],
+      );
+      setActiveEditorTab(id);
+      setEditorCollapsed(false);
+    },
+    [],
+  );
+
+  const pinEditorTab = useCallback((id: string) => {
+    setEditorTabs((prev) => prev.map((t) => (t.id === id ? { ...t, pinned: true } : t)));
   }, []);
 
-  const closeEditorTab = useCallback((path: string) => {
+  const closeEditorTab = useCallback((id: string) => {
     setEditorTabs((prev) => {
-      const next = prev.filter((t) => t.path !== path);
+      const next = prev.filter((t) => t.id !== id);
       setActiveEditorTab((cur) => {
-        if (cur !== path) return cur;
-        const idx = prev.findIndex((t) => t.path === path);
-        return next[Math.min(idx, next.length - 1)]?.path ?? null;
+        if (cur !== id) return cur;
+        const idx = prev.findIndex((t) => t.id === id);
+        return next[Math.min(idx, next.length - 1)]?.id ?? null;
       });
       return next;
     });
@@ -871,6 +888,7 @@ export function App() {
                     approvalAction={approvalAction}
                     onError={report}
                     onRefresh={() => void loadRunDetail(selectedRunId)}
+                    onOpenDiff={openDiffInEditor}
                   />
                 ) : (
                   <RunDetailRequestPanel

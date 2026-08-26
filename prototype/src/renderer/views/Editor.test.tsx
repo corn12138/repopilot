@@ -68,7 +68,7 @@ function routeCalls(input: { files: Record<string, FilePayload>; generation?: nu
   });
 }
 
-const tab = (path: string, pinned = true) => ({ path, pinned });
+const tab = (path: string, pinned = true) => ({ id: path, kind: 'file' as const, path, pinned });
 
 const baseProps = {
   snapshotId: 'snap_1',
@@ -157,5 +157,52 @@ describe('EditorPane', () => {
     await waitFor(() =>
       expect(callMock.mock.calls.filter(([m]) => m === 'files.read').length).toBe(readsBefore + 1),
     );
+  });
+});
+
+describe('diff 标签（交互评审 v0.2 P2）：补丁改动也是一种标签', () => {
+  afterEach(() => cleanup());
+
+  it('diff 标签自带内容不走 IPC，± 前缀与「补丁 diff」徽章，无刷新按钮', async () => {
+    callMock.mockReset();
+    const diffTab = {
+      id: 'diff:src/a.ts',
+      kind: 'diff' as const,
+      path: 'src/a.ts',
+      pinned: true,
+      diff: '@@ -1 +1 @@\n-const a = 1;\n+const a = 2;',
+      truncated: false,
+    };
+    render(<EditorPane {...baseProps} tabs={[diffTab]} active="diff:src/a.ts" />);
+
+    expect(screen.getByRole('tab', { name: /± a.ts/ })).toBeTruthy();
+    expect(screen.getByText('补丁 diff')).toBeTruthy();
+    expect(screen.getByText('+const a = 2;')).toBeTruthy();
+    // 封存补丁没有新版本：不发 IPC、没有刷新按钮
+    expect(callMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: '刷新' })).toBeNull();
+  });
+
+  it('同一路径的 file 与 diff 标签并排互不干扰', async () => {
+    callMock.mockReset();
+    callMock.mockImplementation(async (method: string) => {
+      if (method === 'files.tree') return { entries: [], source: 'SNAPSHOT', generation: null };
+      if (method === 'files.read') {
+        return { path: 'src/a.ts', content: 'const a = 1;', bytes: 12, truncated: false, binary: false, changed: false, source: 'SNAPSHOT', generation: null };
+      }
+      throw new Error(`unexpected ${method}`);
+    });
+    const diffTab = {
+      id: 'diff:src/a.ts',
+      kind: 'diff' as const,
+      path: 'src/a.ts',
+      pinned: true,
+      diff: '@@ -1 +1 @@\n-x\n+y',
+      truncated: false,
+    };
+    render(<EditorPane {...baseProps} tabs={[tab('src/a.ts'), diffTab]} active="src/a.ts" />);
+
+    await screen.findByText('const a = 1;');
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
   });
 });
