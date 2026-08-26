@@ -146,3 +146,21 @@ describe('P1 骨架：布局恒定与显式收起', () => {
     expect(await screen.findByText('+ 授权本地仓库…')).toBeTruthy();
   });
 });
+
+describe('P1 状态栏：全局状态的唯一权威位', () => {
+  it('Core 状态只在状态栏出现一次；项目名入栏；未配置模型可点去设置', async () => {
+    installBridge();
+    render(<App />);
+
+    const bar = await screen.findByLabelText('状态栏');
+    expect(bar.textContent).toContain('Agent Core 就绪');
+    // 唯一主场：侧栏顶部小字不再重复 Core 状态
+    expect(screen.getAllByText(/Agent Core 就绪/)).toHaveLength(1);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Layout Project/ }));
+    await waitFor(() => expect(bar.textContent).toContain('Layout Project'));
+
+    fireEvent.click(screen.getByRole('button', { name: '未配置模型' }));
+    expect(await screen.findByText('环境自检')).toBeTruthy();
+  });
+});

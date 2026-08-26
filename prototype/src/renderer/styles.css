@@ -240,6 +240,8 @@ textarea {
 .app {
   display: grid;
   grid-template-columns: 264px 1fr;
+  /* 第二行是底部状态栏（v0.1 #9），横跨所有列 */
+  grid-template-rows: minmax(0, 1fr) auto;
   height: 100%;
 }
 
@@ -309,6 +311,50 @@ textarea {
 .sidebar .filepanel-head {
   padding: 10px 10px 8px;
 }
+
+/* 底部状态栏：全局状态的唯一权威位（v0.1 #9）。安静、小字、不抢注意力 */
+.statusbar {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 12px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  background: var(--surface-panel);
+  border-top: 1px solid var(--border-hairline);
+  user-select: none;
+}
+.statusbar .spacer {
+  flex: 1;
+}
+.statusbar-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+}
+.statusbar-dot.ok { background: var(--state-verified-fg); }
+.statusbar-dot.warn { background: var(--state-warning-fg); }
+.statusbar-dot.err { background: var(--state-failed-fg); }
+.statusbar-sep { opacity: 0.5; }
+.statusbar-project {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.statusbar-models {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+.statusbar-models:hover { color: var(--text-primary); }
 
 /* 编辑器收起后的回程条：贴在主栏顶部，安静但可见 */
 .editor-restore {

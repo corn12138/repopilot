@@ -331,6 +331,8 @@ export function App() {
   }, [runs]);
 
   const enabledModelCount = modelProfiles.filter((m) => m.enabled).length;
+  /** 状态栏用：还没到终态的 Run 数（全部项目） */
+  const activeRunCount = useMemo(() => runs.filter((r) => !isTerminal(r.status)).length, [runs]);
   const selectedImportData =
     selectedProject && isOwnedReady(importState, selectedProject.projectId) ? importState.data : null;
   const importedProject =
@@ -393,10 +395,8 @@ export function App() {
       <aside className="sidebar">
         <div className="sidebar-head">
           <h1>RepoPilot</h1>
-          <div className="sub">
-            prototype ·{' '}
-            {coreStatus === 'READY' ? 'Agent Core 就绪' : coreStatus === 'DOWN' ? 'Core 已退出' : 'Core 启动中'}
-          </div>
+          {/* Core 状态的唯一主场是底部状态栏（v0.1 #9）—— 这里不再重复 */}
+          <div className="sub">prototype · disposable spike</div>
         </div>
 
         <div className="sidebar-tabs">
@@ -722,6 +722,58 @@ export function App() {
           onCollapse={() => setEditorCollapsed(true)}
         />
       )}
+
+      {/*
+        底部状态栏（v0.1 #9）：全局状态的唯一权威位。
+        此前 Core 状态在侧栏顶部小字、模型在 composer 右下、预算只在 Run 详情 ——
+        散落三个角落。这里只放全局事实，Run 级细节仍在各自主场。
+      */}
+      <footer className="statusbar" aria-label="状态栏">
+        <span
+          className={`statusbar-dot ${coreStatus === 'READY' ? 'ok' : coreStatus === 'DOWN' ? 'err' : 'warn'}`}
+          aria-hidden="true"
+        />
+        <span>
+          {coreStatus === 'READY' ? 'Agent Core 就绪' : coreStatus === 'DOWN' ? 'Core 已退出' : 'Core 启动中'}
+        </span>
+        {selectedProject && (
+          <>
+            <span className="statusbar-sep" aria-hidden="true">·</span>
+            <span className="statusbar-project" title={selectedProject.displayPath}>
+              {selectedProject.name}
+            </span>
+          </>
+        )}
+        {activeRunCount > 0 && (
+          <>
+            <span className="statusbar-sep" aria-hidden="true">·</span>
+            <span>运行中 {activeRunCount}</span>
+          </>
+        )}
+        <span className="spacer" />
+        {selectedRun && !isTerminal(selectedRun.status) && selectedRun.limits.maxTotalTokens > 0 && (
+          <span title={`token ${selectedRun.ledger.inputTokens + selectedRun.ledger.outputTokens} / ${selectedRun.limits.maxTotalTokens}（超限即停，不重置）`}>
+            预算{' '}
+            {Math.round(
+              ((selectedRun.ledger.inputTokens + selectedRun.ledger.outputTokens) /
+                selectedRun.limits.maxTotalTokens) *
+                100,
+            )}
+            %
+          </span>
+        )}
+        <button
+          className="statusbar-models"
+          onClick={() => {
+            setSettingsFocus(null);
+            setShowSettings(true);
+            setShowEvidence(false);
+          }}
+          title="模型连接在「设置 · API」里配置"
+        >
+          {enabledModelCount > 0 ? `${enabledModelCount} 个模型可用` : '未配置模型'}
+        </button>
+      </footer>
     </div>
   );
 }
