@@ -272,7 +272,10 @@ describe('Slice G：补丁动了验证输入时，"已修复"徽章旁必须有�
     await waitFor(() => expect(screen.getByText(/补丁修改了验证输入：/)).toBeTruthy());
     const banner = screen.getByText(/补丁修改了验证输入：/).closest('div')!;
     expect(banner.textContent).toContain('vitest.config.ts、src/a.test.ts');
-    expect(banner.textContent).toContain('ACCEPTED_UNVERIFIED');
+    // 终态用词典词说人话，raw 枚举在 title 里保留（交互评审 v0.2 N7）
+    expect(banner.textContent).toContain('已接受·未验证');
+    expect(banner.textContent).not.toContain('ACCEPTED_UNVERIFIED');
+    expect(banner.querySelector('[title="ACCEPTED_UNVERIFIED"]')).toBeTruthy();
     expect(banner.textContent).toContain('不能证明修复正确');
     // 徽章照常显示"已修复"—— 事实不隐藏，只是旁边说清楚它证明不了什么
     expect(screen.getByText(/已修复 typecheck/)).toBeTruthy();

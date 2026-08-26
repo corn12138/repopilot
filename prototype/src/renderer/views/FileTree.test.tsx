@@ -209,3 +209,37 @@ describe('FileTreePanel async ownership', () => {
     expect(screen.queryByText('没有文件')).toBeNull();
   });
 });
+
+describe('恢复 Run 的文件面板（交互评审 v0.2 N6）：快照原貌 + 说明，不是红字错误', () => {
+  // 注意大括号：beforeEach 返回 mock 本身会被 vitest 当作 teardown 回调零参调用
+  beforeEach(() => {
+    requestMock.mockReset();
+  });
+  afterEach(() => cleanup());
+
+  it('workspaceRecycled：面板说明"工作区已回收、下面是快照原貌"，树走快照通道', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'files.tree') {
+        return { entries: [{ path: 'src/app.ts', bytes: 12, changed: false }], source: 'SNAPSHOT', generation: null };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    render(
+      <FileTreePanel
+        {...baseProps}
+        runId={null}
+        workspaceRecycled
+      />,
+    );
+
+    await screen.findByText('app.ts');
+    expect(screen.getByText(/隔离工作区已随进程结束回收/)).toBeTruthy();
+    expect(screen.getByText(/快照原貌/)).toBeTruthy();
+    // 设计内状态不渲染成错误
+    expect(screen.queryByText(/读取失败/)).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    // 图标按钮有可读的中文名（不是「↻」「✕」）
+    expect(screen.getByRole('button', { name: '刷新文件树' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '关闭文件面板' })).toBeTruthy();
+  });
+});

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { CommandOutcome, RunEvent, ToolCallView } from '@shared/domain';
-import { Badge, DiffView, RiskBadge, timeOf } from '../components/common';
+import { Badge, DiffView, ResolutionBadge, RiskBadge, timeOf } from '../components/common';
 
 /**
  * 把持久化事件和工具调用合并成一条按时间排列的对话流。
@@ -511,8 +511,14 @@ function Row({ item }: { item: Item }) {
       return (
         <div className="term">
           <div className="term-head">
-            <Badge tone={item.phase === 'BASELINE' ? 'default' : 'info'}>{item.phase}</Badge>
-            <Badge tone={item.passed ? 'ok' : 'err'}>{item.passed ? 'PASSED' : 'FAILED'}</Badge>
+            <span title={item.phase}>
+              <Badge tone={item.phase === 'BASELINE' ? 'default' : 'info'}>
+                {item.phase === 'BASELINE' ? '基线验证' : item.phase === 'POST_MUTATION' ? '改后验证' : item.phase}
+              </Badge>
+            </span>
+            <span title={item.passed ? 'PASSED' : 'FAILED'}>
+              <Badge tone={item.passed ? 'ok' : 'err'}>{item.passed ? '通过' : '未通过'}</Badge>
+            </span>
             <span className="spacer" />
             <span className="msg-time">{timeOf(item.at)}</span>
           </div>
@@ -583,9 +589,7 @@ function TerminalBlock({ call, at }: { call: ToolCallView; at: string }) {
         <code>{call.argsSummary}</code>
         <span className="spacer" />
         {call.durationMs !== null && <span className="msg-time">{call.durationMs}ms</span>}
-        <Badge tone={call.resolution === 'SUCCEEDED' ? 'ok' : failed ? 'err' : 'info'}>
-          {call.resolution ?? '运行中'}
-        </Badge>
+        <ResolutionBadge resolution={call.resolution} />
         <span className="msg-time">{timeOf(at)}</span>
       </div>
       {outcome ? (
@@ -649,9 +653,7 @@ function ToolBlock({ call, at }: { call: ToolCallView; at: string }) {
         <span style={{ color: 'var(--text-secondary)' }}>{call.argsSummary}</span>
         <span className="spacer" />
         {call.durationMs !== null && <span className="msg-time">{call.durationMs}ms</span>}
-        <Badge tone={call.resolution === 'SUCCEEDED' ? 'ok' : failed ? 'err' : 'info'}>
-          {call.resolution ?? '…'}
-        </Badge>
+        <ResolutionBadge resolution={call.resolution} />
         <span className="msg-time">{timeOf(at)}</span>
       </summary>
       <div className="toolrow-body">

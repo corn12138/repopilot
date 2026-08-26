@@ -60,8 +60,11 @@ describe('EvidenceView', () => {
     render(<EvidenceView onError={vi.fn()} />);
     await waitFor(() => expect(screen.getByText(/分母为 0，不写百分比/)).toBeTruthy());
     expect(screen.queryByText(/%/)).toBeNull();
-    // 页面必须自己声明它不构成 ASM-019 的证据
-    expect(screen.getByText(/不构成 ASM-019/)).toBeTruthy();
+    // 页面必须自己声明它不构成"异构审核降低缺陷"的证据 —— 说给操作者的话在正文，
+    // 规格编号收进 title（交互评审 v0.2 N7：raw 不删，降层级）
+    expect(screen.getByText(/那需要密封 A\/B 对照实验/)).toBeTruthy();
+    expect(screen.queryByText(/不构成 ASM-019/)).toBeNull();
+    expect(screen.getByTitle(/ASM-019/)).toBeTruthy();
     expect(screen.getByText(/SPK-010 —— Deferred \/ Not authorized/)).toBeTruthy();
   });
 

@@ -655,8 +655,11 @@ export function App() {
       {filesOpen && fileSnapshotId && coreStatus === 'READY' && (
         <FileTreePanel
           snapshotId={fileSnapshotId}
-          runId={selectedRunId}
-          workspaceGeneration={selectedRun?.workspaceGeneration ?? null}
+          // 恢复的 Run 工作区已回收：读它必然失败。直接回落到快照原貌，
+          // 面板里说明为什么 —— 设计内状态不渲染成错误（交互评审 v0.2 N6）
+          runId={selectedRun?.restored ? null : selectedRunId}
+          workspaceGeneration={selectedRun?.restored ? null : (selectedRun?.workspaceGeneration ?? null)}
+          workspaceRecycled={Boolean(selectedRun?.restored)}
           refreshKey={filesKey}
           onClose={() => setFilesOpen(false)}
           onOpenFile={openFileInEditor}

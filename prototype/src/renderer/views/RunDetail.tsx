@@ -18,6 +18,7 @@ import {
   Banner,
   Card,
   DiffView,
+  failureClassText,
   timeOf,
 } from '../components/common';
 import {
@@ -313,28 +314,10 @@ export function RunDetail({
 // ---------------------------------------------------------------------------
 
 /** 失败归类的中文标签；raw 枚举收进 title 悬停可见（与状态徽章同一约定） */
-const FAILURE_CLASS_TEXT: Record<string, string> = {
-  VERIFICATION_FAILED: '验证未通过',
-  NO_CHANGES: '未产生改动',
-  MODEL_INVOCATION_FAILED: '模型调用失败',
-  PLANNING_FAILED: '规划失败',
-  RUNTIME_ERROR: '运行时异常',
-  BUDGET_EXHAUSTED: '预算耗尽',
-  EGRESS_BLOCKED: '出站被阻断',
-  PLAN_REJECTED: '计划被拒',
-  APPROVAL_EXPIRED: '审批过期',
-  PATCH_REJECTED: '补丁被拒',
-  CHANGES_REQUESTED: '要求修改',
-  USER_CANCELLED: '用户取消',
-  TIMEOUT: '超时',
-  INTERRUPTED: '进程中断',
-  INVARIANT_VIOLATION: '平台内部错误',
-};
-
 function FailureClassBadge({ failureClass }: { failureClass: string }) {
   return (
     <span title={failureClass}>
-      <Badge tone="err">{FAILURE_CLASS_TEXT[failureClass] ?? failureClass}</Badge>
+      <Badge tone="err">{failureClassText(failureClass)}</Badge>
     </span>
   );
 }
@@ -549,7 +532,8 @@ function PatchReview({
       {patch.comparison === null && (
         <Banner tone="warn">
           本次运行没有执行任何验证命令。补丁的正确性<strong>完全</strong>由你判断；
-          接受后 Run 终态是 <code>ACCEPTED_UNVERIFIED</code>，不是 <code>SUCCEEDED</code>。
+          接受后 Run 终态是<span title="ACCEPTED_UNVERIFIED"><b>「已接受·未验证」</b></span>，
+          不是<span title="SUCCEEDED">「成功」</span>。
         </Banner>
       )}
       {(patch.verificationInputsTouched?.length ?? 0) > 0 && (
@@ -558,7 +542,8 @@ function PatchReview({
           <strong>补丁修改了验证输入：</strong>
           {patch.verificationInputsTouched!.join('、')}。
           上面的"已修复"是在被改过的配置/测试/验证脚本下跑出来的，<b>不能证明修复正确</b>；
-          接受后 Run 终态是 <code>ACCEPTED_UNVERIFIED</code>，不是 <code>SUCCEEDED</code>。
+          接受后 Run 终态是<span title="ACCEPTED_UNVERIFIED"><b>「已接受·未验证」</b></span>，
+          不是<span title="SUCCEEDED">「成功」</span>。
           若任务本来就要改这些文件，请自行核对验证语义没有被放宽。
         </Banner>
       )}

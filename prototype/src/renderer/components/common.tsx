@@ -76,20 +76,76 @@ export function RunStatusBadge({ status }: { status: RunStatus }) {
   );
 }
 
+/** R0–R4 是内部分级代号，光秃秃地印出来没人看得懂 —— 代号保留，语义进 title（v0.2 N7） */
+const TOOL_RISK_TITLE: Record<ToolRisk, string> = {
+  R0: 'R0 · 只读操作',
+  R1: 'R1 · 构建/测试/类型检查类命令，允许执行',
+  R2: 'R2 · 安装/网络/服务类，需要一次性精确批准',
+  R3: 'R3 · 删除/覆盖/权限类，平台拒绝执行',
+  R4: 'R4 · push/发布/凭据类，平台拒绝执行',
+};
+
 export function RiskBadge({ risk }: { risk: ToolRisk }) {
   const tone = risk === 'R0' ? 'default' : risk === 'R1' ? 'info' : risk === 'R2' ? 'warn' : 'err';
-  return <Badge tone={tone}>{risk}</Badge>;
+  return (
+    <span title={TOOL_RISK_TITLE[risk] ?? risk}>
+      <Badge tone={tone}>{risk}</Badge>
+    </span>
+  );
 }
+
+/**
+ * 工具调用结果说人话，raw 枚举进 title。
+ * UNKNOWN_RECONCILING 不是失败 —— 是"断连期间结果没拿到、正在对账"，
+ * 用紫色（信号缺失）而不是红色（机器负向终局），红色会让用户误以为要去修它。
+ */
+const TOOL_RESOLUTION_TEXT: Record<ToolCallResolution, string> = {
+  SUCCEEDED: '成功',
+  FAILED: '失败',
+  DENIED: '被拒绝',
+  CANCELLED: '已取消',
+  SKIPPED: '已跳过',
+  UNKNOWN_RECONCILING: '结果未知 · 对账中',
+};
 
 export function ResolutionBadge({ resolution }: { resolution: ToolCallResolution | null }) {
   if (!resolution) return <Badge tone="info">运行中</Badge>;
   const tone =
     resolution === 'SUCCEEDED'
       ? 'ok'
-      : resolution === 'FAILED' || resolution === 'UNKNOWN_RECONCILING'
-        ? 'err'
-        : 'warn';
-  return <Badge tone={tone}>{resolution}</Badge>;
+      : resolution === 'UNKNOWN_RECONCILING'
+        ? 'purple'
+        : resolution === 'FAILED'
+          ? 'err'
+          : 'warn';
+  return (
+    <span title={resolution}>
+      <Badge tone={tone}>{TOOL_RESOLUTION_TEXT[resolution] ?? resolution}</Badge>
+    </span>
+  );
+}
+
+/** 失败归类的中文词典。原先只在详情页内用，证据页的分布表也要 —— 一处定义两处消费 */
+export const FAILURE_CLASS_TEXT: Record<string, string> = {
+  VERIFICATION_FAILED: '验证未通过',
+  NO_CHANGES: '未产生改动',
+  MODEL_INVOCATION_FAILED: '模型调用失败',
+  PLANNING_FAILED: '规划失败',
+  RUNTIME_ERROR: '运行时异常',
+  BUDGET_EXHAUSTED: '预算耗尽',
+  EGRESS_BLOCKED: '出站被阻断',
+  PLAN_REJECTED: '计划被拒',
+  APPROVAL_EXPIRED: '审批过期',
+  PATCH_REJECTED: '补丁被拒',
+  CHANGES_REQUESTED: '要求修改',
+  USER_CANCELLED: '用户取消',
+  TIMEOUT: '超时',
+  INTERRUPTED: '进程中断',
+  INVARIANT_VIOLATION: '平台内部错误',
+};
+
+export function failureClassText(failureClass: string): string {
+  return FAILURE_CLASS_TEXT[failureClass] ?? failureClass;
 }
 
 /** 恢复态与证据完整性徽标。两者都必须一眼可见，否则用户会把只读当成能续跑。 */

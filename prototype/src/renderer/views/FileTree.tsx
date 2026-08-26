@@ -140,6 +140,7 @@ export function FileTreePanel({
   snapshotId,
   runId,
   workspaceGeneration = null,
+  workspaceRecycled = false,
   refreshKey,
   onClose,
   onOpenFile,
@@ -148,6 +149,12 @@ export function FileTreePanel({
   runId: string | null;
   /** 当前 Run 投影中的 generation；仅作为请求 owner hint，最终以 tree 响应为准。 */
   workspaceGeneration?: number | null;
+  /**
+   * 恢复的 Run 其隔离工作区已随进程回收 —— 这是设计内状态，不是读取失败。
+   * 为 true 时调用方应传 runId=null（回落到快照原貌），这里负责把"为什么是快照"说清楚
+   * 而不是渲染一段红字错误（交互评审 v0.2 N6）。
+   */
+  workspaceRecycled?: boolean;
   /** 变化时重新拉取；用于 Agent 改完文件后刷新 */
   refreshKey: number;
   onClose: () => void;
@@ -431,10 +438,10 @@ export function FileTreePanel({
           </Badge>
         </span>
         {changedCount > 0 && <Badge tone="ok">{changedCount} 改动</Badge>}
-        <button onClick={() => void load()} title="刷新">
+        <button onClick={() => void load()} title="刷新" aria-label="刷新文件树">
           ↻
         </button>
-        <button onClick={onClose} title="关闭">
+        <button onClick={onClose} title="关闭" aria-label="关闭文件面板">
           ✕
         </button>
       </div>
@@ -445,6 +452,13 @@ export function FileTreePanel({
         placeholder="过滤路径…"
         onChange={(e) => setFilter(e.target.value)}
       />
+
+      {workspaceRecycled && (
+        <div className="filepanel-stale" role="status">
+          该 Run 的隔离工作区已随进程结束回收 —— 这是恢复态的正常状态。
+          下面是导入时的快照原貌；补丁与验证记录在详情页仍可查看。
+        </div>
+      )}
 
       {staleTreeResult && (
         <div className="filepanel-stale" role="status">

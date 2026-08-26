@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
-import { relativeTime, RestoredBadge, runStatusText, runStatusTone } from './common';
+import { relativeTime, ResolutionBadge, RestoredBadge, RiskBadge, runStatusText, runStatusTone } from './common';
 
 describe('relativeTime：列表层的"多久之前"', () => {
   const now = Date.parse('2026-08-25T12:00:00.000Z');
@@ -63,5 +63,27 @@ describe('RestoredBadge：恢复 Run 的"落后一拍"不再常开黄牌（交�
     render(<RestoredBadge run={{ restored: true, evidence: 'DAMAGED' }} />);
     expect(screen.getByText('证据损坏')).toBeTruthy();
     expect(screen.queryByText('已从磁盘恢复')).toBeNull();
+  });
+});
+
+describe('徽章词典（交互评审 v0.2 N7）：说人话，raw 进 title', () => {
+  afterEach(() => cleanup());
+
+  it('ResolutionBadge：中文词 + raw title；对账中是紫色信号缺失，不是红色失败', () => {
+    render(<ResolutionBadge resolution="SUCCEEDED" />);
+    expect(screen.getByText('成功')).toBeTruthy();
+    expect(screen.queryByText('SUCCEEDED')).toBeNull();
+    expect(screen.getByTitle('SUCCEEDED')).toBeTruthy();
+    cleanup();
+
+    render(<ResolutionBadge resolution="UNKNOWN_RECONCILING" />);
+    expect(screen.getByText('结果未知 · 对账中')).toBeTruthy();
+    expect(screen.getByTitle('UNKNOWN_RECONCILING')).toBeTruthy();
+  });
+
+  it('RiskBadge：代号保留，语义进 title', () => {
+    render(<RiskBadge risk="R2" />);
+    expect(screen.getByText('R2')).toBeTruthy();
+    expect(screen.getByTitle(/一次性精确批准/)).toBeTruthy();
   });
 });
