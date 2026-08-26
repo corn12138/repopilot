@@ -1625,6 +1625,86 @@ select:focus-visible {
 }
 
 /* --------------------------------------------------------- 省略披露 */
+/* ⌘K 命令面板（v0.1 #10）：动作/运行/项目/文件的统一入口 */
+.palette-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgb(0 0 0 / 35%);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+}
+.palette {
+  width: min(580px, calc(100vw - 48px));
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-hairline);
+  border-radius: 10px;
+  box-shadow: var(--shadow-overlay);
+  overflow: hidden;
+}
+.palette-input {
+  border: none;
+  border-bottom: 1px solid var(--border-hairline);
+  border-radius: 0;
+  background: transparent;
+  padding: 12px 14px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.palette-input:focus {
+  outline: none;
+}
+.palette-list {
+  overflow-y: auto;
+  padding: 6px;
+}
+.palette-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: var(--text-primary);
+}
+.palette-row.active {
+  background: var(--surface-raised);
+}
+.palette-group {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.6px;
+  color: var(--text-tertiary);
+  min-width: 28px;
+}
+.palette-label {
+  flex: none;
+  font-size: 12.5px;
+}
+.palette-detail {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.palette-empty,
+.palette-more {
+  padding: 8px 10px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+
 /* 相位锚点（v0.1 #6）：时间线的分组结构 —— 一条安静的分隔行，不与消息争音量 */
 .phase-anchor {
   display: flex;

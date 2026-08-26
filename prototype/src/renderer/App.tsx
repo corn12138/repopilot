@@ -35,6 +35,7 @@ import {
   type RunDetailState,
 } from './useRendererOrchestration';
 import { Composer } from './views/TaskForm';
+import { CommandPalette, type PaletteCommand } from './views/CommandPalette';
 import { RunDetail } from './views/RunDetail';
 import { FileTreePanel } from './views/FileTree';
 import { EditorPane } from './views/Editor';
@@ -145,6 +146,19 @@ export function App() {
   // 设置与证据都是全屏视图：选中 Run 的顶栏/新事件提示/审批停靠条/Composer 一律让位。
   // 只判 showSettings 会让证据页下仍可发任务、批准计划（交互评审 v0.2 N1）。
   const fullScreenView = showSettings || showEvidence;
+  /** ⌘K 命令面板（v0.1 #10）：动作/运行/项目/文件的统一入口 */
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   const coreStatusRef = useRef(coreStatus);
   coreStatusRef.current = coreStatus;
@@ -457,6 +471,113 @@ export function App() {
       ) ?? null
     );
   }, [runs, selectedProject, selectedRunId]);
+
+  /*
+   * 命令面板的条目。全部复用已有的状态切换与 IPC —— 面板只是入口的集合，
+   * 不是新的权威。条目按"此刻做得到"过滤：没有项目就没有"新任务"。
+   */
+  const paletteCommands = useMemo<PaletteCommand[]>(() => {
+    const actions: PaletteCommand[] = [];
+    if (importedProject && selectedProject) {
+      actions.push({
+        id: 'act:new-task',
+        group: '动作',
+        label: '新任务',
+        detail: `在 ${selectedProject.name} 上描述要修的问题`,
+        run: () => {
+          setShowSettings(false);
+          setShowEvidence(false);
+          // Composer 常驻主栏底部；等全屏视图退场后聚焦输入框
+          setTimeout(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(), 0);
+        },
+      });
+    }
+    actions.push({
+      id: 'act:settings',
+      group: '动作',
+      label: '打开设置 · API',
+      run: () => {
+        setSettingsFocus(null);
+        setShowSettings(true);
+        setShowEvidence(false);
+      },
+    });
+    actions.push({
+      id: 'act:evidence',
+      group: '动作',
+      label: '打开证据页',
+      run: () => {
+        setShowEvidence(true);
+        setShowSettings(false);
+      },
+    });
+    actions.push({
+      id: 'act:retention',
+      group: '动作',
+      label: '清理历史记录',
+      detail: '设置 · 数据保留（预演后逐项报数）',
+      run: () => {
+        setSettingsFocus('retention');
+        setShowSettings(true);
+        setShowEvidence(false);
+      },
+    });
+    if (canShowFiles && coreStatus === 'READY') {
+      actions.push({
+        id: 'act:files',
+        group: '动作',
+        label: sidebarView === 'files' ? '回到运行列表' : '打开文件树',
+        run: () => setSidebarView((v) => (v === 'files' ? 'runs' : 'files')),
+      });
+    }
+    if (editorTabs.length > 0) {
+      actions.push({
+        id: 'act:editor',
+        group: '动作',
+        label: editorCollapsed ? '展开编辑器' : '收起编辑器',
+        detail: `${editorTabs.length} 个标签`,
+        run: () => setEditorCollapsed((v) => !v),
+      });
+    }
+    const projectName = (id: string) => projects.find((p) => p.projectId === id)?.name ?? '';
+    return [
+      ...actions,
+      ...runs.map((r) => ({
+        id: `run:${r.runId}`,
+        group: '运行' as const,
+        label: r.title || r.runId,
+        detail: `${projectName(r.projectId)} · ${runStatusText(r.status)}`,
+        run: () => openRun(r),
+      })),
+      ...projects.map((p) => ({
+        id: `project:${p.projectId}`,
+        group: '项目' as const,
+        label: p.name,
+        detail: p.displayPath,
+        run: () => openProject(p),
+      })),
+    ];
+  }, [
+    importedProject,
+    selectedProject,
+    canShowFiles,
+    coreStatus,
+    sidebarView,
+    editorTabs.length,
+    editorCollapsed,
+    projects,
+    runs,
+    openRun,
+    openProject,
+  ]);
+
+  const paletteFileSource = useMemo(
+    () =>
+      canShowFiles && fileSnapshotId && coreStatus === 'READY'
+        ? { snapshotId: fileSnapshotId, runId: selectedRun?.restored ? null : selectedRunId }
+        : null,
+    [canShowFiles, fileSnapshotId, coreStatus, selectedRun?.restored, selectedRunId],
+  );
 
   return (
     // 布局恒定（v0.2 N12）：侧栏 264px 恒左，对话恒居中，编辑器恒右舞台。
@@ -875,6 +996,19 @@ export function App() {
           {enabledModelCount > 0 ? `${enabledModelCount} 个模型可用` : '未配置模型'}
         </button>
       </footer>
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        commands={paletteCommands}
+        fileSource={paletteFileSource}
+        onOpenFile={(path) => {
+          // 从面板开文件 = 想看代码：全屏视图退场，编辑器以预览标签打开
+          setShowSettings(false);
+          setShowEvidence(false);
+          openFileInEditor(path);
+        }}
+      />
     </div>
   );
 }
