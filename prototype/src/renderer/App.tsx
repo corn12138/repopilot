@@ -79,6 +79,12 @@ export function App() {
   /** 设置页作为一个独立视图，而不是"没选项目时的兜底" */
   const [showSettings, setShowSettings] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
+  /**
+   * 打开设置页时要不要滚到某张卡。侧栏历史折叠里的"清理"入口跳的是数据保留卡
+   * （交互评审 v0.2 N9：归档/删除走 retention，缺的是列表层的出口）；
+   * 普通"设置"按钮进来则不滚 —— 所以每个入口都显式声明自己的意图。
+   */
+  const [settingsFocus, setSettingsFocus] = useState<'retention' | null>(null);
   // 设置与证据都是全屏视图：选中 Run 的顶栏/新事件提示/审批停靠条/Composer 一律让位。
   // 只判 showSettings 会让证据页下仍可发任务、批准计划（交互评审 v0.2 N1）。
   const fullScreenView = showSettings || showEvidence;
@@ -442,6 +448,18 @@ export function App() {
                         <details className="run-history">
                           <summary>更早的 {olderDone.length} 条</summary>
                           {olderDone.map(runRow)}
+                          {/* 历史的真删除走保留策略（证据按天龄回收）—— 出口放在数据所在之处 */}
+                          <button
+                            className="linklike run-history-clean"
+                            onClick={() => {
+                              setSettingsFocus('retention');
+                              setShowSettings(true);
+                              setShowEvidence(false);
+                              setError(null);
+                            }}
+                          >
+                            清理历史记录 → 设置 · 数据保留
+                          </button>
                         </details>
                       )}
                     </>
@@ -465,6 +483,7 @@ export function App() {
           <button
             className={showSettings ? 'primary' : ''}
             onClick={() => {
+              setSettingsFocus(null);
               setShowSettings(true);
               setShowEvidence(false);
               setError(null);
@@ -544,6 +563,7 @@ export function App() {
                   onProfilesChanged={setModelProfiles}
                   onRefresh={bootstrap}
                   onError={report}
+                  focusSection={settingsFocus}
                 />
               ) : selectedRunId && selectedRun ? (
                 selectedRunDetail ? (
@@ -580,7 +600,7 @@ export function App() {
                   checks={checks}
                   enabledModelCount={enabledModelCount}
                   onPick={pickProject}
-                  onSettings={() => setShowSettings(true)}
+                  onSettings={() => { setSettingsFocus(null); setShowSettings(true); }}
                 />
               )}
             </fieldset>
@@ -633,7 +653,7 @@ export function App() {
               }}
               onReimport={() => importProject(selectedProject)}
               onOpenRun={openRun}
-              onOpenSettings={() => setShowSettings(true)}
+              onOpenSettings={() => { setSettingsFocus(null); setShowSettings(true); }}
               onError={report}
             />
           </fieldset>

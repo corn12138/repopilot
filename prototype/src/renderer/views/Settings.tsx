@@ -13,6 +13,7 @@ export function SettingsView({
   onProfilesChanged,
   onRefresh,
   onError,
+  focusSection = null,
 }: {
   checks: DoctorCheck[];
   profiles: ModelConnectionProfile[];
@@ -22,6 +23,8 @@ export function SettingsView({
   onProfilesChanged: (profiles: ModelConnectionProfile[]) => void;
   onRefresh: () => Promise<void>;
   onError: (err: unknown) => void;
+  /** 从别处（如侧栏历史折叠的清理入口）跳进来时，滚动到指定卡片 */
+  focusSection?: 'retention' | null;
 }) {
   return (
     <>
@@ -103,7 +106,7 @@ export function SettingsView({
         </div>
       </Card>
 
-      <RetentionCard onError={onError} />
+      <RetentionCard onError={onError} autoFocus={focusSection === 'retention'} />
     </>
   );
 }
@@ -217,8 +220,24 @@ function SweepPreview({ summary }: { summary: PurgeSummaryView }) {
  *   - 清理结果必须报数（扫了多少、删了多少、释放多少），INCOMPLETE 必须醒目；
  *   - 单项失败逐条列出原因 —— 静默跳过和静默删除是同一类问题。
  */
-function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
+function RetentionCard({
+  onError,
+  autoFocus = false,
+}: {
+  onError: (err: unknown) => void;
+  /** 从侧栏历史折叠的清理入口跳进来：滚到这张卡，别让用户在设置页里找 */
+  autoFocus?: boolean;
+}) {
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const didFocusRef = useRef(false);
   const [policy, setPolicy] = useState<RetentionPolicyView | null>(null);
+  useEffect(() => {
+    // 等 policy 到位（卡片长到最终高度）再滚，且只滚一次；
+    // jsdom 没有 scrollIntoView —— 可选调用，真实渲染器里生效
+    if (!autoFocus || didFocusRef.current || policy === null) return;
+    didFocusRef.current = true;
+    cardRef.current?.scrollIntoView?.({ block: 'start' });
+  }, [autoFocus, policy]);
   const [usage, setUsage] = useState<DiskUsage>({});
   const [summary, setSummary] = useState<PurgeSummaryView | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
@@ -310,6 +329,7 @@ function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
     (evidenceDays !== String(policy.evidenceDays) || graceMinutes !== String(policy.workspaceGraceMinutes));
 
   return (
+    <div ref={cardRef}>
     <Card
       title="数据保留"
       hint="Retention"
@@ -437,6 +457,7 @@ function RetentionCard({ onError }: { onError: (err: unknown) => void }) {
         </>
       )}
     </Card>
+    </div>
   );
 }
 

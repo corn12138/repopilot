@@ -1849,6 +1849,14 @@ select:focus-visible {
   list-style-position: inside;
 }
 .run-history > summary:hover { color: var(--text-secondary); }
+/* 历史折叠里的清理出口：与折叠头同级的安静一行，跳到设置·数据保留（v0.2 N9） */
+.run-history-clean {
+  display: block;
+  font-size: 11px;
+  padding: 4px 10px 2px;
+  color: var(--text-tertiary);
+}
+.run-history-clean:hover { color: var(--accent-interactive); }
 
 .notice-fold,
 .import-details {
