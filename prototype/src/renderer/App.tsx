@@ -45,6 +45,10 @@ interface ImportRequest {
   subPath?: string;
 }
 
+/** 编辑器列可缩到的下限 / 对话列必须保住的下限（与 styles.css 的 minmax 一致） */
+const EDITOR_MIN_WIDTH = 360;
+const CHAT_MIN_WIDTH = 400;
+
 export function App() {
   const [coreStatus, setCoreStatus] = useState<'READY' | 'RESTARTING' | 'DOWN'>('RESTARTING');
   const [checks, setChecks] = useState<DoctorCheck[]>([]);
@@ -87,6 +91,48 @@ export function App() {
   const [activeEditorTab, setActiveEditorTab] = useState<string | null>(null);
   /** 编辑器显式收起：标签保留，右舞台让位给对话（v0.2 N12 的"显式开关"） */
   const [editorCollapsed, setEditorCollapsed] = useState(false);
+  /**
+   * 编辑器列宽（px）。null = 用 CSS 默认比例。用户拖过就记住（localStorage，
+   * 纯呈现偏好，不进事件、不进 Core）；拖拽、方向键、双击复位三条路等价。
+   */
+  const [editorWidth, setEditorWidth] = useState<number | null>(() => {
+    try {
+      const v = Number(window.localStorage.getItem('repopilot.ui.editorWidth'));
+      return Number.isFinite(v) && v >= EDITOR_MIN_WIDTH ? v : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const persistEditorWidth = useCallback((w: number | null) => {
+    setEditorWidth(w);
+    try {
+      if (w === null) window.localStorage.removeItem('repopilot.ui.editorWidth');
+      else window.localStorage.setItem('repopilot.ui.editorWidth', String(Math.round(w)));
+    } catch {
+      /* 存不了就只在本次会话内生效 —— 宽度是偏好，不是事实 */
+    }
+  }, []);
+
+  const clampEditorWidth = (w: number) =>
+    Math.min(Math.max(w, EDITOR_MIN_WIDTH), Math.max(EDITOR_MIN_WIDTH, window.innerWidth - 264 - CHAT_MIN_WIDTH));
+
+  const startDividerDrag = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      const onMove = (ev: PointerEvent) => {
+        setEditorWidth(clampEditorWidth(window.innerWidth - ev.clientX));
+      };
+      const onUp = (ev: PointerEvent) => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        persistEditorWidth(clampEditorWidth(window.innerWidth - ev.clientX));
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    },
+    [persistEditorWidth],
+  );
   /** 设置页作为一个独立视图，而不是"没选项目时的兜底" */
   const [showSettings, setShowSettings] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
@@ -415,7 +461,14 @@ export function App() {
   return (
     // 布局恒定（v0.2 N12）：侧栏 264px 恒左，对话恒居中，编辑器恒右舞台。
     // 唯一的布局变化是编辑器列的出现/收起 —— 没有任何面板会换位或换宽。
-    <div className={`app ${editorActive ? 'ide' : ''}`}>
+    <div
+      className={`app ${editorActive ? 'ide' : ''}`}
+      style={
+        editorActive && editorWidth !== null
+          ? { gridTemplateColumns: `264px minmax(${CHAT_MIN_WIDTH}px, 1fr) ${editorWidth}px` }
+          : undefined
+      }
+    >
       <aside className="sidebar">
         <div className="sidebar-head">
           <h1>RepoPilot</h1>
@@ -745,6 +798,29 @@ export function App() {
           onClose={closeEditorTab}
           onPin={pinEditorTab}
           onCollapse={() => setEditorCollapsed(true)}
+        />
+      )}
+
+      {/* 对话 ↔ 编辑器的分隔线：拖拽 / 方向键（±32px）/ 双击复位，三条路等价 */}
+      {editorActive && (
+        <div
+          className="pane-divider"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整编辑器宽度（方向键微调，双击复位）"
+          tabIndex={0}
+          onPointerDown={startDividerDrag}
+          onDoubleClick={() => persistEditorWidth(null)}
+          onKeyDown={(e) => {
+            const base = editorWidth ?? Math.round(window.innerWidth * 0.4);
+            if (e.key === 'ArrowLeft') {
+              e.preventDefault();
+              persistEditorWidth(clampEditorWidth(base + 32));
+            } else if (e.key === 'ArrowRight') {
+              e.preventDefault();
+              persistEditorWidth(clampEditorWidth(base - 32));
+            }
+          }}
         />
       )}
 

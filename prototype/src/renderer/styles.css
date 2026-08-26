@@ -1766,6 +1766,27 @@ select:focus-visible {
 .app.ide > .main { grid-column: 2; grid-row: 1; min-width: 0; }
 .app.ide > .editorpane { grid-column: 3; grid-row: 1; }
 
+/* 对话 ↔ 编辑器分隔线：叠在编辑器列左缘的 6px 抓握带（拖拽/方向键/双击复位） */
+.pane-divider {
+  grid-column: 3;
+  grid-row: 1;
+  justify-self: start;
+  width: 6px;
+  margin-left: -3px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 5;
+  touch-action: none;
+}
+.pane-divider:hover {
+  background: color-mix(in srgb, var(--accent-interactive) 35%, transparent);
+}
+.pane-divider:focus-visible {
+  background: color-mix(in srgb, var(--accent-interactive) 35%, transparent);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
 .editorpane {
   display: flex;
   flex-direction: column;

@@ -215,3 +215,41 @@ describe('P1 预览通道合一：单击预览（复用）、双击固定', () =
     await waitFor(() => expect(tabOf('app.ts').className).not.toContain('preview'));
   });
 });
+
+describe('P1 分隔线：对话 ↔ 编辑器宽度可调且被记住', () => {
+  afterEach(() => {
+    window.localStorage.removeItem('repopilot.ui.editorWidth');
+  });
+
+  it('方向键调宽被记住（localStorage），双击复位回默认比例', async () => {
+    installBridge();
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Layout Project/ }));
+    const filesTab = screen.getByRole('button', { name: '文件' });
+    await waitFor(() => expect((filesTab as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(filesTab);
+    const treeNode = () => {
+      const el = screen.getAllByText('app.ts').find((n) => n.className.includes('tree-name'));
+      if (!el) throw new Error('tree node not found');
+      return el;
+    };
+    await screen.findByText('app.ts');
+    fireEvent.doubleClick(treeNode());
+    await screen.findByLabelText('代码编辑器（只读）');
+
+    const divider = screen.getByRole('separator', { name: /调整编辑器宽度/ });
+    // 默认：不写内联列宽，走 CSS 比例
+    expect(appRoot().style.gridTemplateColumns).toBe('');
+
+    fireEvent.keyDown(divider, { key: 'ArrowLeft' });
+    const cols = appRoot().style.gridTemplateColumns;
+    expect(cols).toMatch(/264px minmax\(400px, 1fr\) \d+px/);
+    expect(window.localStorage.getItem('repopilot.ui.editorWidth')).toBeTruthy();
+
+    // 双击复位：内联列宽清除、记忆清除
+    fireEvent.doubleClick(divider);
+    expect(appRoot().style.gridTemplateColumns).toBe('');
+    expect(window.localStorage.getItem('repopilot.ui.editorWidth')).toBeNull();
+  });
+});
