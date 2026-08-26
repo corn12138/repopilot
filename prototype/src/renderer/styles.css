@@ -1051,34 +1051,6 @@ ul.plain li {
   margin-left: auto;
 }
 
-.filepanel-viewer {
-  border-top: 1px solid var(--border-hairline);
-  display: flex;
-  flex-direction: column;
-  max-height: 52%;
-}
-.filepanel-viewer-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 10px;
-  background: var(--surface-raised);
-}
-.filepanel-viewer-head button {
-  padding: 1px 6px;
-  font-size: 11px;
-}
-.filepanel-code {
-  margin: 0;
-  padding: 8px 10px;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  line-height: 1.55;
-  overflow: auto;
-  white-space: pre;
-  color: var(--text-code);
-  flex: 1;
-}
 
 /* ------------------------------------------------- chat layout (会话式主栏) */
 /*
@@ -1686,9 +1658,6 @@ select:focus-visible {
  * 而且不能被点击 —— 对过期坐标系操作只会换来一个 Core 的 CONFLICT。
  */
 .filepanel-tree.stale,
-.filepanel-viewer.stale {
-  opacity: 0.55;
-}
 
 /* ------------------------------------------------- provider 展开头（语义化后） */
 .provider-head {
@@ -1828,6 +1797,15 @@ select:focus-visible {
   min-width: 0;
   scrollbar-width: thin;
 }
+/* 预览标签（v0.1 #7）：斜体 = 临时、会被下一次预览复用；双击固定后转正 */
+.editorpane-tab.preview .editorpane-tab-name {
+  font-style: italic;
+  color: var(--text-secondary);
+}
+.editorpane-tab.preview.active .editorpane-tab-name {
+  color: var(--text-primary);
+}
+
 /* 显式收起编辑器列（标签保留）—— v0.2 N12 的"显式开关" */
 .editorpane-collapse {
   flex: none;

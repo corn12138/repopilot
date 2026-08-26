@@ -68,6 +68,8 @@ function routeCalls(input: { files: Record<string, FilePayload>; generation?: nu
   });
 }
 
+const tab = (path: string, pinned = true) => ({ path, pinned });
+
 const baseProps = {
   snapshotId: 'snap_1',
   runId: null,
@@ -84,7 +86,7 @@ afterEach(() => {
 describe('EditorPane', () => {
   it('加载活动标签：tree → read，内容与来源徽章可见', async () => {
     routeCalls({ files: { 'src/a.ts': filePayload('src/a.ts') } });
-    render(<EditorPane {...baseProps} tabs={['src/a.ts']} active="src/a.ts" />);
+    render(<EditorPane {...baseProps} tabs={[tab('src/a.ts')]} active="src/a.ts" />);
     await waitFor(() => expect(screen.getByTestId('codeview-stub').textContent).toContain('content of src/a.ts'));
     expect(screen.getByText('快照')).toBeTruthy();
     expect(callMock).toHaveBeenCalledWith('files.tree', expect.objectContaining({ snapshotId: 'snap_1' }));
@@ -100,7 +102,7 @@ describe('EditorPane', () => {
       generation: 2,
       failReadOnce: '文件来源 generation 已变化，请刷新文件树后重试',
     });
-    render(<EditorPane {...baseProps} runId="run_1" tabs={['src/a.ts']} active="src/a.ts" />);
+    render(<EditorPane {...baseProps} runId="run_1" tabs={[tab('src/a.ts')]} active="src/a.ts" />);
     await waitFor(() => expect(screen.getByTestId('codeview-stub')).toBeTruthy());
     // 重试 = 第二轮 tree + read
     expect(callMock.mock.calls.filter(([m]) => m === 'files.tree')).toHaveLength(2);
@@ -110,7 +112,7 @@ describe('EditorPane', () => {
 
   it('非 generation 类错误不重试，as-is 展示', async () => {
     routeCalls({ files: {}, failReadOnce: 'POLICY_DENIED: 路径越界' });
-    render(<EditorPane {...baseProps} tabs={['x.ts']} active="x.ts" />);
+    render(<EditorPane {...baseProps} tabs={[tab('x.ts')]} active="x.ts" />);
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('路径越界'));
     expect(callMock.mock.calls.filter(([m]) => m === 'files.tree')).toHaveLength(1);
   });
@@ -122,11 +124,11 @@ describe('EditorPane', () => {
         'big.ts': filePayload('big.ts', { truncated: true, bytes: 999999, content: 'partial' }),
       },
     });
-    const { rerender } = render(<EditorPane {...baseProps} tabs={['a.png', 'big.ts']} active="a.png" />);
+    const { rerender } = render(<EditorPane {...baseProps} tabs={[tab('a.png'), tab('big.ts')]} active="a.png" />);
     await waitFor(() => expect(screen.getByText(/二进制文件（5000 B），不显示内容/)).toBeTruthy());
     expect(screen.queryByTestId('codeview-stub')).toBeNull();
 
-    rerender(<EditorPane {...baseProps} tabs={['a.png', 'big.ts']} active="big.ts" />);
+    rerender(<EditorPane {...baseProps} tabs={[tab('a.png'), tab('big.ts')]} active="big.ts" />);
     await waitFor(() => expect(screen.getByText(/已截断/)).toBeTruthy());
     expect(screen.getByTestId('codeview-stub').textContent).toBe('partial');
   });
@@ -136,7 +138,7 @@ describe('EditorPane', () => {
     const onActivate = vi.fn();
     const onClose = vi.fn();
     render(
-      <EditorPane {...baseProps} tabs={['a.ts', 'b.ts']} active="a.ts" onActivate={onActivate} onClose={onClose} />,
+      <EditorPane {...baseProps} tabs={[tab('a.ts'), tab('b.ts')]} active="a.ts" onActivate={onActivate} onClose={onClose} />,
     );
     await waitFor(() => expect(screen.getByTestId('codeview-stub')).toBeTruthy());
     fireEvent.click(screen.getByText('b.ts'));
@@ -148,10 +150,10 @@ describe('EditorPane', () => {
 
   it('refreshKey 变化（Agent 改动落地）→ 内容作废重读', async () => {
     routeCalls({ files: { 'a.ts': filePayload('a.ts') } });
-    const { rerender } = render(<EditorPane {...baseProps} tabs={['a.ts']} active="a.ts" />);
+    const { rerender } = render(<EditorPane {...baseProps} tabs={[tab('a.ts')]} active="a.ts" />);
     await waitFor(() => expect(screen.getByTestId('codeview-stub')).toBeTruthy());
     const readsBefore = callMock.mock.calls.filter(([m]) => m === 'files.read').length;
-    rerender(<EditorPane {...baseProps} refreshKey={1} tabs={['a.ts']} active="a.ts" />);
+    rerender(<EditorPane {...baseProps} refreshKey={1} tabs={[tab('a.ts')]} active="a.ts" />);
     await waitFor(() =>
       expect(callMock.mock.calls.filter(([m]) => m === 'files.read').length).toBe(readsBefore + 1),
     );

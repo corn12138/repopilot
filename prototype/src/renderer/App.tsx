@@ -78,8 +78,12 @@ export function App() {
   const [sidebarView, setSidebarView] = useState<'runs' | 'files'>('runs');
   /** 文件树刷新令牌（Agent 改完文件后自增，让树重新拉取） */
   const [filesKey, setFilesKey] = useState(0);
-  // 编辑器标签页（只读查看器）。路径列表 + 活动项；换快照/项目时整体作废
-  const [editorTabs, setEditorTabs] = useState<string[]>([]);
+  /**
+   * 编辑器标签页（只读查看器）。换快照/项目时整体作废。
+   * 预览/固定模型（v0.1 #7）：树单击产生的预览标签全局至多一个、被下一次预览复用；
+   * 双击（树里或标签上）把它固定下来。IDE 惯例 —— 预览是临时的，固定才是"我要留着"。
+   */
+  const [editorTabs, setEditorTabs] = useState<{ path: string; pinned: boolean }[]>([]);
   const [activeEditorTab, setActiveEditorTab] = useState<string | null>(null);
   /** 编辑器显式收起：标签保留，右舞台让位给对话（v0.2 N12 的"显式开关"） */
   const [editorCollapsed, setEditorCollapsed] = useState(false);
@@ -356,20 +360,40 @@ export function App() {
     setActiveEditorTab(null);
   }, [fileSnapshotId]);
 
-  const openFileInEditor = useCallback((path: string) => {
-    setEditorTabs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+  const openFileInEditor = useCallback((path: string, opts?: { pin?: boolean }) => {
+    const pin = opts?.pin ?? false;
+    setEditorTabs((prev) => {
+      const existing = prev.find((t) => t.path === path);
+      if (existing) {
+        // 已开着：双击把预览升级为固定；固定的不降级
+        return pin && !existing.pinned
+          ? prev.map((t) => (t.path === path ? { ...t, pinned: true } : t))
+          : prev;
+      }
+      if (pin) return [...prev, { path, pinned: true }];
+      // 预览位全局至多一个：有就原位复用，没有才新开
+      const previewIdx = prev.findIndex((t) => !t.pinned);
+      if (previewIdx < 0) return [...prev, { path, pinned: false }];
+      const next = [...prev];
+      next[previewIdx] = { path, pinned: false };
+      return next;
+    });
     setActiveEditorTab(path);
     // 打开文件就是"我要看编辑器"的显式表达 —— 收起态随之解除
     setEditorCollapsed(false);
   }, []);
 
+  const pinEditorTab = useCallback((path: string) => {
+    setEditorTabs((prev) => prev.map((t) => (t.path === path ? { ...t, pinned: true } : t)));
+  }, []);
+
   const closeEditorTab = useCallback((path: string) => {
     setEditorTabs((prev) => {
-      const next = prev.filter((t) => t !== path);
+      const next = prev.filter((t) => t.path !== path);
       setActiveEditorTab((cur) => {
         if (cur !== path) return cur;
-        const idx = prev.indexOf(path);
-        return next[Math.min(idx, next.length - 1)] ?? null;
+        const idx = prev.findIndex((t) => t.path === path);
+        return next[Math.min(idx, next.length - 1)]?.path ?? null;
       });
       return next;
     });
@@ -719,6 +743,7 @@ export function App() {
           active={activeEditorTab}
           onActivate={setActiveEditorTab}
           onClose={closeEditorTab}
+          onPin={pinEditorTab}
           onCollapse={() => setEditorCollapsed(true)}
         />
       )}

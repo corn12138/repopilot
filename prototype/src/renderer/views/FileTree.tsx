@@ -65,23 +65,7 @@ interface TreeResult {
   readonly workspaceGeneration: number | null;
 }
 
-interface FileRequestOwner extends TreeRequestOwner {
-  readonly path: string;
-}
-
-interface FileResult {
-  readonly path: string;
-  readonly content: string;
-  readonly bytes: number;
-  readonly truncated: boolean;
-  readonly binary: boolean;
-  readonly changed: boolean;
-  readonly source: 'SNAPSHOT' | 'WORKSPACE';
-  readonly generation: number | null;
-}
-
 type TreeLoadState = OwnedAsyncState<TreeRequestOwner, TreeResult, string>;
-type FileLoadState = OwnedAsyncState<FileRequestOwner, FileResult, string>;
 
 function sameTreeOwner(a: TreeRequestOwner, b: TreeRequestOwner): boolean {
   return (
@@ -89,10 +73,6 @@ function sameTreeOwner(a: TreeRequestOwner, b: TreeRequestOwner): boolean {
     a.runId === b.runId &&
     a.workspaceGeneration === b.workspaceGeneration
   );
-}
-
-function sameFileOwner(a: FileRequestOwner, b: FileRequestOwner): boolean {
-  return sameTreeOwner(a, b) && a.path === b.path;
 }
 
 /**
@@ -158,73 +138,23 @@ export function FileTreePanel({
   /** 变化时重新拉取；用于 Agent 改完文件后刷新 */
   refreshKey: number;
   onClose: () => void;
-  /** 在编辑器面板打开文件（双击行 / 预览头部按钮）。不传则只有内嵌预览 */
-  onOpenFile?: (path: string) => void;
+  /**
+   * 预览通道合一（交互评审 v0.1 #7 / v0.2 P1）：单击 = 编辑器预览标签（复用），
+   * 双击 = 固定标签。树内不再有内嵌预览 —— 文件内容的唯一读取通道是编辑器面板，
+   * generation 门禁与刷新重读也由它统一执行。未接线时单击仅高亮。
+   */
+  onOpenFile?: (path: string, opts?: { pin?: boolean }) => void;
 }) {
   const treeRequestsRef = useRef<LatestRequestGuard<TreeRequestOwner> | null>(null);
-  const fileRequestsRef = useRef<LatestRequestGuard<FileRequestOwner> | null>(null);
   if (treeRequestsRef.current === null) {
     treeRequestsRef.current = createLatestRequestGuard<TreeRequestOwner>();
   }
-  if (fileRequestsRef.current === null) {
-    fileRequestsRef.current = createLatestRequestGuard<FileRequestOwner>();
-  }
   const treeRequests = treeRequestsRef.current;
-  const fileRequests = fileRequestsRef.current;
 
   const [treeState, setTreeState] = useState<TreeLoadState>(OWNED_ASYNC_IDLE);
-  const [fileState, setFileState] = useState<FileLoadState>(OWNED_ASYNC_IDLE);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
-
-  /** 正在读的文件路径，供刷新后自动重读用；state 会随渲染滞后，ref 不会。 */
-  const selectedRef = useRef<string | null>(null);
-  selectedRef.current = selected;
-
-  const openFile = useCallback(
-    async (path: string, tree: TreeResult) => {
-      const owner: FileRequestOwner = {
-        snapshotId,
-        runId,
-        // 文件归属使用 Core 确认的 tree generation，不能拿请求时的 hint 代替事实。
-        workspaceGeneration: tree.workspaceGeneration,
-        path,
-      };
-      const identity = fileRequests.begin(owner);
-      setSelected(path);
-      setFileState({ status: 'loading', ...identity });
-      try {
-        const result = await call('files.read', {
-          snapshotId,
-          path,
-          expectedGeneration: tree.workspaceGeneration,
-          ...(runId ? { runId } : {}),
-        });
-        // 文件请求可能在切换路径/来源后才完成；只有完整 owner 仍最新时才能渲染。
-        if (!fileRequests.isLatest(identity)) return;
-        if (
-          result.path !== path ||
-          result.source !== tree.source ||
-          result.generation !== tree.workspaceGeneration
-        ) {
-          setFileState({
-            status: 'error',
-            ...identity,
-            error:
-              `文件响应归属不匹配：请求 ${tree.source}/gen-${String(tree.workspaceGeneration)}/${path}，` +
-              `返回 ${result.source}/gen-${String(result.generation)}/${result.path}`,
-          });
-          return;
-        }
-        setFileState({ status: 'ready', ...identity, data: result });
-      } catch (err) {
-        if (!fileRequests.isLatest(identity)) return;
-        setFileState({ status: 'error', ...identity, error: errorMessage(err) });
-      }
-    },
-    [fileRequests, runId, snapshotId],
-  );
 
   const load = useCallback(async () => {
     const owner: TreeRequestOwner = { snapshotId, runId, workspaceGeneration };
@@ -232,16 +162,12 @@ export function FileTreePanel({
     const entityChanged = previousOwner === null || !sameTreeEntity(previousOwner, owner);
     const identity = treeRequests.begin(owner);
 
-    // Tree generation 是 file preview 的归属根；tree 一刷新，旧 file 请求即失去写 UI 的资格。
-    fileRequests.invalidate();
     /*
-     * 换实体才清空用户的位置。同一个 Run 写了个文件就把展开状态、选中文件和整棵树
-     * 全部清掉，是原型此前"生硬"的主要来源之一：Agent 每改一次文件，用户正在读的
-     * 东西就消失一次。旧内容在这里保留下来，但下面会显式标成"上一代、只读"。
+     * 换实体才清空用户的位置。同一个 Run 写了个文件就把展开状态、选中高亮和整棵树
+     * 全部清掉，是原型此前"生硬"的主要来源之一。旧内容在这里保留下来，
+     * 但下面会显式标成"上一代、只读"。
      */
-    const keepPath = entityChanged ? null : selectedRef.current;
     if (entityChanged) {
-      setFileState(OWNED_ASYNC_IDLE);
       setSelected(null);
       setExpanded(new Set());
       setTreeState({ status: 'loading', ...identity });
@@ -272,20 +198,13 @@ export function FileTreePanel({
         }
         return top;
       });
-      // 新一代里这个文件还在，就把它按新 generation 重读；不在了就明确收起。
-      if (keepPath !== null) {
-        if (r.entries.some((e) => e.path === keepPath)) {
-          void openFile(keepPath, data);
-        } else {
-          setFileState(OWNED_ASYNC_IDLE);
-          setSelected(null);
-        }
-      }
+      // 选中高亮只指向仍然存在的文件；文件内容的刷新重读由编辑器面板自己做
+      setSelected((cur) => (cur !== null && r.entries.some((e) => e.path === cur) ? cur : null));
     } catch (err) {
       if (!treeRequests.isLatest(identity)) return;
       setTreeState({ status: 'error', ...identity, error: errorMessage(err) });
     }
-  }, [fileRequests, openFile, runId, snapshotId, treeRequests, workspaceGeneration]);
+  }, [runId, snapshotId, treeRequests, workspaceGeneration]);
 
   useEffect(() => {
     void load();
@@ -294,9 +213,8 @@ export function FileTreePanel({
   useEffect(
     () => () => {
       treeRequests.invalidate();
-      fileRequests.invalidate();
     },
-    [fileRequests, treeRequests],
+    [treeRequests],
   );
 
   const currentTreeOwner: TreeRequestOwner = { snapshotId, runId, workspaceGeneration };
@@ -319,33 +237,6 @@ export function FileTreePanel({
   /** 屏幕上正在显示的那棵树 —— 可能是权威的，也可能是被标记为上一代的。 */
   const shownTree = treeResult ?? staleTreeResult;
 
-  const closeFile = () => {
-    fileRequests.invalidate();
-    setFileState(OWNED_ASYNC_IDLE);
-    setSelected(null);
-  };
-
-  /*
-   * 预览的归属跟着屏幕上那棵树走。刷新期间用 shownTree，正在读的文件才不会闪掉；
-   * 它连同树一起被标成上一代，所以"还在显示"不等于"这就是最新内容"。
-   */
-  const expectedFileOwner: FileRequestOwner | null =
-    selected && shownTree
-      ? {
-          snapshotId,
-          runId,
-          workspaceGeneration: shownTree.workspaceGeneration,
-          path: selected,
-        }
-      : null;
-  const ownedFileState =
-    fileState.status !== 'idle' &&
-    expectedFileOwner !== null &&
-    sameFileOwner(fileState.ownerId, expectedFileOwner)
-      ? fileState
-      : null;
-  const file = ownedFileState?.status === 'ready' ? ownedFileState.data : null;
-
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
     if (!shownTree) return [];
@@ -361,8 +252,6 @@ export function FileTreePanel({
   // 有上一代内容可显示时不算 loading：那会把屏幕清空，正是要避免的动作。
   const treeLoading =
     staleTreeResult === null && (ownedTreeState === null || ownedTreeState.status === 'loading');
-  const fileLoading = ownedFileState?.status === 'loading';
-  const fileError = ownedFileState?.status === 'error' ? ownedFileState.error : null;
 
   const renderNode = (node: TreeNode, depth: number): React.ReactNode => {
     const isDir = node.children.size > 0;
@@ -384,8 +273,10 @@ export function FileTreePanel({
                 else next.add(node.path);
                 return next;
               });
-            } else {
-              if (treeResult) void openFile(node.path, treeResult);
+            } else if (treeResult) {
+              // 单击 = 编辑器预览标签（复用同一个预览位）；高亮跟手
+              setSelected(node.path);
+              onOpenFile?.(node.path);
             }
           }}
         >
@@ -393,7 +284,8 @@ export function FileTreePanel({
           <span
             className={`tree-name ${changed ? 'changed' : ''}`}
             onDoubleClick={() => {
-              if (!isDir && onOpenFile && treeResult) onOpenFile(node.path);
+              // 双击 = 固定标签（IDE 惯例：预览是临时的，双击表示"我要留着它"）
+              if (!isDir && onOpenFile && treeResult) onOpenFile(node.path, { pin: true });
             }}
           >
             {node.name}
@@ -409,7 +301,7 @@ export function FileTreePanel({
     <aside
       className="filepanel rp-enter"
       aria-label="文件浏览器"
-      aria-busy={treeLoading || fileLoading}
+      aria-busy={treeLoading}
     >
       <div className="filepanel-head">
         <strong style={{ fontSize: 12 }}>文件</strong>
@@ -489,60 +381,6 @@ export function FileTreePanel({
         )}
       </div>
 
-      {fileLoading && expectedFileOwner && (
-        <div className="filepanel-viewer" aria-busy="true">
-          <div className="filepanel-viewer-head">
-            <code style={{ fontSize: 11 }}>{expectedFileOwner.path}</code>
-            <span className="spacer" />
-            <button onClick={closeFile} title="取消预览">
-              ✕
-            </button>
-          </div>
-          <div className="empty" style={{ padding: 14 }} role="status">
-            正在读取文件…
-          </div>
-        </div>
-      )}
-
-      {fileError && expectedFileOwner && (
-        <div className="filepanel-viewer">
-          <div className="filepanel-viewer-head">
-            <code style={{ fontSize: 11 }}>{expectedFileOwner.path}</code>
-            <span className="spacer" />
-            <button onClick={closeFile} title="收起">
-              ✕
-            </button>
-          </div>
-          <div className="filepanel-error" role="alert">
-            文件读取失败：{fileError}
-          </div>
-        </div>
-      )}
-
-      {file && (
-        <div className={`filepanel-viewer ${staleTreeResult ? 'stale' : ''}`}>
-          <div className="filepanel-viewer-head">
-            <code style={{ fontSize: 11 }}>{file.path}</code>
-            <span className="spacer" />
-            {staleTreeResult && <Badge tone="warn">上一代</Badge>}
-            {file.changed && <Badge tone="ok">已改动</Badge>}
-            <span style={{ color: 'var(--text-tertiary)', fontSize: 10.5 }}>{file.bytes} B</span>
-            {onOpenFile && (
-              <button onClick={() => onOpenFile(file.path)} title="在编辑器面板打开（只读）">
-                编辑器
-              </button>
-            )}
-            <button onClick={closeFile} title="收起">
-              ✕
-            </button>
-          </div>
-          <pre className="filepanel-code">
-            {file.binary ? '（二进制文件，不显示内容）' : file.content}
-            {file.truncated &&
-              `\n\n… 已截断：只读取了前 ${file.bytes} B，其余内容未加载。用「刷新」重读，或在补丁审查里看完整改动。`}
-          </pre>
-        </div>
-      )}
     </aside>
   );
 }

@@ -57,7 +57,7 @@ function installBridge(): void {
   const p: ProjectRef = { projectId: 'p1', name: 'Layout Project', displayPath: '/p1', createdAt: NOW };
   window.repopilot = {
     protocolVersion: PROTOCOL_VERSION,
-    request: vi.fn(async (method: RequestMethod) => {
+    request: vi.fn(async (method: RequestMethod, payload?: unknown) => {
       switch (method) {
         case 'core.getStatus':
           return ok({ status: 'READY', detail: 'ready', epoch: 1 });
@@ -72,10 +72,17 @@ function installBridge(): void {
         case 'project.import':
           return ok(imported('p1'));
         case 'files.tree':
-          return ok({ entries: [{ path: 'app.ts', bytes: 20, changed: false }], source: 'SNAPSHOT', generation: null });
+          return ok({
+            entries: [
+              { path: 'app.ts', bytes: 20, changed: false },
+              { path: 'util.ts', bytes: 8, changed: false },
+            ],
+            source: 'SNAPSHOT',
+            generation: null,
+          });
         case 'files.read':
           return ok({
-            path: 'app.ts',
+            path: String((payload as { path?: string } | undefined)?.path ?? 'app.ts'),
             content: 'const a = 1;',
             bytes: 12,
             truncated: false,
@@ -162,5 +169,49 @@ describe('P1 状态栏：全局状态的唯一权威位', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '未配置模型' }));
     expect(await screen.findByText('环境自检')).toBeTruthy();
+  });
+});
+
+describe('P1 预览通道合一：单击预览（复用）、双击固定', () => {
+  it('单击开斜体预览标签；换文件复用同一位置；双击转正后预览位重新可用', async () => {
+    installBridge();
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Layout Project/ }));
+    const filesTab = screen.getByRole('button', { name: '文件' });
+    await waitFor(() => expect((filesTab as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(filesTab);
+
+    // 树行与编辑器标签会同名 —— 一律用 tree-name 侧的节点驱动树交互
+    const treeName = (name: string) => {
+      const el = screen.getAllByText(name).find((n) => n.className.includes('tree-name'));
+      if (!el) throw new Error(`tree node ${name} not found`);
+      return el;
+    };
+
+    // 单击 = 预览标签（斜体），编辑器随之出现 —— 树内不再有内嵌预览
+    await screen.findByText('app.ts');
+    fireEvent.click(treeName('app.ts'));
+    await screen.findByLabelText('代码编辑器（只读）');
+    const tabOf = (name: string) => screen.getByRole('tab', { name: new RegExp(name) });
+    expect(tabOf('app.ts').className).toContain('preview');
+    expect(document.querySelector('.filepanel-viewer')).toBeNull();
+
+    // 单击另一个文件：预览位被复用，标签总数仍是 1
+    fireEvent.click(treeName('util.ts'));
+    await waitFor(() => expect(tabOf('util.ts')).toBeTruthy());
+    expect(screen.getAllByRole('tab')).toHaveLength(1);
+    expect(screen.queryByRole('tab', { name: /app.ts/ })).toBeNull();
+
+    // 双击标签 → 固定（斜体消失）；再单击别的文件 → 新预览位，共 2 个标签
+    fireEvent.doubleClick(tabOf('util.ts'));
+    await waitFor(() => expect(tabOf('util.ts').className).not.toContain('preview'));
+    fireEvent.click(treeName('app.ts'));
+    await waitFor(() => expect(screen.getAllByRole('tab')).toHaveLength(2));
+    expect(tabOf('app.ts').className).toContain('preview');
+
+    // 树里双击 = 直接固定
+    fireEvent.doubleClick(treeName('app.ts'));
+    await waitFor(() => expect(tabOf('app.ts').className).not.toContain('preview'));
   });
 });

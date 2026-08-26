@@ -39,16 +39,19 @@ export function EditorPane({
   active,
   onActivate,
   onClose,
+  onPin,
   onCollapse,
 }: {
   snapshotId: string;
   runId: string | null;
   /** Agent 改动落地后由外层递增，触发来源与内容重读 */
   refreshKey: number;
-  tabs: readonly string[];
+  tabs: readonly { path: string; pinned: boolean }[];
   active: string | null;
   onActivate: (path: string) => void;
   onClose: (path: string) => void;
+  /** 双击标签把预览固定下来（IDE 惯例），可选 —— 单测可不接线 */
+  onPin?: (path: string) => void;
   /** 显式收起整个编辑器列（标签保留），可选 —— 单测可不接线 */
   onCollapse?: () => void;
 }) {
@@ -105,13 +108,13 @@ export function EditorPane({
     epochRef.current += 1;
     inflightRef.current.clear();
     setStates(new Map());
-    if (active && tabs.includes(active)) void load(active);
+    if (active && tabs.some((t) => t.path === active)) void load(active);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snapshotId, runId, refreshKey]);
 
   // 激活一个还没内容的标签时加载
   useEffect(() => {
-    if (active && tabs.includes(active) && !states.has(active)) void load(active);
+    if (active && tabs.some((t) => t.path === active) && !states.has(active)) void load(active);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, tabs]);
 
@@ -123,14 +126,17 @@ export function EditorPane({
       <div className="editorpane-drag" aria-hidden="true" />
       <div className="editorpane-tabs">
         <div className="editorpane-tablist" role="tablist">
-        {tabs.map((path) => (
+        {tabs.map(({ path, pinned }) => (
           <div
             key={path}
             role="tab"
             aria-selected={path === active}
-            className={`editorpane-tab ${path === active ? 'active' : ''}`}
-            title={path}
+            className={`editorpane-tab ${path === active ? 'active' : ''} ${pinned ? '' : 'preview'}`}
+            title={pinned ? path : `${path}（预览 —— 双击固定；打开别的文件会复用这个位置）`}
             onClick={() => onActivate(path)}
+            onDoubleClick={() => {
+              if (!pinned) onPin?.(path);
+            }}
           >
             <span className="editorpane-tab-name">{basename(path)}</span>
             <button
