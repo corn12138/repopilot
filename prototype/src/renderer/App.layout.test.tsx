@@ -253,3 +253,29 @@ describe('P1 分隔线：对话 ↔ 编辑器宽度可调且被记住', () => {
     expect(window.localStorage.getItem('repopilot.ui.editorWidth')).toBeNull();
   });
 });
+
+describe('P2 键盘贯通：Esc 关层与 F6 面板循环', () => {
+  it('Esc 从设置层退回；F6 在侧栏/主栏间循环焦点', async () => {
+    installBridge();
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Layout Project/ }));
+    await screen.findByText(/2 个文件|1 个文件/);
+
+    // 设置是"层"：Esc 退回项目视图（此前只进不出）
+    fireEvent.click(screen.getByRole('button', { name: /⚙ 设置/ }));
+    await screen.findByText('环境自检');
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByText('环境自检')).toBeNull();
+
+    // F6：焦点在 body → 进侧栏；再按 → 进主栏
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    fireEvent.keyDown(window, { key: 'F6' });
+    expect(document.querySelector('.sidebar')!.contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(window, { key: 'F6' });
+    expect(document.querySelector('.main')!.contains(document.activeElement)).toBe(true);
+    // Shift+F6 反向：回侧栏
+    fireEvent.keyDown(window, { key: 'F6', shiftKey: true });
+    expect(document.querySelector('.sidebar')!.contains(document.activeElement)).toBe(true);
+  });
+});

@@ -149,16 +149,43 @@ export function App() {
   /** ⌘K 命令面板（v0.1 #10）：动作/运行/项目/文件的统一入口 */
   const [paletteOpen, setPaletteOpen] = useState(false);
 
+  /*
+   * 全局键盘（v0.1 #11 / PRD-NFR-ACC-001）：
+   *   ⌘K 命令面板 · Esc 关层（全屏视图退回）· F6 / Shift+F6 面板间循环。
+   * 面板自己的 Esc（命令面板、任务选项弹层）在各自层里处理并先于这里生效。
+   */
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setPaletteOpen((v) => !v);
+        return;
+      }
+      if (e.key === 'Escape' && !paletteOpen && (showSettings || showEvidence)) {
+        // 设置/证据是"层"：Esc 退回之前的运行/项目视图（v0.1 病根 B 的"只进不出"）
+        setShowSettings(false);
+        setShowEvidence(false);
+        return;
+      }
+      if (e.key === 'F6') {
+        e.preventDefault();
+        const regions = ['.sidebar', '.main', '.editorpane']
+          .map((sel) => document.querySelector<HTMLElement>(sel))
+          .filter((el): el is HTMLElement => el !== null);
+        if (regions.length === 0) return;
+        const current = regions.findIndex((r) => r.contains(document.activeElement));
+        const step = e.shiftKey ? -1 : 1;
+        const next = regions[(current + step + regions.length) % regions.length]!;
+        next
+          .querySelector<HTMLElement>(
+            'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex="0"]',
+          )
+          ?.focus();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [paletteOpen, showSettings, showEvidence]);
 
   const coreStatusRef = useRef(coreStatus);
   coreStatusRef.current = coreStatus;
@@ -571,6 +598,22 @@ export function App() {
     openProject,
   ]);
 
+  /** 列表方向键（v0.1 #11）：↑↓ 在可见行间移动焦点；折叠区里的行不参与 */
+  const onListKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    const rows = [...e.currentTarget.querySelectorAll<HTMLButtonElement>('button:not([disabled])')].filter(
+      (r) => r.closest('details:not([open])') === null,
+    );
+    if (rows.length === 0) return;
+    e.preventDefault();
+    const i = rows.indexOf(document.activeElement as HTMLButtonElement);
+    if (i === -1) {
+      rows[0]!.focus();
+      return;
+    }
+    rows[e.key === 'ArrowDown' ? Math.min(i + 1, rows.length - 1) : Math.max(i - 1, 0)]!.focus();
+  }, []);
+
   const paletteFileSource = useMemo(
     () =>
       canShowFiles && fileSnapshotId && coreStatus === 'READY'
@@ -641,7 +684,7 @@ export function App() {
             </div>
           </div>
         ) : (
-        <div className="sidebar-scroll">
+        <div className="sidebar-scroll" onKeyDown={onListKeyDown}>
           {projects.length === 0 && (
             <div style={{ color: 'var(--text-tertiary)', fontSize: 11.5, padding: '10px 8px' }}>
               还没有项目

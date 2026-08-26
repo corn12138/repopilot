@@ -175,3 +175,51 @@ describe('恢复 Run 的文件面板（交互评审 v0.2 N6）：快照原貌 + 
     expect(screen.getByRole('button', { name: '关闭文件面板' })).toBeTruthy();
   });
 });
+
+describe('树内方向键（交互评审 v0.1 #11）', () => {
+  beforeEach(() => {
+    requestMock.mockReset();
+  });
+  afterEach(() => cleanup());
+
+  it('↑↓ 移动焦点，→ 展开目录，← 收起/回父级', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'files.tree') {
+        return {
+          entries: [
+            { path: 'src/app.ts', bytes: 12, changed: false },
+            { path: 'readme.md', bytes: 5, changed: false },
+          ],
+          source: 'SNAPSHOT',
+          generation: null,
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    render(<FileTreePanel {...baseProps} runId={null} />);
+    await screen.findByText('app.ts');
+
+    // 顶层目录默认展开：src(dir) / app.ts / readme.md 三行
+    const rows = () => screen.getAllByRole('button').filter((b) => b.className.includes('tree-row'));
+    const tree = rows()[0]!.closest('.filepanel-tree')!;
+    rows()[0]!.focus();
+    expect((document.activeElement as HTMLElement).dataset.path).toBe('src');
+
+    fireEvent.keyDown(tree, { key: 'ArrowDown' });
+    expect((document.activeElement as HTMLElement).dataset.path).toBe('src/app.ts');
+
+    // ← 在子项上：回父级
+    fireEvent.keyDown(tree, { key: 'ArrowLeft' });
+    expect((document.activeElement as HTMLElement).dataset.path).toBe('src');
+
+    // ← 在展开的目录上：收起（app.ts 从树里消失）
+    fireEvent.keyDown(tree, { key: 'ArrowLeft' });
+    expect(screen.queryByText('app.ts')).toBeNull();
+    expect((document.activeElement as HTMLElement).getAttribute('aria-expanded')).toBe('false');
+
+    // → 重新展开
+    fireEvent.keyDown(tree, { key: 'ArrowRight' });
+    expect(await screen.findByText('app.ts')).toBeTruthy();
+    expect((document.activeElement as HTMLElement).getAttribute('aria-expanded')).toBe('true');
+  });
+});

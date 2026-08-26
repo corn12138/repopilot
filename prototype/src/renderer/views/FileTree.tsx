@@ -253,6 +253,44 @@ export function FileTreePanel({
   const treeLoading =
     staleTreeResult === null && (ownedTreeState === null || ownedTreeState.status === 'loading');
 
+  /**
+   * 树内方向键（v0.1 #11 / PRD-NFR-ACC-001）：↑↓ 在可见行间移动，
+   * → 展开目录（已展开则进入第一个子项），← 收起目录（文件/已收起则回父级）。
+   * 行的身份放在 data-path / data-dir 上 —— 键盘导航读 DOM 事实，不再维护一份镜像。
+   */
+  const onTreeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!['ArrowDown', 'ArrowUp', 'ArrowRight', 'ArrowLeft'].includes(e.key)) return;
+    const rows = [...e.currentTarget.querySelectorAll<HTMLButtonElement>('.tree-row:not([disabled])')];
+    if (rows.length === 0) return;
+    e.preventDefault();
+    const current = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
+    const i = current ? rows.indexOf(current) : -1;
+    if (i === -1) {
+      rows[0]!.focus();
+      return;
+    }
+    const path = current!.dataset.path ?? '';
+    const isDir = current!.dataset.dir === 'true';
+    const isOpen = current!.getAttribute('aria-expanded') === 'true';
+    if (e.key === 'ArrowDown') rows[Math.min(i + 1, rows.length - 1)]!.focus();
+    else if (e.key === 'ArrowUp') rows[Math.max(i - 1, 0)]!.focus();
+    else if (e.key === 'ArrowRight') {
+      if (isDir && !isOpen) setExpanded((prev) => new Set(prev).add(path));
+      else if (isDir && isOpen) rows[Math.min(i + 1, rows.length - 1)]!.focus();
+    } else if (e.key === 'ArrowLeft') {
+      if (isDir && isOpen) {
+        setExpanded((prev) => {
+          const next = new Set(prev);
+          next.delete(path);
+          return next;
+        });
+      } else if (path.includes('/')) {
+        const parent = path.slice(0, path.lastIndexOf('/'));
+        rows.find((r) => r.dataset.path === parent)?.focus();
+      }
+    }
+  };
+
   const renderNode = (node: TreeNode, depth: number): React.ReactNode => {
     const isDir = node.children.size > 0;
     const isOpen = forceExpand || expanded.has(node.path);
@@ -263,6 +301,9 @@ export function FileTreePanel({
         <button
           className={`tree-row ${selected === node.path ? 'active' : ''}`}
           style={{ paddingLeft: 6 + depth * 12 }}
+          data-path={node.path}
+          data-dir={isDir}
+          aria-expanded={isDir ? isOpen : undefined}
           // 上一代的树只用于保持画面稳定；对它点击等于对着过期坐标系操作。
           disabled={treeResult === null}
           onClick={() => {
@@ -359,7 +400,7 @@ export function FileTreePanel({
         </div>
       )}
 
-      <div className={`filepanel-tree ${staleTreeResult ? 'stale' : ''}`}>
+      <div className={`filepanel-tree ${staleTreeResult ? 'stale' : ''}`} onKeyDown={onTreeKeyDown}>
         {treeLoading ? (
           <div className="empty" style={{ padding: 20 }} role="status">
             正在读取当前文件树…
