@@ -13,7 +13,8 @@
     "test": "vitest run",
     "selftest": "electron-vite build && REPOPILOT_SELFTEST=1 electron .",
     "dist:mac": "npm run build && electron-builder --mac --config electron-builder.yml",
-    "dist:mac:x64": "npm run build && electron-builder --mac --x64 --config electron-builder.yml"
+    "dist:mac:x64": "npm run build && electron-builder --mac --x64 --config electron-builder.yml",
+    "eval:spk010": "vite build --config eval.vite.config.ts && node eval-out/.build/run-experiment.js"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.2",

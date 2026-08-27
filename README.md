@@ -169,7 +169,10 @@ confidence / file / range / evidence / blocking）。审核方由平台强制只
   基线红 / 参考修复绿证据，参考修复不进 case 目录。这些是零依赖、秒级验证的
   确定性任务，**不是**真实 Vite/React/TS 工具链 fixture（那是正式 benchmark
   未解冻的 blocker）。
-- **诚实边界**：样本门槛已达，但正式实验（真实模型 + 人工盲评）按协议需单独确认，
+- **执行入口**：`pnpm eval:spk010 -- --implementer <provider> --reviewer <provider>`
+  —— 预检（路由 / 默认模型 / 凭据就绪度）、`--dry-run` 零出站、断点续跑、连续失败熔断，
+  收口落 `ab-report.json` 与盲评包。凭据只从环境变量读，脚本不接受明文 key。
+- **诚实边界**：样本门槛已达、执行入口就绪，但正式实验（真实模型 + 人工盲评）
   **还没有跑**。harness 建成 ≠ 实验做完，「一写一审值不值」仍是 Open。
 
 ## 还没做的
