@@ -1,0 +1,21 @@
+{
+  "caseId": "case-008-type-callback-migration",
+  "title": "组件回调改了签名，调用点漏改",
+  "goal": "修复 node check.mjs 失败：makeCard 的回调已从 onOpen(id) 迁移为 onSelect(project)（整个对象），但 src/project-list.mjs 的调用点还在按旧签名传参。所有卡片点击后都要拿到正确的项目对象。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/project-list.mjs",
+    "src/project-card.mjs"
+  ]
+}

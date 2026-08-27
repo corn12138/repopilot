@@ -1,0 +1,20 @@
+{
+  "caseId": "case-010-dep-named-exports",
+  "title": "路由库升级后旧 API 不存在了",
+  "goal": "修复 node check.mjs 失败：src/router/index.mjs 已升级为 Routes/Navigate API，src/router-app.mjs 还在 import 旧版的 Switch/Redirect。用当前 API 重建路由：/ 到 home、/runs 到 runs、未知路径跳转 /404。只允许改 src/router-app.mjs。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/router-app.mjs"
+  ]
+}

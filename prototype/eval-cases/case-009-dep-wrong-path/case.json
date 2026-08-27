@@ -1,0 +1,20 @@
+{
+  "caseId": "case-009-dep-wrong-path",
+  "title": "模块路径写错了",
+  "goal": "修复 node check.mjs 失败：src/app.mjs 引用的模块找不到（ERR_MODULE_NOT_FOUND）。修好后 classes(\"btn\", {active:true, hidden:false}) 应得到 \"btn active\"。只允许改 src/app.mjs。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/app.mjs"
+  ]
+}

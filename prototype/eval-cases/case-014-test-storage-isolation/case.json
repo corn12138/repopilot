@@ -1,0 +1,20 @@
+{
+  "caseId": "case-014-test-storage-isolation",
+  "title": "偏好缓存串了别人的存储",
+  "goal": "修复 node check.mjs 失败：src/preferences.mjs 的读缓存是模块级共享的，两个独立 storage 的实例互相污染。要求：不同 storage 完全隔离；同一 storage 重建实例后已写入的值仍读得到。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/preferences.mjs"
+  ]
+}

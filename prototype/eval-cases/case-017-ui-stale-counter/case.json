@@ -1,0 +1,20 @@
+{
+  "caseId": "case-017-ui-stale-counter",
+  "title": "连点三次只加了一",
+  "goal": "修复 node check.mjs 失败：src/counter.mjs 的 increment 捕获了旧值快照，一次 flush 内连点三次只加一。要求：连点三次得 3；上限 5 仍生效；reset 归零。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/counter.mjs"
+  ]
+}

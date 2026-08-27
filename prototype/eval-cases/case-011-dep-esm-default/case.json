@@ -1,0 +1,20 @@
+{
+  "caseId": "case-011-dep-esm-default",
+  "title": "工具库没有默认导出",
+  "goal": "修复 node check.mjs 失败：src/lib/toolkit.mjs 是纯命名导出（ESM），src/report.mjs 却按默认导出引入。修好后 report([\"B a\",\"B a\",\"c\"]) 应得到 \"b-a,c\"。只允许改 src/report.mjs。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/report.mjs"
+  ]
+}

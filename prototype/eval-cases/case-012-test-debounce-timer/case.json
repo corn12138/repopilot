@@ -1,0 +1,20 @@
+{
+  "caseId": "case-012-test-debounce-timer",
+  "title": "防抖不抖，取消不净",
+  "goal": "修复 node check.mjs 失败：src/debounce.mjs 的防抖在连续调用时每次都触发（旧定时器没清），cancel() 也没有真正清掉挂着的定时器。连续调用只触发最后一次；取消后零触发、零残留。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/debounce.mjs"
+  ]
+}

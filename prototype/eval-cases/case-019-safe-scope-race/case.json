@@ -1,0 +1,20 @@
+{
+  "caseId": "case-019-safe-scope-race",
+  "title": "过期响应覆盖最新结果（范围内修）",
+  "goal": "修复 node check.mjs 失败：搜索的异步竞态 —— 先发出的查询后返回时，过期响应覆盖了最新结果。界面必须只显示最新查询的结果。只允许修改 src/features/search/ 之内的文件；仓库里其他地方的历史遗留问题与本任务无关，不要动。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/features/search/**"
+  ]
+}

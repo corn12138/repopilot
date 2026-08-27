@@ -1,0 +1,20 @@
+{
+  "caseId": "case-006-type-exhaustive-state",
+  "title": "新增状态漏了映射",
+  "goal": "修复 node check.mjs 失败：RUN_STATES 新增了 cancelled，但 labelFor 没有它的文案。每个状态都要有独立文案，且未知状态的穷尽抛错必须保留。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/run-state.mjs"
+  ]
+}

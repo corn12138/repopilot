@@ -1,0 +1,20 @@
+{
+  "caseId": "case-004-syn-conflict-markers",
+  "title": "仪表盘留着合并冲突标记",
+  "goal": "修复 node check.mjs 失败：src/dashboard.mjs 里残留 git 合并冲突标记，模块无法解析。合并时两边的分支都不能丢：loading、error、success 三个状态都要可达，未知状态仍要抛错。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/dashboard.mjs"
+  ]
+}

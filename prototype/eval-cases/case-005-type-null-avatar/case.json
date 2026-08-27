@@ -1,0 +1,20 @@
+{
+  "caseId": "case-005-type-null-avatar",
+  "title": "头像地址可空但代码不认",
+  "goal": "修复 node check.mjs 失败：用户的 avatarUrl 现在可能是 null，src/avatar.mjs 在无头像时崩溃。有头像显示图片地址，null 显示姓名首字母。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/avatar.mjs"
+  ]
+}

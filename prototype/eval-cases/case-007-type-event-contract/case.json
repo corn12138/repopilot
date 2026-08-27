@@ -1,0 +1,20 @@
+{
+  "caseId": "case-007-type-event-contract",
+  "title": "回调拿到的是事件不是值",
+  "goal": "修复 node check.mjs 失败：src/debounced-input.mjs 的 attachInput 应把输入的字符串值交给 onChange 回调，现在回调拿到的是整个事件对象。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/debounced-input.mjs"
+  ]
+}

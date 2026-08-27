@@ -1,0 +1,20 @@
+{
+  "caseId": "case-016-cfg-base-path",
+  "title": "子路径部署下资源与路由全 404",
+  "goal": "修复 node check.mjs 失败：src/config/base-url.mjs 生成的地址无视部署 base。要求：base 为 \"/\" 时保持根路径行为；base 为 \"/repo-pilot/\"（或不带尾斜杠的 \"/repo-pilot\"）时资源与路由都落在子路径下，且不出现连续斜杠。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/config/base-url.mjs"
+  ]
+}

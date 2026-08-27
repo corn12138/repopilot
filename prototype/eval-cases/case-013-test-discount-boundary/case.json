@@ -1,0 +1,20 @@
+{
+  "caseId": "case-013-test-discount-boundary",
+  "title": "满减边界差一分钱",
+  "goal": "修复 node check.mjs 失败：折扣规则是「满 100 九折」（含 100 本身），src/discount.mjs 把 100 整落在了原价一侧。99.99 原价、100 与 100.01 打九折；负数金额照旧抛错。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/discount.mjs"
+  ]
+}

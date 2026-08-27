@@ -1,0 +1,20 @@
+{
+  "caseId": "case-015-cfg-env-convention",
+  "title": "客户端配置无视注入的环境",
+  "goal": "修复 node check.mjs 失败：src/config/env.mjs 应从注入的 env 对象读取 VITE_API_URL（去掉尾部斜杠），缺失或为空时抛出带「VITE_API_URL」的错误；现在它无视注入、返回硬编码地址。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/config/env.mjs"
+  ]
+}

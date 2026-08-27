@@ -1,0 +1,20 @@
+const fail = (msg) => { console.error(msg); process.exit(1); };
+let mod;
+try { mod = await import('./src/features/search/search.mjs'); } catch (err) { fail('search.mjs 加载失败: ' + err.message); }
+const handles = new Map();
+const fetcher = (q) => new Promise((resolve) => handles.set(q, resolve));
+const s = mod.createSearch(fetcher);
+const p1 = s.issue('al');
+const p2 = s.issue('alpha');
+handles.get('alpha')(['alpha-1', 'alpha-2']);
+await p2;
+handles.get('al')(['al-stale']);
+await p1;
+const cur = s.current();
+if (cur.query !== 'alpha') fail('当前查询应是最新的 alpha: ' + JSON.stringify(cur.query));
+if (JSON.stringify(cur.results) !== JSON.stringify(['alpha-1', 'alpha-2'])) fail('过期响应覆盖了最新结果: ' + JSON.stringify(cur.results));
+const p3 = s.issue('beta');
+handles.get('beta')(['beta-1']);
+await p3;
+if (JSON.stringify(s.current().results) !== JSON.stringify(['beta-1'])) fail('正常顺序的响应必须生效: ' + JSON.stringify(s.current().results));
+console.log('ok');

@@ -1,0 +1,20 @@
+{
+  "caseId": "case-018-ui-form-guard",
+  "title": "空表单也发了请求",
+  "goal": "修复 node check.mjs 失败：src/signup-form.mjs 在姓名为空时仍调用服务，且错误对象没有 fieldRef 供辅助技术定位。要求：空姓名不调用服务并返回 {ok:false, error:{fieldRef:\"name\", message:非空}}；合法输入去除首尾空白后恰好调用一次服务。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/signup-form.mjs"
+  ]
+}

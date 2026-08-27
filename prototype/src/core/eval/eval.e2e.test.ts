@@ -191,10 +191,11 @@ const synCase = (allowedPaths: unknown, extra: Record<string, unknown> = {}): Re
 });
 
 describe('EvalCase 加载：内容寻址，fail-closed', () => {
-  it('seed 两个 case 可加载，digest 互异且对内容敏感', () => {
+  it('case 集可加载：恰好 20 个，seed 居前，digest 互异且对内容敏感', () => {
     const cases = loadEvalCases(CASES_ROOT);
-    expect(cases.map((c) => c.caseId)).toEqual(['case-001-status-flag', 'case-002-rate-constant']);
-    expect(cases[0]!.caseDigest).not.toBe(cases[1]!.caseDigest);
+    expect(cases).toHaveLength(20); // 20/20 的逐个红绿证据在 cases.qa.test.ts
+    expect(cases.slice(0, 2).map((c) => c.caseId)).toEqual(['case-001-status-flag', 'case-002-rate-constant']);
+    expect(new Set(cases.map((c) => c.caseDigest)).size).toBe(20);
 
     // 改模板一个字节 → 另一个 case
     const copy = mkdtempSync(join(tmpdir(), 'eval-case-copy-'));
@@ -567,7 +568,10 @@ describe('2 case × 2 臂 端到端', () => {
   it(
     '四个观察密封落盘；B 臂有审核事实且已证异构；报告成对；盲包不破盲；篡改可检出；假绿不计分',
     async () => {
-      const cases = loadEvalCases(CASES_ROOT);
+      // 端到端只跑 2 个 seed（脚本化 HTTP 模型只备了它们的修复）——
+      // 这里锁的是 harness 纪律，不是案例覆盖；20/20 的红绿证据在 cases.qa.test.ts
+      const cases = loadEvalCases(CASES_ROOT).filter((c) => c.caseId in FIX);
+      expect(cases.map((c) => c.caseId)).toEqual(Object.keys(FIX));
       const outDir = mkdtempSync(join(tmpdir(), 'eval-out-'));
       tempDirs.add(outDir);
       const observations: EvalObservation[] = [];

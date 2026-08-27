@@ -1,0 +1,20 @@
+{
+  "caseId": "case-003-syn-unclosed-brace",
+  "title": "用户卡片模块无法解析",
+  "goal": "修复 node check.mjs 失败：src/render.mjs 无法被解析（Unexpected end of input）。修好后用户卡片要同时正确渲染姓名与邮箱，无邮箱时只渲染姓名。",
+  "acceptance": [
+    "node check.mjs 退出 0"
+  ],
+  "commands": [
+    {
+      "label": "node check.mjs",
+      "argv": [
+        "node",
+        "check.mjs"
+      ]
+    }
+  ],
+  "allowedPaths": [
+    "src/render.mjs"
+  ]
+}
