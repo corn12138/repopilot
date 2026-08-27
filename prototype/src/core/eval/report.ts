@@ -1,6 +1,13 @@
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { digestOf } from '@shared/ids';
+import {
+  MACHINE_PASS_REASONS,
+  classifyObservation,
+  emptyReasonCounts,
+  type MachinePassReasonCounts,
+  type MachinePassReason,
+} from './judge';
 import type { EvalArm, EvalObservation } from './runner';
 
 /**
@@ -14,9 +21,11 @@ import type { EvalArm, EvalObservation } from './runner';
 export interface ArmAggregate {
   readonly arm: EvalArm;
   readonly observations: number;
-  /** 平台验证通过（pass@1 口径：最后一次 POST_MUTATION 通过且有封存补丁） */
+  /** 平台验证通过（fail-closed 口径见 judge.classifyObservation：基线红过 + 终验通过 + 有封存补丁 + 未碰验证输入 + 人工收口点 + schema 受支持） */
   readonly machineVerifiedPass: number;
   readonly machinePassRate: number | null;
+  /** 未计分观察的 reason 分布 —— 排除必须报数，不能只给一个没有原因的 false */
+  readonly machinePassReasons: MachinePassReasonCounts;
   readonly inputTokens: number;
   readonly outputTokens: number;
   /** 用量未知轮次合计 —— 未知不折 0，成本对比必须带着它 */
@@ -34,7 +43,17 @@ export interface CasePairing {
   readonly caseId: string;
   readonly caseDigest: string;
   readonly byArm: Partial<
-    Record<EvalArm, { runId: string; status: string; machineVerifiedPass: boolean; patchDigest: string | null }>
+    Record<
+      EvalArm,
+      {
+        runId: string;
+        status: string;
+        machineVerifiedPass: boolean;
+        /** 未计分时的 primary reason（固定优先级，单条观察只入一个）；计成功为 null */
+        machinePassReason: MachinePassReason | null;
+        patchDigest: string | null;
+      }
+    >
   >;
   /** 两臂都在场才有：B 的机器验证通过 − A 的（1/0/-1）；缺臂为 null */
   readonly machinePassDelta: number | null;
@@ -51,23 +70,39 @@ export interface AbReport {
   readonly sampleCaveat: string | null;
   /** 回读结果文件时的坏行 / 篡改计数 —— 报告的可信度声明 */
   readonly resultFileDamage: { unparseableLines: number; digestMismatches: number };
+  /**
+   * 未计分观察的 reason 分布（全臂合并 + 结果文件里的损坏记录）。
+   * 含 RESULT_DIGEST_INVALID —— 那些记录没有臂（内容不可信），只进总账，不进任何单臂。
+   */
+  readonly machinePassReasons: MachinePassReasonCounts;
 }
-
-const machinePass = (o: EvalObservation): boolean => o.finalVerificationPassed === true && o.patch !== null;
 
 export function buildAbReport(
   observations: readonly EvalObservation[],
-  damage: { unparseableLines: number; digestMismatches: number },
+  damage: {
+    unparseableLines: number;
+    digestMismatches: number;
+    /** readObservations 保留的 digest 损坏记录本体 —— 计 RESULT_DIGEST_INVALID，不静默丢弃 */
+    digestInvalidRecords: readonly unknown[];
+  },
   generatedAt: string,
 ): AbReport {
   const arms: ArmAggregate[] = (['SINGLE_WRITER', 'CROSS_REVIEW'] as const).map((arm) => {
     const of = observations.filter((o) => o.arm === arm);
     const reviews = of.map((o) => o.crossReview).filter((r): r is NonNullable<typeof r> => r !== null);
+    const reasons = { ...emptyReasonCounts() };
+    let passed = 0;
+    for (const o of of) {
+      const v = classifyObservation(o, true);
+      if (v.pass) passed += 1;
+      else if (v.reason) reasons[v.reason] += 1;
+    }
     return {
       arm,
       observations: of.length,
-      machineVerifiedPass: of.filter(machinePass).length,
-      machinePassRate: of.length === 0 ? null : of.filter(machinePass).length / of.length,
+      machineVerifiedPass: passed,
+      machinePassRate: of.length === 0 ? null : passed / of.length,
+      machinePassReasons: reasons,
       inputTokens: of.reduce((n, o) => n + o.ledger.inputTokens, 0),
       outputTokens: of.reduce((n, o) => n + o.ledger.outputTokens, 0),
       unknownUsageTurns: of.reduce((n, o) => n + (o.ledger.unknownUsageTurns ?? 0), 0),
@@ -92,10 +127,12 @@ export function buildAbReport(
   const pairings: CasePairing[] = caseIds.map((caseId) => {
     const byArm: CasePairing['byArm'] = {};
     for (const o of observations.filter((x) => x.caseId === caseId)) {
+      const verdict = classifyObservation(o, true);
       byArm[o.arm] = {
         runId: o.runId,
         status: o.status,
-        machineVerifiedPass: machinePass(o),
+        machineVerifiedPass: verdict.pass,
+        machinePassReason: verdict.reason,
         patchDigest: o.patch?.digest ?? null,
       };
     }
@@ -109,6 +146,17 @@ export function buildAbReport(
     };
   });
 
+  // 总账 = 两臂合并 + digest 损坏记录（无臂，只进总账）。守恒断言靠测试钉：
+  // 各 reason 之和 + machineVerifiedPass 之和 = 观察总数 + digest 损坏记录数
+  const totalReasons = { ...emptyReasonCounts() };
+  for (const a of arms) {
+    for (const r of MACHINE_PASS_REASONS) totalReasons[r] += a.machinePassReasons[r];
+  }
+  for (const rec of damage.digestInvalidRecords) {
+    const v = classifyObservation(rec, false);
+    if (v.reason) totalReasons[v.reason] += 1;
+  }
+
   return {
     generatedAt,
     cases: caseIds.length,
@@ -119,7 +167,8 @@ export function buildAbReport(
       caseIds.length < 20
         ? `样本 ${caseIds.length} 个 case，低于 PRD 靶值 20 —— 一切结果只能标 PILOT / underpowered，不得进 Evidence 栏`
         : null,
-    resultFileDamage: damage,
+    resultFileDamage: { unparseableLines: damage.unparseableLines, digestMismatches: damage.digestMismatches },
+    machinePassReasons: totalReasons,
   };
 }
 

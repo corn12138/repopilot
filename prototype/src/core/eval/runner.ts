@@ -19,7 +19,10 @@ import type { EvalCase } from './cases';
  *      度量止于 AWAITING_PATCH_REVIEW / 终态的平台事实；
  *   4. 臂完整性 fail-closed —— CROSS_REVIEW 臂的审核方若被降级（不可用/同厂商/缺凭据），
  *      观察立即作废抛错，绝不把实际单写的 Run 密封成 B 臂结果；
- *   5. 收敛与预算沿用产品，不放宽。
+ *   5. 收敛与预算沿用产品，不放宽；
+ *   6. 范围原样 —— case 的 allowedPaths 逐字交给 task.create。产品层把空范围兜底为
+ *      `['**']`（全仓可写），Runner 绝不回退为空或任何更宽的范围：候选能不能改
+ *      check.mjs，由 case 合同在加载时决定，不由 Runner 偷偷放宽。
  */
 
 export type EvalArm = 'SINGLE_WRITER' | 'CROSS_REVIEW';
@@ -30,9 +33,17 @@ export interface EvalRoutes {
   readonly reviewerProfileId: string | null;
 }
 
-/** 一次观察的密封结果。digest 覆盖除自身外的全部字段 */
+/**
+ * 一次观察的密封结果。digest 覆盖除自身外的全部字段。
+ *
+ * schemaVersion 2（不兼容变更，必须升版）：
+ *   - 新增 verificationInputsTouched —— 补丁是否触碰验证输入的原始事实，
+ *     machine pass 的必要证据（见 judge.classifyObservation）；
+ *   - allowedPaths 随 case 合同进 caseDigest，Runner 原样交给 task.create。
+ * v1 的观察能被识别和计数（OBSERVATION_SCHEMA_LEGACY），但不能按成功处理。
+ */
 export interface EvalObservation {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly caseId: string;
   readonly caseDigest: string;
   readonly arm: EvalArm;
@@ -51,6 +62,13 @@ export interface EvalObservation {
     readonly removedLines: number;
     readonly unifiedDiff: string;
   } | null;
+  /**
+   * 补丁是否触碰验证输入的原始事实（PatchArtifact.verificationInputsTouched 原样封存）。
+   * patch 存在时必须是数组 —— 空数组 = 明确没碰；非空 = 这次"验证通过"不能证明修复正确。
+   * patch 为 null 时为 null。缺失/undefined 不是"干净"，是证据不足
+   * （judge 计 OBSERVATION_EVIDENCE_INCOMPLETE）。
+   */
+  readonly verificationInputsTouched: readonly string[] | null;
   readonly crossReview: {
     readonly reviewerKey: string;
     readonly parity: string;
@@ -174,7 +192,9 @@ export async function runObservation(input: {
       egressConsentDigest: disclosure.digest,
       goal: input.evalCase.goal,
       taskClass: imported.profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX',
-      allowedPaths: [],
+      // 范围原样传递：产品层对空范围的兜底是 ['**']（全仓可写），
+      // Runner 不允许回退 —— 候选能改什么由 case 合同决定，不由 Runner 放宽
+      allowedPaths: [...input.evalCase.allowedPaths],
       acceptance: [...input.evalCase.acceptance],
       verificationCommandIds: input.evalCase.commands.map((_, i) => `user${i + 1}`),
       customCommands: input.evalCase.commands.map((c) => ({ label: c.label, argv: [...c.argv] })),
@@ -242,7 +262,7 @@ export async function runObservation(input: {
     const finalVerificationPassed = postMutation.length === 0 ? null : postMutation[postMutation.length - 1]!.passed;
 
     const body = {
-      schemaVersion: 1 as const,
+      schemaVersion: 2 as const,
       caseId: input.evalCase.caseId,
       caseDigest: input.evalCase.caseDigest,
       arm: input.arm,
@@ -261,6 +281,9 @@ export async function runObservation(input: {
             unifiedDiff: patch.unifiedDiff,
           }
         : null,
+      // 产品层事实原样封存：sealPatch 总会给这个字段；老结构记录读出 undefined 时
+      // 不折成空数组 —— "不知道碰没碰"与"明确没碰"在判定里不是一回事
+      verificationInputsTouched: patch ? ((patch.verificationInputsTouched ?? null) as readonly string[] | null) : null,
       crossReview: crossReview
         ? {
             reviewerKey: crossReview.reviewerProfileId,

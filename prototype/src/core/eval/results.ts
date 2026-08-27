@@ -16,6 +16,11 @@ export interface EvalResultsRead {
   readonly unparseableLines: number;
   /** JSON 读得出来但 digest 对不上 —— 被改动过或写入时就是坏的 */
   readonly digestMismatches: number;
+  /**
+   * digest 对不上的原始记录本体。不静默丢弃：交给判定层计 RESULT_DIGEST_INVALID，
+   * 与"实验本来就只有这些观察"可区分。内容不可信，只用于计数。
+   */
+  readonly digestInvalidRecords: readonly unknown[];
 }
 
 export function resultsPath(outDir: string): string {
@@ -36,8 +41,11 @@ export function observationDigest(obs: EvalObservation): string {
 
 export function readObservations(outDir: string): EvalResultsRead {
   const file = resultsPath(outDir);
-  if (!existsSync(file)) return { observations: [], unparseableLines: 0, digestMismatches: 0 };
+  if (!existsSync(file)) {
+    return { observations: [], unparseableLines: 0, digestMismatches: 0, digestInvalidRecords: [] };
+  }
   const observations: EvalObservation[] = [];
+  const digestInvalidRecords: unknown[] = [];
   let unparseableLines = 0;
   let digestMismatches = 0;
   for (const line of readFileSync(file, 'utf8').split('\n')) {
@@ -52,9 +60,10 @@ export function readObservations(outDir: string): EvalResultsRead {
     }
     if (observationDigest(obs) !== obs.digest) {
       digestMismatches += 1;
+      digestInvalidRecords.push(obs); // 计数之外保留本体 —— 不静默丢弃
       continue;
     }
     observations.push(obs);
   }
-  return { observations, unparseableLines, digestMismatches };
+  return { observations, unparseableLines, digestMismatches, digestInvalidRecords };
 }
