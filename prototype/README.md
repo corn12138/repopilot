@@ -1,8 +1,10 @@
-# RepoPilot Prototype — 可丢弃工程 Spike
+# RepoPilot Prototype — 产品种子
 
-> 状态：`DISPOSABLE_SPIKE / NOT_AN_IMPLEMENTATION_BASELINE`
+> 状态：`PRODUCT_SEED / EVOLVING_IN_PLACE`（2026-08-27 自 `DISPOSABLE_SPIKE` 升格，
+> 依据 08-24 定向「不另起炉灶」；方向决定文档在 docs/inception，仅本地）
 > 建立日期：2026-08-06
-> 定位：为 Stage 0 的 F-01（用户证据）、F-03（Benchmark fixture）、F-04（机器 schema）提供**可运行的证据来源**
+> 定位：真正可用的 Agent IDE 从这里长出来；同时仍为 Stage 0 的 F-01（用户证据）、
+> F-03（Benchmark fixture）、F-04（机器 schema）提供**可运行的证据来源**
 
 ## 这是什么，不是什么
 
@@ -11,8 +13,11 @@
 **不是**：
 - 不是 Stage 0 Gate 通过的证明。ADR 001–017 仍全部是 `Proposed / Open`，没有一份 Accepted。
 - 不是 `local-desktop-only-topology.md` 里 `utilityProcess` / SQLite / 发行方案已被接受的证据。
-- 不是 M2 Walking Skeleton。M2 需要在 Gate 通过并获得独立授权后，按 `docs/development/m2-link1-execution-contract.md` 从 `M2-WP0` 开始。
-- 这里的代码**不应**被当作 M2 的工程起点直接继承。它的价值是回答"这些设计假设成立吗"，不是"这就是产品"。
+- 不是 M2 Walking Skeleton。M2 合同与本种子「不另起炉灶」的关系待方向决定文档定稿时
+  显式裁决（废止或改写为种子上的里程碑），在那之前不按 `M2-WP0` 自启动。
+- 2026-08-27 起这里的代码**是**后续演进的工程基座（08-24 定向的落档）——
+  但升格不追认任何技术决策：ADR 仍按真实状态逐份决议，种子里的取舍
+  （如 node_modules 宿主 symlink）仍是记录在案的残余风险，不是推荐做法。
 
 ## 已经证明的（有机器证据）
 
