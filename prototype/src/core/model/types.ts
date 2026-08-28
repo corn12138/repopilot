@@ -35,10 +35,19 @@ export type StopReason = 'TOOL_USE' | 'END_TURN' | 'MAX_TOKENS' | 'OTHER';
 export interface ModelResponse {
   readonly content: readonly ContentBlock[];
   readonly stopReason: StopReason;
+  /**
+   * 本轮处理的**输入总量，含缓存读取的部分**。
+   *
+   * 这是适配器归一化之后的口径，两个 wire 同义 —— 因为两家原始语义相反：
+   * OpenAI 的 `prompt_tokens` 本来就含缓存；Anthropic 的 `input_tokens` 明确
+   * **不含**（`total = cache_read + cache_creation + input_tokens`）。
+   * 不归一化的话，Anthropic 侧一开缓存就会把总量记成"缓存断点之后那几十个 token"，
+   * 而这个数直接进预算账本 —— 止损会失灵。
+   */
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
   /**
-   * 输入 token 里**命中前缀缓存**的部分（provider 报什么记什么）。
+   * 上面这个输入总量里**命中前缀缓存**的部分（provider 报什么记什么）。
    *
    * 为什么要单列：多轮 agent 循环每一轮都把整段历史重发一遍 —— 实测
    * `run_074bde20…` 12 轮累计输入 218453 token，绝大部分是重复前缀。

@@ -1080,6 +1080,27 @@ export function App() {
 }
 
 /**
+ * "未回报"底下藏着三件不同的事，混成一句话就把责任归错了。
+ *
+ * 逐家核实官方文档（2026-08-28）之后确认：
+ *   - **我方没开启**：Anthropic 必须显式发 `cache_control` 才缓存，我们不发。
+ *     此时说"该 provider 没给缓存构成"是把**我们自己的选择**说成对方的缺陷 ——
+ *     这不是"未知就是未知"，这是把已知的原因写成未知。
+ *   - **该家不适用**：ModelScope 按调用次数计费（0.5/1/2 魔粒每次），
+ *     "缓存计费构成"在它上面语义不成立，不是"没回报"。
+ *   - **真的没给**：provider 有缓存能力，但这次响应里没有这个字段。
+ */
+function unreportedCacheReason(providerId: string): string {
+  if (providerId === 'anthropic') {
+    return '未启用 —— 需显式发送 cache_control，我方目前不发';
+  }
+  if (providerId === 'modelscope') {
+    return '不适用 —— 该平台按调用次数计费，缓存不改变费用';
+  }
+  return '未回报（该 provider 这次没给缓存构成）';
+}
+
+/**
  * 找出**离上限最近**的那个预算维度 —— 状态栏只有一格，就该给绑定约束。
  *
  * 四个维度都有硬上限、超限即停：轮次、工具调用、token、墙钟。
@@ -1290,18 +1311,31 @@ function UsagePanel({ run, events }: { run: RunView; events: RunEvent[] }) {
     return undefined; // 还没有任何出站
   }, [events]);
 
-  /** 同一次出站里命中前缀缓存的输入 token；undefined=尚无出站，null=provider 未回报 */
-  const cacheRead = useMemo(() => {
+  /** 同一次出站里命中前缀缓存的输入 token 与它的 provider；undefined=尚无出站，null=未回报 */
+  const { cacheRead, lastProvider } = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i -= 1) {
       const e = events[i]!;
       if (e.kind !== 'MODEL_INVOCATION') continue;
-      const manifest = (e.payload as { manifest?: { cacheReadTokens?: number | null } } | null)
-        ?.manifest;
+      const manifest = (
+        e.payload as {
+          manifest?: { cacheReadTokens?: number | null; providerId?: string };
+        } | null
+      )?.manifest;
       if (manifest === undefined) continue;
-      return manifest.cacheReadTokens ?? null;
+      return { cacheRead: manifest.cacheReadTokens ?? null, lastProvider: manifest.providerId ?? '' };
     }
-    return undefined;
+    return { cacheRead: undefined as number | null | undefined, lastProvider: '' };
   }, [events]);
+
+  /*
+   * 占比只有分子分母都拿到才算得出来。此前这里写的是 `lastContext ? … : 0`，
+   * 于是 provider 没回报总输入时会**凭空印出一个 0%** —— 一个我们证明不了的数字，
+   * 与把未知折算成 0 是同一类问题。
+   */
+  const cachePct =
+    typeof cacheRead === 'number' && typeof lastContext === 'number' && lastContext > 0
+      ? `${Math.round((cacheRead / lastContext) * 100)}%`
+      : null;
 
   return (
     <div className="usage-pop">
@@ -1344,8 +1378,10 @@ function UsagePanel({ run, events }: { run: RunView; events: RunEvent[] }) {
           {cacheRead === undefined
             ? '尚无出站'
             : cacheRead === null
-              ? '未回报（该 provider 没给缓存构成）'
-              : `${cacheRead} tok · 本轮输入的 ${lastContext ? Math.round((cacheRead / lastContext) * 100) : 0}%`}
+              ? unreportedCacheReason(lastProvider)
+              : `${cacheRead} tok · ${
+                  cachePct === null ? '占比未知（本轮输入未回报）' : `本轮输入的 ${cachePct}`
+                }`}
         </span>
       </div>
       <div className="usage-note">

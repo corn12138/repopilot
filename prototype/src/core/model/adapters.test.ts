@@ -163,6 +163,33 @@ describe('anthropicAdapter: 响应解析', () => {
     expect(r.outputTokens).toBeNull();
   });
 
+  it('input_tokens 归一化：Anthropic 是相加口径，不归一化会让预算止损失灵', async () => {
+    /*
+     * 官方文档（platform.claude.com/.../prompt-caching）逐字：
+     *   input_tokens = "tokens which were **not** read from or used to create a cache"
+     *   total_input_tokens = cache_read + cache_creation + input_tokens
+     * 下面直接用文档给的那个例子：100000 读 + 0 新建 + 50 用户消息 = 100050。
+     *
+     * 照搬 input_tokens 会把 100050 记成 50 —— 而它直接进预算账本，
+     * 那是一个永远花不完的预算，Run 不会因超限而停。
+     */
+    stubFetchJson({
+      content: [{ type: 'text', text: 'hi' }],
+      stop_reason: 'end_turn',
+      usage: {
+        input_tokens: 50,
+        output_tokens: 7,
+        cache_read_input_tokens: 100_000,
+        cache_creation_input_tokens: 0,
+      },
+    });
+    const r = await anthropicAdapter.call(req, ctx());
+    expect(r.inputTokens).toBe(100_050); // 不是 50
+    expect(r.cacheReadTokens).toBe(100_000);
+    // 命中占总输入的比例应当接近 100%，而不是荒谬的 200000%
+    expect(r.cacheReadTokens! / r.inputTokens!).toBeCloseTo(0.9995, 3);
+  });
+
   it('缓存构成：命中/写入分别解析；缺失记 null 而不是 0', async () => {
     /*
      * 多轮循环每一轮都重发整段历史，命中前缀缓存的输入按远低于常规输入计价。
@@ -190,6 +217,8 @@ describe('anthropicAdapter: 响应解析', () => {
       usage: { input_tokens: 100, output_tokens: 5 },
     });
     const miss = await anthropicAdapter.call(req, ctx());
+    // 求和把缺失按 0 计（没有缓存活动就没有这部分 token），但对外仍报 null ——
+    // "求和用的 0" 与 "展示用的未知" 是两件事，不能混
     expect(miss.cacheReadTokens).toBeNull();
     expect(miss.cacheWriteTokens).toBeNull();
     expect(miss.inputTokens).toBe(100);
@@ -525,6 +554,70 @@ describe('openAiWireAdapter: 响应解析', () => {
       type: 'tool_use',
       input: { __malformed_arguments__: '{path: a.ts' },
     });
+  });
+
+  it('Moonshot：cached_tokens 在 usage 顶层 —— 不认它就等于把已回报的数当未回报', async () => {
+    /*
+     * 2026-08-28 逐家核实官方文档时抓到的真错：Kimi 把命中数放在 usage **顶层**，
+     * 既不叫 prompt_cache_hit_tokens，也不在 prompt_tokens_details 下。
+     * 只认前两个字段的话，Kimi **每次都回报了**而我们**每次都显示"未回报"** ——
+     * 这是纪律的反向违反：不是把未知当已知，是把已知当未知。
+     */
+    stubFetchJson({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 19, completion_tokens: 21, total_tokens: 40, cached_tokens: 10 },
+    });
+    expect((await openAiWireAdapter.call(req, ctx())).cacheReadTokens).toBe(10);
+  });
+
+  it('SiliconFlow：两套字段并存时不被占位 0 截断', async () => {
+    /*
+     * SiliconFlow 是唯一同时声明两套字段的 provider。若其中一套是未接上游的占位 0，
+     * `??` 会在 0 处停下（?? 只对 null/undefined 下坠），把真实命中显示成"0 命中" ——
+     * 正是我们明令禁止的那一格。所以取 max 而不是取第一个非空。
+     */
+    stubFetchJson({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 1000,
+        prompt_cache_hit_tokens: 0, // 占位
+        prompt_tokens_details: { cached_tokens: 800 }, // 真值
+      },
+    });
+    expect((await openAiWireAdapter.call(req, ctx())).cacheReadTokens).toBe(800);
+  });
+
+  it('真实回报的 0 保留成 0，字段整体缺席才是 null', async () => {
+    // "确实 0 命中"与"没告诉我们"是两件事，不能都塌缩成一个显示
+    stubFetchJson({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 19, prompt_tokens_details: { cached_tokens: 0 } },
+    });
+    expect((await openAiWireAdapter.call(req, ctx())).cacheReadTokens).toBe(0);
+
+    stubFetchJson({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 19 },
+    });
+    expect((await openAiWireAdapter.call(req, ctx())).cacheReadTokens).toBeNull();
+  });
+
+  it('openai wire 的 cache_write 是子集，绝不能加进 inputTokens', async () => {
+    /*
+     * 与 anthropic wire 的非对称性：那边 cache_creation 是额外项、要相加；
+     * 这边 OpenAI 官方算式是 ordinary = input − cached − cache_write，是子集。
+     * 照搬求和会把总输入重复计一遍。
+     */
+    stubFetchJson({
+      choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 1000,
+        prompt_tokens_details: { cached_tokens: 600, cache_write_tokens: 300 },
+      },
+    });
+    const r = await openAiWireAdapter.call(req, ctx());
+    expect(r.inputTokens).toBe(1000); // 不是 1300
+    expect(r.cacheWriteTokens).toBe(300); // 此前被硬编码成 null，真实数据被丢弃
   });
 
   it('缓存构成：认 DeepSeek 与 OpenAI 两种口径；都没有则记 null', async () => {
