@@ -19,7 +19,13 @@ interface AnthropicBlock {
 interface AnthropicResponse {
   content?: AnthropicBlock[];
   stop_reason?: string;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    /** 显式 cache_control 命中时才出现 */
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
   error?: { type?: string; message?: string };
 }
 
@@ -76,6 +82,9 @@ export const anthropicAdapter: ModelAdapter = {
       stopReason: mapStop(data.stop_reason),
       inputTokens: data.usage?.input_tokens ?? null,
       outputTokens: data.usage?.output_tokens ?? null,
+      // 未发 cache_control 时这两个字段不会出现 —— 缺失是"未回报"(null)，不是 0
+      cacheReadTokens: data.usage?.cache_read_input_tokens ?? null,
+      cacheWriteTokens: data.usage?.cache_creation_input_tokens ?? null,
     };
   },
 };

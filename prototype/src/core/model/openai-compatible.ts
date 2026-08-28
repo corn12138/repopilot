@@ -20,7 +20,15 @@ interface ChatResponse {
     message?: { content?: string | null; tool_calls?: ChatToolCall[] };
     finish_reason?: string;
   }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    /** DeepSeek 自动前缀缓存的口径 */
+    prompt_cache_hit_tokens?: number;
+    prompt_cache_miss_tokens?: number;
+    /** OpenAI 标准口径 */
+    prompt_tokens_details?: { cached_tokens?: number };
+  };
   error?: { message?: string };
 }
 
@@ -103,6 +111,15 @@ export const openAiWireAdapter: ModelAdapter = {
       stopReason: mapStop(choice.finish_reason, content),
       inputTokens: data.usage?.prompt_tokens ?? null,
       outputTokens: data.usage?.completion_tokens ?? null,
+      /*
+       * 两家口径都认：DeepSeek 用 prompt_cache_hit_tokens，OpenAI 用
+       * prompt_tokens_details.cached_tokens。都没有 = 未回报(null)，不是 0 ——
+       * 这个 provider 可能根本没有前缀缓存，也可能有但没告诉我们，两者都不该显示成"0 命中"。
+       */
+      cacheReadTokens:
+        data.usage?.prompt_cache_hit_tokens ?? data.usage?.prompt_tokens_details?.cached_tokens ?? null,
+      // OpenAI 兼容侧没有"为写缓存付费"的概念，恒为未回报
+      cacheWriteTokens: null,
     };
   },
 };

@@ -1088,6 +1088,12 @@ export interface ModelEgressManifest {
   readonly contextFileRefs: readonly string[];
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
+  /**
+   * 输入 token 的**计费构成**:命中前缀缓存的部分。字段缺失或 null 都读作"未回报",
+   * 都不等于 0 —— 历史记录里没有这两个字段是正常的(它们晚于那些记录出现)。
+   */
+  readonly cacheReadTokens?: number | null;
+  readonly cacheWriteTokens?: number | null;
   readonly requestedAt: Iso8601;
   readonly settledAt: Iso8601 | null;
   readonly errorKind: string | null;

@@ -1290,6 +1290,19 @@ function UsagePanel({ run, events }: { run: RunView; events: RunEvent[] }) {
     return undefined; // 还没有任何出站
   }, [events]);
 
+  /** 同一次出站里命中前缀缓存的输入 token；undefined=尚无出站，null=provider 未回报 */
+  const cacheRead = useMemo(() => {
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const e = events[i]!;
+      if (e.kind !== 'MODEL_INVOCATION') continue;
+      const manifest = (e.payload as { manifest?: { cacheReadTokens?: number | null } } | null)
+        ?.manifest;
+      if (manifest === undefined) continue;
+      return manifest.cacheReadTokens ?? null;
+    }
+    return undefined;
+  }, [events]);
+
   return (
     <div className="usage-pop">
       <UsageBar label="模型轮次" used={run.ledger.modelTurns} max={run.limits.maxModelTurns} />
@@ -1318,6 +1331,21 @@ function UsagePanel({ run, events }: { run: RunView; events: RunEvent[] }) {
         <span className="usage-label">最近上下文</span>
         <span className="usage-value">
           {lastContext === undefined ? '尚无出站' : lastContext === null ? '未知（provider 未回报）' : `${lastContext} tok (in)`}
+        </span>
+      </div>
+      {/*
+        输入 token 的计费构成。多轮循环每轮重发整段历史，命中前缀缓存的部分
+        按远低于常规输入的价格计费 —— 只报一个总数会让账本看起来比实际更贵。
+        provider 没回报就写「未回报」，不猜、不折算成 0。
+      */}
+      <div className="usage-row">
+        <span className="usage-label">其中缓存命中</span>
+        <span className="usage-value">
+          {cacheRead === undefined
+            ? '尚无出站'
+            : cacheRead === null
+              ? '未回报（该 provider 没给缓存构成）'
+              : `${cacheRead} tok · 本轮输入的 ${lastContext ? Math.round((cacheRead / lastContext) * 100) : 0}%`}
         </span>
       </div>
       <div className="usage-note">

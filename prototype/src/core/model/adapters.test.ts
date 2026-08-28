@@ -163,6 +163,38 @@ describe('anthropicAdapter: 响应解析', () => {
     expect(r.outputTokens).toBeNull();
   });
 
+  it('缓存构成：命中/写入分别解析；缺失记 null 而不是 0', async () => {
+    /*
+     * 多轮循环每一轮都重发整段历史，命中前缀缓存的输入按远低于常规输入计价。
+     * 只报一个 inputTokens 总数会让账本看起来比实际更贵 —— 少报事实与
+     * 把未知折算成 0 是同一类问题（实测 run_074bde20… 12 轮累计输入 218453 tok）。
+     */
+    stubFetchJson({
+      content: [{ type: 'text', text: 'hi' }],
+      stop_reason: 'end_turn',
+      usage: {
+        input_tokens: 100,
+        output_tokens: 5,
+        cache_read_input_tokens: 80,
+        cache_creation_input_tokens: 20,
+      },
+    });
+    const hit = await anthropicAdapter.call(req, ctx());
+    expect(hit.cacheReadTokens).toBe(80);
+    expect(hit.cacheWriteTokens).toBe(20);
+
+    // 没发 cache_control 时这两个字段根本不出现 —— 那是"未回报"，不是"命中 0"
+    stubFetchJson({
+      content: [{ type: 'text', text: 'hi' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 100, output_tokens: 5 },
+    });
+    const miss = await anthropicAdapter.call(req, ctx());
+    expect(miss.cacheReadTokens).toBeNull();
+    expect(miss.cacheWriteTokens).toBeNull();
+    expect(miss.inputTokens).toBe(100);
+  });
+
   it('stop_reason 映射：max_tokens → MAX_TOKENS，未知 → OTHER', async () => {
     stubFetchJson({ content: [], stop_reason: 'max_tokens' });
     expect((await anthropicAdapter.call(req, ctx())).stopReason).toBe('MAX_TOKENS');
@@ -493,6 +525,31 @@ describe('openAiWireAdapter: 响应解析', () => {
       type: 'tool_use',
       input: { __malformed_arguments__: '{path: a.ts' },
     });
+  });
+
+  it('缓存构成：认 DeepSeek 与 OpenAI 两种口径；都没有则记 null', async () => {
+    // DeepSeek 口径
+    stubFetchJson({
+      choices: [{ message: { content: 'a' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, completion_tokens: 5, prompt_cache_hit_tokens: 64 },
+    });
+    expect((await openAiWireAdapter.call(req, ctx())).cacheReadTokens).toBe(64);
+
+    // OpenAI 标准口径
+    stubFetchJson({
+      choices: [{ message: { content: 'a' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 32 } },
+    });
+    expect((await openAiWireAdapter.call(req, ctx())).cacheReadTokens).toBe(32);
+
+    // 两种都没有 —— provider 可能没有前缀缓存，也可能有但没告诉我们，都不是"命中 0"
+    stubFetchJson({
+      choices: [{ message: { content: 'a' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, completion_tokens: 5 },
+    });
+    const none = await openAiWireAdapter.call(req, ctx());
+    expect(none.cacheReadTokens).toBeNull();
+    expect(none.cacheWriteTokens).toBeNull();
   });
 
   it('usage 缺失 → token 记 null', async () => {

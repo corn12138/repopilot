@@ -37,6 +37,22 @@ export interface ModelResponse {
   readonly stopReason: StopReason;
   readonly inputTokens: number | null;
   readonly outputTokens: number | null;
+  /**
+   * 输入 token 里**命中前缀缓存**的部分（provider 报什么记什么）。
+   *
+   * 为什么要单列：多轮 agent 循环每一轮都把整段历史重发一遍 —— 实测
+   * `run_074bde20…` 12 轮累计输入 218453 token，绝大部分是重复前缀。
+   * 这些 token 在支持前缀缓存的 provider（如 DeepSeek 自动缓存、Anthropic 显式
+   * cache_control）上按远低于常规输入的价格计费。只报一个 `inputTokens` 总数，
+   * 等于把"实际计费构成"抹平成一个看起来更贵的数 —— 对一个以诚实记账立身的产品，
+   * 这是**少报事实**，和把未知折算成 0 是同一类问题。
+   *
+   * 字段缺失或 `null` 都读作"未回报"（**都不等于 0**）。绝不由本地估算填充。
+   * 做成可选是为了让既有的测试替身与历史持久化记录保持兼容 —— 没写就是没报。
+   */
+  readonly cacheReadTokens?: number | null;
+  /** 为写入缓存而付费的输入 token（Anthropic `cache_creation_input_tokens`）；null = 未回报 */
+  readonly cacheWriteTokens?: number | null;
 }
 
 export type ModelCallErrorKind =

@@ -360,6 +360,9 @@ export class ModelGateway {
         blockReason: null,
         inputTokens: response.inputTokens,
         outputTokens: response.outputTokens,
+        // 计费构成:命中缓存的输入按远低于常规输入计价,不单列等于少报事实
+        cacheReadTokens: response.cacheReadTokens ?? null,
+        cacheWriteTokens: response.cacheWriteTokens ?? null,
         settledAt: nowIso(),
         errorKind: null,
         sendAttempt: 1,
@@ -476,6 +479,8 @@ export class ModelGateway {
           blockReason: null,
           inputTokens: response.inputTokens,
           outputTokens: response.outputTokens,
+          cacheReadTokens: response.cacheReadTokens ?? null,
+          cacheWriteTokens: response.cacheWriteTokens ?? null,
           settledAt: nowIso(),
           errorKind: null,
           sendAttempt: att,
