@@ -1034,17 +1034,22 @@ export function App() {
           </>
         )}
         <span className="spacer" />
-        {selectedRun && !isTerminal(selectedRun.status) && selectedRun.limits.maxTotalTokens > 0 && (
-          <span title={`token ${selectedRun.ledger.inputTokens + selectedRun.ledger.outputTokens} / ${selectedRun.limits.maxTotalTokens}（超限即停，不重置）`}>
-            预算{' '}
-            {Math.round(
-              ((selectedRun.ledger.inputTokens + selectedRun.ledger.outputTokens) /
-                selectedRun.limits.maxTotalTokens) *
-                100,
-            )}
-            %
-          </span>
-        )}
+        {selectedRun && !isTerminal(selectedRun.status) && (() => {
+          /*
+           * 显示**真正绑定的那个**约束，而不是笼统的"预算 N%"。
+           *
+           * 2026-08-28 的实测教训（EVI-PLANNING-CAP-001）：一个 Run 死于轮次上限时，
+           * 状态栏显示的是 token「预算 36%」—— 看着很宽裕，而真正掐死它的维度不可见。
+           * 一个只报最舒服那个数字的仪表，比没有仪表更误导。
+           */
+          const binding = bindingBudget(selectedRun);
+          if (!binding) return null;
+          return (
+            <span className={binding.ratio >= 0.9 ? 'statusbar-tight' : undefined} title={binding.detail}>
+              {binding.label} {binding.used}/{binding.max}
+            </span>
+          );
+        })()}
         <button
           className="statusbar-models"
           onClick={() => {
@@ -1072,6 +1077,45 @@ export function App() {
       />
     </div>
   );
+}
+
+/**
+ * 找出**离上限最近**的那个预算维度 —— 状态栏只有一格，就该给绑定约束。
+ *
+ * 四个维度都有硬上限、超限即停：轮次、工具调用、token、墙钟。
+ * 挑比值最大的那个显示，并在 title 里把四个都列全（省略要报数）。
+ * 不做百分比换算成"剩余额度"之类的推断 —— BYOK 下套餐余量在供应商侧，这里不猜。
+ */
+export function bindingBudget(
+  run: RunView,
+): { label: string; used: string; max: string; ratio: number; detail: string } | null {
+  const l = run.ledger;
+  const m = run.limits;
+  const tokens = l.inputTokens + l.outputTokens;
+  const dims = [
+    { label: '轮次', used: l.modelTurns, max: m.maxModelTurns, fmt: (n: number) => String(n) },
+    { label: '工具', used: l.toolCalls, max: m.maxToolCalls, fmt: (n: number) => String(n) },
+    { label: 'token', used: tokens, max: m.maxTotalTokens, fmt: (n: number) => `${(n / 1000).toFixed(0)}k` },
+    {
+      label: '时长',
+      used: l.elapsedMs,
+      max: m.maxWallClockMs,
+      fmt: (n: number) => `${Math.round(n / 1000)}s`,
+    },
+  ].filter((d) => d.max > 0);
+  if (dims.length === 0) return null;
+
+  const detail =
+    dims.map((d) => `${d.label} ${d.fmt(d.used)}/${d.fmt(d.max)}`).join(' · ') +
+    '（四项都是硬上限，任一触顶即停，不重置）';
+  const top = dims.reduce((a, b) => (b.used / b.max > a.used / a.max ? b : a));
+  return {
+    label: top.label,
+    used: top.fmt(top.used),
+    max: top.fmt(top.max),
+    ratio: top.used / top.max,
+    detail,
+  };
 }
 
 /** 排除原因的中文标签。分类必须来自数据，不能是一句写死的"依赖、产物、二进制、疑似 secret"。 */

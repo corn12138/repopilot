@@ -2141,3 +2141,8 @@ select:focus-visible {
 }
 .import-details > .kv { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
 .import-details > .field { margin-top: 0 !important; }
+
+/* 绑定约束逼近上限时的提示色 —— 只在 ≥90% 时出现，平时不喊 */
+.statusbar-tight {
+  color: var(--state-warning-fg);
+}

@@ -820,9 +820,10 @@ describe('规划阶段不会无限重试', () => {
   it('模型只回文本不调 submit_plan：每轮都被要求重提，用满轮次后抛 PlanningFailed', async () => {
     const gateway = new ScriptedModel(() => endTurn('我觉得这个 bug 挺简单的，直接改就行。'));
     const task = makeTask({
-      budget: { ...makeTask().budget, maxModelTurns: 3 },
+      budget: { ...makeTask().budget, maxModelTurns: 6 },
     });
 
+    // 规划子预算 = 轮次预算的一半（6 → 3），见 generatePlan 里 maxPlanTurns 的注释
     await expect(run(gateway, task)).rejects.toThrow(/规划阶段用满 3 轮仍未提交计划/);
 
     expect(gateway.callCount).toBe(3);
@@ -835,14 +836,32 @@ describe('规划阶段不会无限重试', () => {
     expect(host.toolCalls).toHaveLength(0);
   });
 
-  it('规划轮次还有一道与预算无关的硬上限 12', async () => {
-    // maxModelTurns 给到 50，规划仍然只能用 12 轮 —— 否则一个死活不提交计划的模型
-    // 可以把整个 token 预算烧在规划上。
+  it('规划子预算从 Run 轮次预算派生，且永远吃不掉整个预算', async () => {
+    /*
+     * 守卫的**意图**不变：一个死活不提交计划的模型不能把整个预算烧在规划上。
+     * 变的是它的来源 —— 以前是与用户预算无关的常数 12，这让"用户把预算调大"
+     * 对规划完全无效。2026-08-28 实测（EVI-PLANNING-CAP-001）显示真实失败正是撞在
+     * 那个常数上，而 token 36% / 工具 45% / 轮次 30% 三项预算都没用完。
+     */
     const gateway = new ScriptedModel(() => endTurn('再想想。'));
     const task = makeTask({ budget: { ...makeTask().budget, maxModelTurns: 50 } });
 
-    await expect(run(gateway, task)).rejects.toThrow(/用满 12 轮/);
-    expect(gateway.callCount).toBe(12);
+    await expect(run(gateway, task)).rejects.toThrow(/用满 25 轮/);
+    expect(gateway.callCount).toBe(25); // 派生：50 的一半
+    expect(gateway.callCount).toBeLessThan(50); // 守卫仍在：吃不掉整个预算
+  });
+
+  it('规划触顶的文案如实报数：点明其他预算尚未耗尽，并给出下一步', async () => {
+    /*
+     * 不变式 8「省略要报数」的应用：旧文案只说"用满 12 轮"，把最关键的事实藏了 ——
+     * **其他预算根本没用完**。用户因此无法判断该放宽预算还是该收窄任务描述。
+     */
+    const gateway = new ScriptedModel(() => endTurn('再想想。'));
+    const task = makeTask({ budget: { ...makeTask().budget, maxModelTurns: 6 } });
+
+    await expect(run(gateway, task)).rejects.toThrow(/尚未耗尽/);
+    await expect(run(gateway, task)).rejects.toThrow(/轮次预算 6 轮的一半/);
+    await expect(run(gateway, task)).rejects.toThrow(/提高任务的模型轮次预算|收窄范围/);
   });
 
   it('submit_plan 参数不合法：把校验错误回灌给模型，允许改正而不是直接失败', async () => {

@@ -480,7 +480,25 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
 async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Promise<PlanRevision> {
   const { host } = deps;
   const tools = [...PLANNING_TOOLS, submitPlan as unknown as ToolDefinition];
-  const maxPlanTurns = Math.min(12, deps.task.budget.maxModelTurns);
+  /*
+   * 规划阶段的轮次子预算。
+   *
+   * 这里曾经是 `Math.min(12, …)` —— 一个没有任何文档依据的硬编码。它的后果是
+   * **用户的预算选择对规划完全无效**：把 Run 调到 40 轮，规划仍然只有 12 轮。
+   *
+   * 2026-08-28 实测（EVI-PLANNING-CAP-001）：真实失败正是撞在这条线上 ——
+   * `run_074bde20…` 终止时 token 218453/600000（36%）、工具 36/80（45%）、
+   * 轮次 12/40（30%），三项预算都远未耗尽，末轮上下文也只有 32k。
+   * 也就是说它不是"资源不够"，是被一个常数掐断的。
+   *
+   * 现在从 Run 自己的轮次预算派生一半：上限仍然存在（规划不能吃光整个 Run，
+   * 执行与自修复要留一半），但它跟随用户的选择。执行阶段本来就没有子上限，
+   * 只靠同一个 `budgetExceeded()` 守卫，所以这里放宽不会饿死后面的阶段。
+   *
+   * **比例本身仍是开放问题（Q-026）**：没有模型 key 就做不了对照实验，
+   * 所以这次只做"派生 + 如实报数"，不声称"这样更好用"。
+   */
+  const maxPlanTurns = Math.max(2, Math.floor(deps.task.budget.maxModelTurns / 2));
 
   for (let turn = 0; turn < maxPlanTurns; turn += 1) {
     throwIfCancelled(deps.signal);
@@ -590,7 +608,20 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
     if (submitted) return submitted;
   }
 
-  throw new PlanningFailed(`规划阶段用满 ${maxPlanTurns} 轮仍未提交计划`);
+  /*
+   * 触顶文案必须报数（不变式 8）。旧文案只说"用满 12 轮"，把最关键的事实藏了起来：
+   * **其他预算根本没用完**。用户看不到这一点，就无从判断该放宽预算还是该收窄任务 ——
+   * 这正是 EVI-PLANNING-CAP-001 里那三个 Run 的处境。
+   */
+  const remaining = host.budgetExceeded();
+  throw new PlanningFailed(
+    `规划阶段用满 ${maxPlanTurns} 轮仍未提交计划` +
+      `（规划子预算 = 本任务模型轮次预算 ${deps.task.budget.maxModelTurns} 轮的一半）。` +
+      (remaining.exceeded
+        ? `此时 Run 预算也已耗尽：${remaining.reason}。`
+        : `此时 token 与工具调用预算尚未耗尽 —— 这是规划子预算到顶，不是资源不足。` +
+          `若该仓库确实需要更多探索，可提高任务的模型轮次预算；若不需要，通常说明任务描述过宽，先收窄范围。`),
+  );
 }
 
 export class PlanningFailed extends Error {}
