@@ -424,27 +424,62 @@ describe('runExternalCliReview：隔离的负向断言（真子进程）', () =>
   });
 
   it('真实 HOME、宿主凭据、GITHUB_TOKEN 全都不在子进程环境里', async () => {
-    // CLI 把整份 env 与 cwd 塞进 findings[0].evidence 带回来
+    /*
+     * 证据必须**有界**，而且失败时要直接说出漏了什么。
+     *
+     * 上一版让 CLI 把整份 `env`（含值）带回来。两个问题：
+     *   1. 宿主 PATH 在开发机上就有 ~3000 字节，而平台对 stdout 预览有 4000 字节
+     *      上限，超了整份判为不可解析。于是这条用例的成败取决于"仓库检出到多深的
+     *      目录" —— 实测同一份代码，深一层路径下 PATH 从 2996 涨到 3451 就必红，
+     *      红成 `expected 'FAILED' to be 'SEALED'`，看着像隔离坏了。CI 的 PATH
+     *      通常更长，这条迟早在那里炸，而且炸得让人查错方向。
+     *   2. 更糟的是**真泄漏时也报截断**：一旦有人把宿主环境合并进来，
+     *      dump 立刻撑爆上限，用例是红了，但红的理由是"输出被截断"，
+     *      没有一个字提到泄漏。
+     *
+     * 现在改成让 CLI 自己算判据：**键的清单**（证明整份替换 —— 任何多出来的键
+     * 都会现形）+ **逐项泄漏检查**（直接对值 grep，命中就点名）。
+     * 两者都是有界的，且失败信息直接指向原因。
+     */
     const spy = makeSpyCli(
       [
-        'ENVDUMP=$(env | tr "\\n" ";")',
-        'CWD=$(pwd)',
-        'printf \'{"verdict":"PASS","findings":[{"severity":"INFO","blocking":false,"evidence":"%s|CWD=%s"}]}\' "$ENVDUMP" "$CWD"',
+        // 只带键名：足以证明"没有别的东西漏进来"，且长度不随宿主 PATH 变化
+        'KEYS=$(env | cut -d= -f1 | sort | tr "\\n" ",")',
+        // 逐项对**值**检查，命中就点名 —— 泄漏时不会被别的失败盖过去
+        'LEAKS=""',
+        'env | grep -q "canary-must-not-leak" && LEAKS="${LEAKS}canary,"',
+        'env | grep -q "ghp_must_not_leak" && LEAKS="${LEAKS}github-token,"',
+        'printf \'{"verdict":"PASS","findings":[{"severity":"INFO","blocking":false,"evidence":"KEYS=%s|LEAKS=%s|HOME=%s|CWD=%s"}]}\' "$KEYS" "$LEAKS" "$HOME" "$(pwd)"',
       ].join('\n'),
     );
     const r = await call(spy);
+    // 先看原因再看状态：SEALED 断言失败时，光看 'FAILED' 三个字查不出到底怎么了
+    expect(r.manifest.failureDetail).toBeNull();
     expect(r.manifest.state).toBe('SEALED');
     const evidence = String(r.submission!.findings[0]!.evidence);
 
-    // 关键负向断言
-    expect(evidence).not.toContain('canary-must-not-leak');
-    expect(evidence).not.toContain('ghp_must_not_leak');
+    // 关键负向断言：一个都不许漏，漏了直接在这一行看到漏的是哪个
+    expect(evidence).toContain('|LEAKS=|');
     expect(evidence).not.toContain('REPOPILOT_SECRET_CANARY');
-    expect(evidence).not.toContain(`HOME=${realHomeMarker};`);
-    // 正向：显式凭据在，synthetic HOME 在，cwd 是一次性目录（不是仓库）
-    expect(evidence).toContain('OPENAI_API_KEY=sk-scoped-for-review');
-    expect(evidence).toContain('repopilot-xagent-');
-    expect(evidence).toMatch(/CWD=.*repopilot-xagent-/);
+    expect(evidence).not.toContain('GITHUB_TOKEN');
+    expect(evidence).not.toContain(realHomeMarker);
+
+    // 正向：显式凭据在、PATH 在（否则 CLI 找不到自己的 node）、synthetic HOME 在
+    expect(evidence).toContain('OPENAI_API_KEY');
+    expect(evidence).toContain('PATH');
+    expect(evidence).toMatch(/HOME=[^|]*repopilot-xagent-/);
+    // cwd 是一次性目录，不是仓库 —— 审核方连坐标系都没有
+    expect(evidence).toMatch(/CWD=[^|]*repopilot-xagent-/);
+
+    /*
+     * 整份替换的正面证据：键的数量就是 isolatedEnv 明确给出的那几个
+     * （PATH/HOME/4×XDG/TMPDIR/LANG/CI/NO_COLOR/TERM/凭据），再加 shell 自己
+     * 注入的少数几个。给一个宽松上界即可 —— 宿主环境一旦合并进来是几十上百个，
+     * 差着数量级，不会误判。
+     */
+    const keys = /KEYS=([^|]*)\|/.exec(evidence)?.[1]?.split(',').filter(Boolean) ?? [];
+    expect(keys.length).toBeGreaterThan(5);
+    expect(keys.length).toBeLessThan(20);
   });
 
   it('调用结束后一次性 HOME 被删除，不在磁盘上留登录态残留', async () => {
