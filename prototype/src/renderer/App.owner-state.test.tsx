@@ -564,15 +564,46 @@ function seqEvent(runId: string, seq: number, summary: string): RunEvent {
 }
 
 describe('App 时间线跟随', () => {
+  /**
+   * 这里有两处刻意的选择，都是为了消掉一条真实抓到过的随机红。
+   *
+   * 失败签名有两个："↓ 2 条新事件"按钮从未出现，和 `expected 800 to be 1100`。
+   * 查下来是同一个原因：**用例在一次仍在飞行的补拉中间做了同步断言**。
+   *
+   * 补拉从哪来：App 有个"状态推进到需要新数据时补拉一次"的 effect —— 
+   * `AWAITING_PLAN_APPROVAL` 且 `plan` 为 null 就会回源（run.updated 只带 view、
+   * 不带计划/补丁本体）。原来的 fixture 正好是这个状态、而 `plan.get` 回 null，
+   * 于是每次挂载都会发**第二次** `run.events`（加计数实测：同一条用例里两次）。
+   * 那次补拉把 runDetail 置为 loading，`selectedRunDetail` 暂时为 null，
+   * itemCount 归 0；机器不忙时它在 act() 内就 settle 了，忙起来就没有 ——
+   * 断言于是撞在空窗上。
+   *
+   * 两处修法：
+   *   1. Run 状态改成 EXECUTING —— 它不满足任何 needsRefresh 条件，补拉不再发生。
+   *      这条用例测的是**跟随**，补拉是无关的异步源，不该混进来。
+   *   2. `run.events` 返回**累积的**事件而不是永远那一条。真实 Core 持有全部事件，
+   *      重拉一定是超集；静态 mock 会让任何一次回源都变成"回退到更旧的事实"。
+   *      现在没有补拉了这条用不上，但线束不该对 Core 撒谎 —— 下一个人加个
+   *      需要回源的用例时，不该再踩一遍。
+   *
+   * 刻意**没有**做的：给断言加 waitFor 或重试。那样红会消失，但消失的理由是
+   * "等久一点"，而不是"这里本来就不该有第二个异步源"。
+   */
   async function mountRunWithTranscript() {
     const ownerProject = project('project-follow', 'Follow Project');
-    const followRun = run('run-follow', ownerProject.projectId, 'Follow Run');
+    const followRun: RunView = {
+      ...run('run-follow', ownerProject.projectId, 'Follow Run'),
+      // 见上：AWAITING_* / FAILED / BLOCKED / CANCELLED 都会触发补拉
+      status: 'EXECUTING',
+    };
+    // Core 侧的事实：推送过的事件同样留在事件流里，重拉必然拿得到
+    const durable: RunEvent[] = [seqEvent(followRun.runId, 1, '第一条事件')];
+
     const bridge = installBridge(async (method, payload) => {
       const bootstrap = bootstrapResponse(method, [ownerProject], [followRun]);
       if (bootstrap) return bootstrap;
       if (method === 'project.import') return ok(imported(ownerProject.projectId, 2));
-      const runId = (payload as { runId: string }).runId;
-      if (method === 'run.events') return ok({ events: [seqEvent(runId, 1, '第一条事件')] });
+      if (method === 'run.events') return ok({ events: [...durable] });
       if (method === 'run.toolCalls') return ok({ toolCalls: [] });
       if (method === 'approval.pending') return ok({ approvals: [] });
       if (method === 'plan.get') return ok({ plan: null });
@@ -590,18 +621,26 @@ describe('App 时间线跟随', () => {
     const scroller = document.querySelector('.chat-scroll');
     if (!(scroller instanceof HTMLElement)) throw new Error('找不到滚动容器');
     const box = installScrollMetrics(scroller, { scrollHeight: 1000, clientHeight: 200 });
-    return { bridge, box, scroller, runId: followRun.runId };
+
+    /** 发一条新事件：先落进 Core 的事件流，再推给 Renderer —— 与真实顺序一致 */
+    const emit = (seq: number, summary: string) => {
+      const e = seqEvent(followRun.runId, seq, summary);
+      durable.push(e);
+      bridge.push({ type: 'run.event', runId: followRun.runId, event: e });
+    };
+
+    return { bridge, box, scroller, runId: followRun.runId, emit };
   }
 
   it('用户向上阅读时不被抢滚动，计数准确且可点击回到底部', async () => {
-    const { bridge, box, scroller, runId } = await mountRunWithTranscript();
+    const { box, scroller, emit } = await mountRunWithTranscript();
 
     box.scrollTop = 40; // 距底 760px，远超阈值
     fireEvent.scroll(scroller);
 
     act(() => {
-      bridge.push({ type: 'run.event', runId, event: seqEvent(runId, 2, '第二条事件') });
-      bridge.push({ type: 'run.event', runId, event: seqEvent(runId, 3, '第三条事件') });
+      emit(2, '第二条事件');
+      emit(3, '第三条事件');
     });
 
     /*
@@ -623,14 +662,14 @@ describe('App 时间线跟随', () => {
   });
 
   it('用户在底部时直接跟随，不显示未读提示', async () => {
-    const { bridge, box, scroller, runId } = await mountRunWithTranscript();
+    const { box, scroller, emit } = await mountRunWithTranscript();
 
     box.scrollTop = 800; // 1000 - 800 - 200 = 0
     fireEvent.scroll(scroller);
 
     box.scrollHeight = 1100;
     act(() => {
-      bridge.push({ type: 'run.event', runId, event: seqEvent(runId, 2, '第二条事件') });
+      emit(2, '第二条事件');
     });
 
     expect(box.scrollTop).toBe(1100);
