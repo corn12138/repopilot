@@ -53,6 +53,7 @@ const connector = (kind: 'CODEX_CLI' | 'CLAUDE_CLI'): ExternalConnectorProfile =
   version: '1.0',
   identityDigest: 'sha256:id',
   credentialEnvVar: 'X',
+  authorAdmitted: true,
   detail: '',
   remediation: null,
 });

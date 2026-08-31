@@ -39,6 +39,7 @@ function makeFakeCli(body: string): ExternalConnectorProfile {
     version: 'fake 1.0',
     identityDigest: 'sha256:fake',
     credentialEnvVar: 'OPENAI_API_KEY',
+    authorAdmitted: true,
     detail: 'fake',
     remediation: null,
   };
@@ -244,3 +245,49 @@ describe('runExternalCliAuthor：简报 DLP（与 ModelGateway 同一道）', ()
     expect(r.seal).toBeNull();
   });
 });
+
+describe('作者角色的准入闸门：只准入审核方的连接器不许写代码', () => {
+  /**
+   * 分阶段准入的执行面。一个连接器可以只以**只读审核方**身份进来 ——
+   * 那条路上 cwd 是空目录、产出只有一段 JSON，"它能不能写文件"不影响结果。
+   * 作者角色不一样：它在 candidate 目录里真的改代码，「工具白名单能不能压住
+   * shell」是安全边界，必须有实测证据。
+   *
+   * 闸门放在 author.ts 而不只在 authority：这里是**所有**作者调用的必经之路，
+   * 挡在这里才不依赖上游每个调用点都记得查。
+   */
+  it('authorArgv 为 null → BLOCKED，且一个子进程都不起', async () => {
+    const candidate = makeCandidate({ 'src/a.ts': 'export const total = 1;\n' });
+    const before = listTree(candidate.path);
+
+    // 用真实的 opencode-deepseek 描述符：它只准入了审核方角色
+    const res = await call(
+      {
+        connectorId: 'opencode-deepseek',
+        kind: 'CODEX_CLI', // kind 与本用例无关；连接器身份由 connectorId 决定
+        vendor: 'DEEPSEEK',
+        label: 'OpenCode · DeepSeek',
+        state: 'READY',
+        form: 'CLI',
+        appPath: null,
+        // 指向一个必然会改文件的假 CLI：真起了进程就会被下面的 tree 断言抓到
+        binaryPath: '/bin/sh',
+        version: 'x',
+        identityDigest: 'sha256:x',
+        credentialEnvVar: 'DEEPSEEK_API_KEY',
+        authorAdmitted: false,
+        detail: '',
+        remediation: null,
+      },
+      candidate,
+    );
+
+    expect(res.manifest.state).toBe('BLOCKED');
+    expect(res.manifest.failureDetail).toContain('尚未以作者身份准入');
+    expect(res.seal).toBeNull();
+    // 没跑过任何东西：candidate 目录逐字节不变
+    expect(listTree(candidate.path)).toEqual(before);
+    // 拒绝发生在起进程之前，所以没有退出码可记
+    expect(res.manifest.exitCode).toBeNull();
+  });
+})

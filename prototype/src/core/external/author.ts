@@ -229,6 +229,20 @@ export async function runExternalCliAuthor(input: {
     return { manifest: seal('BLOCKED', null, describeDlpHits(dlp), null), seal: null };
   }
 
+  /*
+   * 作者角色的准入闸门。描述符里 `authorArgv === null` 意味着这一家**只准入了
+   * 审核方角色** —— 它的工具白名单/沙箱证据还不足以让它在 candidate 目录里写代码。
+   *
+   * 这道检查在这里而不只在 authority：author.ts 是所有作者调用的必经之路，
+   * 挡在这里才不依赖上游每个调用点都记得查。
+   */
+  if (!d.authorArgv) {
+    return {
+      manifest: seal('BLOCKED', null, `${d.label} 尚未以作者身份准入（只准入了只读审核方）`, null),
+      seal: null,
+    };
+  }
+
   const home = mkdtempSync(join(tmpdir(), 'repopilot-xauthor-'));
   try {
     const def: CommandDefinition = {
@@ -246,6 +260,7 @@ export async function runExternalCliAuthor(input: {
         pathValue: buildChildEnv().env.PATH ?? '',
         home,
         credential: { name: d.credentialEnvVar, value: input.apiKey },
+        extraEnv: d.extraEnv,
       }),
       stdin: prompt,
     });

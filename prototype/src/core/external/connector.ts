@@ -111,10 +111,38 @@ interface ExternalConnectorDescriptorShape {
    * 内写文件。写权限只到 cwd 为止 —— 各家 CLI 自己的 sandbox/permission 机制负责这一层，
    * 平台这一层再用 tree diff → MutationPlan 兜底，两道保险互不依赖。
    * 同样不接受运行时拼接的任意 argv。
+   *
+   * **`null` = 该连接器尚未以作者身份准入。**
+   *
+   * 分阶段准入是必要的，因为两个角色的证据门槛差得远：审核方只读一段 diff、
+   * cwd 是空目录，"它能不能写文件"根本不影响结果；而作者要在 candidate 目录里
+   * 真的改代码，那条路上「工具白名单能不能压住 shell」是安全边界，
+   * 必须有实测证据，不能靠读文档推断。
+   *
+   * 没有这个字段的话，唯一的选择是「整家都不接」或「连没验过的作者角色一起接」——
+   * 前者浪费掉已经站得住的那一半证据，后者拿安全边界赌文档。
    */
-  readonly authorArgv: readonly string[];
+  readonly authorArgv: readonly string[] | null;
   /** 显式凭据 audience：只注入这一个变量 */
   readonly credentialEnvVar: string;
+  /**
+   * 额外注入的**非密**环境变量（可选）。
+   *
+   * 为什么需要：隔离环境是**整份替换**的，CLI 拿不到任何宿主环境。但有些 CLI
+   * 需要几个非机密的变量才能在这种环境里正常工作 —— 关掉自动更新与远端目录拉取、
+   * 用 inline 形式下发权限配置、把配置根指到一次性目录。这些是**平台的决定**，
+   * 不是用户的配置，所以它们属于描述符，不属于运行时输入。
+   *
+   * 两条硬约束由形状本身保证，不靠调用方自觉：
+   *
+   * 1. **值是描述符表里的静态字面量**，不是运行时拼接、更不是回调 ——
+   *    所以它**结构上装不下 API key**。凭据只有一条路：`isolatedEnv` 的
+   *    `credential` 参数（AGENTS.md 不变式 7：凭据不落明文，也不散落多处）。
+   * 2. **不得覆盖隔离本身设定的键**（PATH / HOME / XDG_* / 凭据变量）——
+   *    否则一个描述符条目就能把 synthetic HOME 指回真实 HOME。
+   *    由 `isolatedEnv` 强制，见那里的实现。
+   */
+  readonly extraEnv?: Readonly<Record<string, string>>;
 }
 
 const DESCRIPTORS = [
@@ -182,6 +210,77 @@ const DESCRIPTORS = [
     ],
     credentialEnvVar: 'OPENAI_API_KEY',
   },
+  {
+    /*
+     * OpenCode（anomalyco/opencode，原 sst/opencode）—— **只准入只读审核方角色**。
+     *
+     * 与前两家不同，它是 provider 无关的：`--model provider/model` 决定用谁。
+     * 而描述符每条固定一个 vendor（异构不变式与出站披露都建立在这上面），
+     * 所以这里取「一模型一条目」：model 钉死在 argv 里，vendor 随之确定。
+     * 想接第二个模型就再加一条 —— 保持「表是唯一事实源、argv 不做运行时拼接」。
+     *
+     * 选 DeepSeek 是因为它**没有自己的编码 CLI**：这条目才真的扩了覆盖面，
+     * 而不是重复我们已有的 claude/codex 两条。
+     *
+     * 证据等级（2026-08-31 核对，逐条见 devlog 2026-08-31-02）：
+     *   - stdin 收 prompt：**源码级确证**（run.ts 判 `process.stdin.isTTY`，
+     *     非 TTY 就整块读走当 prompt），但**官方文档一个字没提** ——
+     *     属于无合同保障的行为，升级可能静默改掉。这是我们的硬需求
+     *     （prompt 不进 argv），所以下面有一条专门的回归断言盯着它。
+     *   - 纯环境变量凭据：源码级确证。models 目录里 deepseek 的 env 数组是
+     *     **单元素** `["DEEPSEEK_API_KEY"]` —— 代码只在单元素时自动填 apiKey，
+     *     多元素（如 google 的三个别名）不填。换模型前要重核这一点。
+     *   - 作者角色：**未准入**（authorArgv = null）。权限配置要靠
+     *     `OPENCODE_CONFIG_CONTENT` 压过目标仓库自带的 `opencode.json`
+     *     （precedence 6 > 4），而多份 config 的 permission 到底是深合并还是
+     *     整体替换**没有确证**。那是安全边界，不拿文档推断赌。
+     *     补一次实测（仓库放 bash:allow，我们下 deny，看 bash 是否真的消失）
+     *     才谈作者准入。
+     */
+    connectorId: 'opencode-deepseek',
+    kind: 'OPENCODE_CLI',
+    vendor: 'DEEPSEEK',
+    label: 'OpenCode · DeepSeek',
+    binaries: ['opencode'],
+    binaryPathEnv: 'REPOPILOT_OPENCODE_CLI_PATH',
+    // 纯 CLI，没有桌面应用形态
+    appBundles: [],
+    bundledBinaryRelPaths: [],
+    versionArgv: ['--version'],
+    /*
+     * argv 里**不放任何 positional message** —— prompt 全部走 stdin。
+     * 也刻意不写 `opencode run -`：源码里没有对 `-` 的特殊处理，
+     * 它会被当成普通 message，把 prompt 污染成 `-\n<正文>`。
+     */
+    reviewArgv: ['run', '--model', 'deepseek/deepseek-chat'],
+    authorArgv: null,
+    credentialEnvVar: 'DEEPSEEK_API_KEY',
+    extraEnv: {
+      /*
+       * 隔离环境里的出站要能向安全评审交代。这两个开关关掉启动期的两条出站：
+       *   - 远端模型目录 https://models.opencode.ai/api.json（后台 fork、60 分钟一次）
+       *   - 自动更新检查
+       * 注意开关只认 "true"/"1"（源码 `truthy()` 小写比较），写 "yes" 无效。
+       */
+      OPENCODE_DISABLE_MODELS_FETCH: '1',
+      OPENCODE_DISABLE_AUTOUPDATE: '1',
+      /*
+       * 审核方是只读的，权限配置走 inline（precedence 6）而**不是**
+       * `OPENCODE_CONFIG`（precedence 3）—— 后者低于目标仓库自带的
+       * `opencode.json`（4），任何仓库都能用自己的配置把我们的 deny 盖掉。
+       * 审核方的 cwd 是空目录、本来就没有仓库配置，这里下 deny 是纵深防御：
+       * 它只该读一段 diff 文本然后吐 JSON，不需要任何工具。
+       */
+      OPENCODE_CONFIG_CONTENT: JSON.stringify({
+        permission: {
+          '*': 'deny',
+          bash: { '*': 'deny' },
+          edit: { '*': 'deny' },
+          task: { '*': 'deny' },
+        },
+      }),
+    },
+  },
 ] as const satisfies readonly ExternalConnectorDescriptorShape[];
 
 export type ExternalConnectorKind = (typeof DESCRIPTORS)[number]['kind'];
@@ -212,6 +311,11 @@ export interface ExternalConnectorProfile {
   /** 身份摘要：路径 + 版本。换了二进制或升级了版本，这个值就变 */
   readonly identityDigest: string | null;
   readonly credentialEnvVar: string;
+  /**
+   * 该连接器是否已以**作者**身份准入（描述符 `authorArgv` 非 null）。
+   * 与 `state` 正交：一个 READY 的连接器完全可能只准入了审核方角色。
+   */
+  readonly authorAdmitted: boolean;
   readonly detail: string;
   readonly remediation: string | null;
 }
@@ -238,6 +342,7 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
     vendor: d.vendor,
     label: d.label,
     credentialEnvVar: d.credentialEnvVar,
+    authorAdmitted: d.authorArgv !== null,
   };
   const childEnv = buildChildEnv().env;
   const appPath = d.appBundles.find((p) => existsSync(p)) ?? null;
@@ -316,7 +421,7 @@ export function probeConnector(d: ExternalConnectorDescriptor): ExternalConnecto
       encoding: 'utf8',
       timeout: 10_000,
       // 探测也走 synthetic HOME：问版本不该成为读真实配置的借口
-      env: isolatedEnv({ pathValue: childEnv.PATH ?? '', home: probeHome }),
+      env: isolatedEnv({ pathValue: childEnv.PATH ?? '', home: probeHome, extraEnv: d.extraEnv }),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
       .trim()
@@ -366,8 +471,24 @@ export function isolatedEnv(input: {
   pathValue: string;
   home: string;
   credential?: { name: string; value: string };
+  /**
+   * 描述符声明的非密变量（`ExternalConnectorDescriptor.extraEnv`）。
+   * **先于**隔离键与凭据写入，因此覆盖不了它们 —— 见下面的顺序说明。
+   */
+  extraEnv?: Readonly<Record<string, string>>;
 }): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = Object.create(null) as NodeJS.ProcessEnv;
+
+  /*
+   * 顺序即强制：描述符的 extraEnv 先落，隔离键与凭据后落，后写覆盖先写。
+   *
+   * 这不是风格问题。反过来写的话，描述符里一行 `HOME: '/Users/…'` 就能把
+   * synthetic HOME 指回真实 HOME —— 整套隔离（读不到 ~/.claude、读不到登录态）
+   * 一句配置就没了。用赋值顺序保证，比写一张禁用键黑名单更难写错：
+   * 黑名单会漏，顺序不会。
+   */
+  for (const [k, v] of Object.entries(input.extraEnv ?? {})) env[k] = v;
+
   env.PATH = input.pathValue;
   env.HOME = input.home;
   env.XDG_CONFIG_HOME = join(input.home, '.config');
@@ -603,6 +724,7 @@ export async function runExternalCliReview(input: {
         pathValue: buildChildEnv().env.PATH ?? '',
         home,
         credential: { name: d.credentialEnvVar, value: input.apiKey },
+        extraEnv: d.extraEnv,
       }),
       stdin: prompt,
     });

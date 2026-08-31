@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   SameVendorReviewDenied,
   assertHeterogeneousVendor,
+  connectorDescriptors,
   descriptorOfConnector,
   discoverConnectors,
   isolatedEnv,
@@ -152,10 +153,18 @@ describe('异构 vendor 是不变式，不是披露项', () => {
 });
 
 describe('连接器发现与身份探测', () => {
-  it('内置两个连接器，vendor 互异（否则交叉审核永远同厂商）', () => {
+  it('每个连接器的 vendor 互异（否则交叉审核永远同厂商）', () => {
+    /*
+     * 断言的是**性质**而不是当时恰好有几家：连接器表是会长的（加一家 = 表里一条目），
+     * 而"vendor 两两互异"是它必须一直成立的那条 —— 有两条同 vendor 的条目，
+     * 用户选中它们做交叉审核就只会撞 SAME_VENDOR_REVIEW_DENIED，
+     * 那不是保护，是把一个本该在表里就避免的错误推到运行时。
+     */
     const all = discoverConnectors();
-    expect(all.map((c) => c.connectorId).sort()).toEqual(['claude-cli', 'codex-cli']);
-    expect(new Set(all.map((c) => c.vendor)).size).toBe(2);
+    expect(all.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(all.map((c) => c.vendor)).size).toBe(all.length);
+    // connectorId 也必须唯一 —— 它是 task.create 的选择键
+    expect(new Set(all.map((c) => c.connectorId)).size).toBe(all.length);
   });
 
   it('没装的连接器报 NOT_INSTALLED 并给修复建议，不是静默消失', () => {
@@ -365,6 +374,7 @@ describe('runExternalCliReview：隔离的负向断言（真子进程）', () =>
       version: 'spy 1.0',
       identityDigest: 'sha256:spy',
       credentialEnvVar: 'OPENAI_API_KEY',
+      authorAdmitted: true,
       detail: 'spy',
       remediation: null,
     };
@@ -481,6 +491,7 @@ describe('runExternalCliReview：失败与拒绝路径都封存 manifest', () =>
     version: '1',
     identityDigest: 'sha256:x',
     credentialEnvVar: 'OPENAI_API_KEY',
+    authorAdmitted: true,
     detail: '',
     remediation: null,
     ...over,
@@ -586,5 +597,125 @@ describe('外部 CLI 的发现与模型 API 走同一套归一化', () => {
     const r = parseExternalSubmission('PASS', []);
     expect(r?.verdict).toBe('PASS');
     expect(r?.findings).toEqual([]);
+  });
+});
+
+describe('extraEnv：描述符可以给非密变量，但覆盖不了隔离本身', () => {
+  /**
+   * 为什么要有 extraEnv：隔离环境是整份替换的，CLI 拿不到任何宿主环境。
+   * 但有些 CLI 需要几个**非机密**变量才能在这种环境里正常工作 ——
+   * 关掉自动更新与远端目录拉取、用 inline 形式下发权限配置。
+   * 这些是平台的决定，属于描述符，不属于运行时输入。
+   *
+   * 而它必须**覆盖不了隔离键**：描述符里一行 `HOME: '/Users/…'` 就能把
+   * synthetic HOME 指回真实 HOME，整套隔离（读不到 ~/.claude、读不到登录态）
+   * 一句配置就没了。这一条由赋值顺序保证 —— 黑名单会漏，顺序不会。
+   */
+  it('非密变量原样注入', () => {
+    const env = isolatedEnv({
+      pathValue: '/usr/bin',
+      home: '/tmp/h',
+      extraEnv: { OPENCODE_DISABLE_AUTOUPDATE: '1', OPENCODE_CONFIG_CONTENT: '{"a":1}' },
+    });
+    expect(env.OPENCODE_DISABLE_AUTOUPDATE).toBe('1');
+    expect(env.OPENCODE_CONFIG_CONTENT).toBe('{"a":1}');
+  });
+
+  it('覆盖不了 HOME / PATH / XDG —— 一行配置不能把隔离指回真实 HOME', () => {
+    const env = isolatedEnv({
+      pathValue: '/usr/bin',
+      home: '/tmp/synthetic',
+      extraEnv: {
+        HOME: '/Users/victim',
+        PATH: '/evil/bin',
+        XDG_CONFIG_HOME: '/Users/victim/.config',
+        TMPDIR: '/Users/victim/tmp',
+      },
+    });
+    expect(env.HOME).toBe('/tmp/synthetic');
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.XDG_CONFIG_HOME).toBe('/tmp/synthetic/.config');
+    expect(env.TMPDIR).toBe('/tmp/synthetic/tmp');
+  });
+
+  it('覆盖不了凭据变量 —— 描述符不能把 key 换成自己写死的值', () => {
+    const env = isolatedEnv({
+      pathValue: '/usr/bin',
+      home: '/tmp/h',
+      credential: { name: 'DEEPSEEK_API_KEY', value: 'sk-real' },
+      extraEnv: { DEEPSEEK_API_KEY: 'sk-planted' },
+    });
+    expect(env.DEEPSEEK_API_KEY).toBe('sk-real');
+  });
+
+  it('内置表里的 extraEnv 一律不含凭据字面量（不变式 7：凭据不落别处）', () => {
+    /*
+     * 这条守的是形状纪律：extraEnv 的值是编译期字面量，所以它**结构上**装不下
+     * 运行时的 key。但人可能手滑把一个测试用的 sk-… 粘进表里，那就等于
+     * 把凭据写进了源码。这里逐条扫一遍，不靠自觉。
+     */
+    for (const d of connectorDescriptors()) {
+      for (const [k, v] of Object.entries(d.extraEnv ?? {})) {
+        expect(`${k}=${v}`).not.toMatch(/sk-[A-Za-z0-9]|Bearer\s|api[_-]?key["'\s]*[:=]\s*["'][^"']/i);
+        // 凭据变量本身也不该出现在 extraEnv 里 —— 它只有 credential 一条路
+        expect(k).not.toBe(d.credentialEnvVar);
+      }
+    }
+  });
+});
+
+describe('分阶段准入：可以只准入审核方角色', () => {
+  /**
+   * 两个角色的证据门槛差得远：审核方只读一段 diff、cwd 是空目录，
+   * "它能不能写文件"根本不影响结果；作者要在 candidate 目录里真的改代码，
+   * 那条路上「工具白名单能不能压住 shell」是安全边界，必须有实测证据。
+   *
+   * 没有分阶段准入，选择就只剩「整家都不接」或「连没验过的作者角色一起接」——
+   * 前者浪费掉已经站得住的那一半证据，后者拿安全边界赌文档。
+   */
+  it('authorArgv 为 null 的连接器，profile 上如实标注未准入作者角色', () => {
+    const opencode = connectorDescriptors().find((d) => d.connectorId === 'opencode-deepseek');
+    expect(opencode).toBeTruthy();
+    expect(opencode!.authorArgv).toBeNull();
+    expect(probeConnector(opencode!).authorAdmitted).toBe(false);
+
+    // 对照：已准入作者角色的两家
+    for (const id of ['claude-cli', 'codex-cli']) {
+      const d = connectorDescriptors().find((x) => x.connectorId === id)!;
+      expect(d.authorArgv).not.toBeNull();
+      expect(probeConnector(d).authorAdmitted).toBe(true);
+    }
+  });
+
+  it('OpenCode 的出站开关与只读权限配置在表里就钉死了', () => {
+    const d = connectorDescriptors().find((x) => x.connectorId === 'opencode-deepseek')!;
+    // 隔离环境里的出站要能向安全评审交代：两条启动期出站都关掉
+    expect(d.extraEnv?.OPENCODE_DISABLE_MODELS_FETCH).toBe('1');
+    expect(d.extraEnv?.OPENCODE_DISABLE_AUTOUPDATE).toBe('1');
+    /*
+     * 权限走 inline（OPENCODE_CONFIG_CONTENT，precedence 6）而不是
+     * OPENCODE_CONFIG（precedence 3）—— 后者低于目标仓库自带的 opencode.json（4），
+     * 任何仓库都能用自己的配置把我们的 deny 盖掉。这是个真实的沙箱逃逸口。
+     */
+    expect(d.extraEnv?.OPENCODE_CONFIG).toBeUndefined();
+    const perm = JSON.parse(d.extraEnv!.OPENCODE_CONFIG_CONTENT!) as {
+      permission: Record<string, unknown>;
+    };
+    expect(perm.permission.bash).toEqual({ '*': 'deny' });
+    expect(perm.permission.edit).toEqual({ '*': 'deny' });
+    // 子代理是条未验证的旁路，一并堵死
+    expect(perm.permission.task).toEqual({ '*': 'deny' });
+  });
+
+  it('prompt 不进 argv：审核入口的 argv 里没有 positional message，也没有 `-`', () => {
+    /*
+     * 硬需求：prompt 进 argv 会在进程列表里可见。OpenCode 判 stdin 是否 TTY，
+     * 非 TTY 就整块读走当 prompt —— 所以 argv 里**必须什么都不放**。
+     * 也不能写 `opencode run -`：源码里没有对 `-` 的特殊处理，它会被当成
+     * 普通 message，把 prompt 污染成 `-\n<正文>`。
+     */
+    const d = connectorDescriptors().find((x) => x.connectorId === 'opencode-deepseek')!;
+    expect(d.reviewArgv).toEqual(['run', '--model', 'deepseek/deepseek-chat']);
+    expect(d.reviewArgv).not.toContain('-');
   });
 });
