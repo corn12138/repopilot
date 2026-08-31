@@ -1481,6 +1481,184 @@ ul.plain li {
   border-top: 1px solid var(--border-hairline);
 }
 
+/*
+ * 没有工具调用的那一轮：一条安静的行，不是一张卡片。
+ * 之前它渲染成写着"没有工具调用"的折叠卡 —— 整块版面用来说"这里什么都没有"。
+ */
+.turn-quiet {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+
+/* --------------------------------------------- 相邻同族调用并成的组 */
+/*
+ * 折叠头必须读起来像一句话（"读取文件 · 7 次"），不是内部标识符的拼接。
+ * 视觉重量刻意低于 .turn：它是被收起来的噪声，不该和真正的叙事抢注意力。
+ */
+.toolgroup {
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  margin: 4px 0;
+  background: var(--surface-panel);
+  overflow: hidden;
+}
+.toolgroup[open] {
+  border-color: var(--border-control);
+}
+.toolgroup-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  list-style: none;
+}
+.toolgroup-head::-webkit-details-marker {
+  display: none;
+}
+.toolgroup-head:hover {
+  background: var(--surface-raised);
+}
+/* 折叠状态自己要看得见：▸/▾ 是"这里还有东西"的唯一线索 */
+.toolgroup-head::before {
+  content: '▸';
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+.toolgroup[open] > .toolgroup-head::before {
+  content: '▾';
+}
+.toolgroup-title {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.toolgroup-failed {
+  color: var(--state-failed-fg);
+}
+.toolgroup-turns {
+  color: var(--text-tertiary);
+}
+.toolgroup-body {
+  padding: 2px 10px 6px 22px;
+  border-top: 1px solid var(--border-hairline);
+}
+.toolrow-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* --------------------------------------------- 模型说的话 */
+/*
+ * 归属与截断说明都比正文低一层：正文才是要读的东西。
+ * 但两者都不能省 —— 并组之后"谁说的"必须留得住，截断必须报数。
+ */
+/*
+ * 正在流进来的那一段：视觉上要与"已经写下来的"有别，否则用户分不清
+ * 哪些是记录、哪些还可能被撤回（重试时增量会整段作废）。
+ * 用一条左边框而不是动画 —— 静止即可读，也不违反动效纪律。
+ */
+.msg.agent.live .msg-body {
+  border-left: 2px solid var(--accent-interactive);
+  padding-left: 8px;
+}
+.say-attribution {
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+}
+.say-truncated {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--state-warning-fg);
+}
+
+/* --------------------------------------------- 活动指示 */
+/*
+ * 模型调用期间一条事件都不发，那是整个流程里最长的等待。
+ * 这一行是那段时间里唯一说"还在跑"的东西。
+ *
+ * 刻意不做持续动画：动效纪律是"只动 opacity/transform、reduced-motion 下关闭"，
+ * 而永不停止的 spinner 在这条纪律下没有诚实的实现方式 ——
+ * 它还会让"卡住了"和"在跑"长得一模一样。空心点 + 文字，静止即可读。
+ */
+.transcript-activity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0 8px 44px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+.transcript-activity-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-interactive);
+}
+
+/* --------------------------------------------- 模型正文的 Markdown 呈现 */
+/*
+ * 模型写的就是 Markdown。直接 {text} 会把 `**`、反引号、`##` 当正文印出来。
+ * 标题只做视觉加重、不进标题大纲 —— 这是聊天流里的一段话，不是文档。
+ */
+.prose > :first-child {
+  margin-top: 0;
+}
+.prose > :last-child {
+  margin-bottom: 0;
+}
+.prose-p {
+  margin: 0 0 6px;
+}
+.prose-h {
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 10px 0 4px;
+}
+.prose-h1,
+.prose-h2 {
+  font-size: 12.5px;
+}
+.prose-list {
+  margin: 0 0 6px;
+  padding-left: 18px;
+}
+.prose-list li {
+  margin: 2px 0;
+}
+.prose code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--surface-code);
+  border: 1px solid var(--border-hairline);
+  border-radius: 4px;
+  padding: 0 3px;
+}
+.prose-code {
+  margin: 4px 0 6px;
+  padding: 6px 8px;
+  background: var(--surface-code);
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-code);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
 /* --------------------------------------------- 任务选项 / 自定义命令的状态回显 */
 /*
  * "开了但没填"必须与"已生效"长得不一样 —— 前者实际不生效，

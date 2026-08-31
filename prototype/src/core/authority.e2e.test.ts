@@ -45,10 +45,11 @@ vi.mock('./paths', async () => {
   };
 });
 
-import type { ApprovalRequest, PatchArtifact, RunEvent, RunView } from '@shared/domain';
+import type { ApprovalRequest, PatchArtifact, RunEvent, RunView, ToolCallView } from '@shared/domain';
 import type { PushEvent, ResponsePayload } from '@shared/protocol';
 import { RunAuthority } from './authority';
 import { PATHS } from './paths';
+import { chatCompletionResponse } from './model/chatSse.testkit';
 
 /**
  * Authority 级端到端：从 __project.register 一路走到终态。
@@ -166,10 +167,9 @@ class Harness {
           throw new Error(`${host} 的模型脚本已耗尽。最后请求：${bodyText.slice(-600)}`);
         }
         const wire = queue.shift()!(bodyText);
-        return new Response(JSON.stringify(wire), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
+        // Agent Loop 默认走流式，所以线束也必须发 SSE —— 否则这些 e2e 覆盖的
+        // 是一条生产里不存在的路径（见 chatSse.testkit.ts 顶部）
+        return chatCompletionResponse(wire);
       }),
     );
   }
@@ -1313,4 +1313,74 @@ describe('进程退出：shutdown 真的发信号，重启后的清理说明只�
     await waitDead(pid);
     rmSync(pidFile, { force: true });
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// 命令终局：模型发起的那一侧也必须是判别联合
+// ---------------------------------------------------------------------------
+
+describe('模型发起的 run_command 留下完整终局，而不是一个布尔', () => {
+  /**
+   * 不变式 5 说的是「命令结果是判别联合，不是布尔。非零退出、信号、超时、
+   * spawn 失败必须可区分。命令无论由谁发起都走同一套」。
+   *
+   * **平台发起**的验证命令一直满足它（CommandOutcome 进 VERIFICATION_FINISHED），
+   * 但**模型发起**的 run_command 此前只在 ToolCallView 上留下
+   * `resolution: SUCCEEDED | FAILED` —— 到了界面上，"退出码 1"、"被信号杀掉"、
+   * "超时"、"根本没起来"长得一模一样，而这四种要采取的行动完全不同。
+   *
+   * 这条钉住投影：工具如实上报完整 CommandOutcome，Core 投影成不含正文的
+   * CommandResult 存进 ToolCallView 与 TOOL_CALL_RESOLVED。
+   */
+  it('非零退出：ToolCallView 带 EXIT_NONZERO 与真实退出码，正文不重复进事件', async () => {
+    harness.script(IMPL, [
+      () => planCall(),
+      () => readApp(),
+      // 仓库还是 broken，check.mjs 必定退出 1 —— 这是一次真实的非零退出
+      () => oaToolCall('run_command', { commandId: 'user1' }),
+      () => oaText('命令失败了，我不再改动。'),
+    ]);
+
+    const { runId } = await harness.createRun({ hostPath: makeFixtureRepo() });
+    await harness.approvePlan(runId);
+    await harness.waitForStatus(runId, ['FAILED', 'AWAITING_PATCH_REVIEW', 'BLOCKED']);
+
+    const { toolCalls } = await harness.call<{ toolCalls: ToolCallView[] }>('run.toolCalls', { runId });
+    const ran = toolCalls.filter((t) => t.toolName === 'run_command');
+    expect(ran).toHaveLength(1);
+
+    const result = ran[0]!.commandResult;
+    expect(result).toBeTruthy();
+    expect(result!.outcome).toBe('EXIT_NONZERO');
+    expect(result!.exitCode).toBe(1);
+    expect(result!.signal).toBeNull();
+    expect(result!.durationMs).toBeGreaterThanOrEqual(0);
+    // 布尔那一层仍在，但不再是唯一的事实
+    expect(ran[0]!.resolution).toBe('FAILED');
+
+    // 事件 payload 只带判别联合，不带正文 —— 正文在 preview/artifact 里，
+    // 原样塞进每条 TOOL_CALL_RESOLVED 会让事件流背上完整命令输出
+    const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+    const resolved = events.filter(
+      (e) => e.kind === 'TOOL_CALL_RESOLVED' && e.payload.toolCallId === ran[0]!.toolCallId,
+    );
+    expect(resolved).toHaveLength(1);
+    const command = resolved[0]!.payload.command as Record<string, unknown>;
+    expect(command.outcome).toBe('EXIT_NONZERO');
+    expect(command.exitCode).toBe(1);
+    expect(Object.keys(command).sort()).toEqual(['durationMs', 'exitCode', 'outcome', 'signal']);
+  });
+
+  it('非命令类工具没有终局可言：commandResult 是 null，不是一个编出来的通过', async () => {
+    harness.script(IMPL, [() => planCall(), () => readApp(), () => oaText('看完了，不改。')]);
+
+    const { runId } = await harness.createRun({ hostPath: makeFixtureRepo() });
+    await harness.approvePlan(runId);
+    await harness.waitForStatus(runId, ['FAILED', 'AWAITING_PATCH_REVIEW', 'BLOCKED']);
+
+    const { toolCalls } = await harness.call<{ toolCalls: ToolCallView[] }>('run.toolCalls', { runId });
+    const reads = toolCalls.filter((t) => t.toolName === 'fs_read');
+    expect(reads.length).toBeGreaterThan(0);
+    for (const r of reads) expect(r.commandResult ?? null).toBeNull();
+  });
 });

@@ -488,6 +488,20 @@ export type RunEventKind =
   | 'SELF_FIX_ROUND'
   | 'BUDGET_EXHAUSTED'
   | 'CLEANUP_SUMMARY'
+  /**
+   * 模型自己写的话。
+   *
+   * 必须与 NOTE 分开：NOTE 是**平台**的如实标注（未验证模式、状态流转、整改结果），
+   * 把模型正文塞进 NOTE 等于把它记在平台名下 —— 时间线上会显示成"平台"在说话，
+   * 而界面上从来不会出现"AI"这个说话人。这正是之前发生的事。
+   *
+   * 之前更严重的一半是：只有模型**停止调用工具**的那一轮才取一次正文，且截到 400 字
+   * 无披露；有工具调用的那些轮，模型写的东西整段丢弃。参照物界面里"每组工具调用后面
+   * 那段有实质结论的自然语言"，在这套数据里根本不存在。
+   *
+   * payload: { purpose: 'PLANNING'|'EXECUTION'|'CROSS_REVIEW', truncated: boolean, fullLength: number }
+   */
+  | 'ASSISTANT_MESSAGE'
   /** 交叉审核开始（含 reviewer route 与是否异构） */
   | 'CROSS_REVIEW_STARTED'
   /** 一次 reviewer invocation 结束（verdict + 发现数） */
@@ -545,6 +559,13 @@ export interface ToolCallView {
   readonly startedAt: Iso8601;
   readonly resolvedAt: Iso8601 | null;
   readonly durationMs: number | null;
+  /**
+   * 命令类工具（run_command）的终局判别联合。非命令工具为 null。
+   *
+   * 可选：旧状态快照里没有这个字段，读回来是 `undefined` —— 那不是"命令成功了"，
+   * 是"这次记录里没有这份事实"，界面必须按未知处理而不是按通过处理。
+   */
+  readonly commandResult?: CommandResult | null;
 }
 
 export interface ApprovalRequest {
@@ -698,6 +719,24 @@ export interface CommandOutcome {
   readonly stdoutPreview: string;
   readonly stderrPreview: string;
   readonly outputTruncated: boolean;
+}
+
+/**
+ * 命令终局的判别联合投影 —— **不含正文**。
+ *
+ * 正文在 `ToolCallView.preview` / `artifactRef` 里，重复带一份既胀事件也胀状态快照。
+ *
+ * 为什么要单独有这个：不变式「命令结果是判别联合，不是布尔」对**平台发起**的验证命令
+ * 一直成立（结果以 CommandOutcome 进 VERIFICATION_FINISHED），但对**模型发起**的
+ * run_command 只留下 `resolution: SUCCEEDED | FAILED` —— 到了界面上，"退出码 1"、
+ * "被信号杀掉"、"超时"、"根本没起来"长得一模一样。不变式说的是"无论由谁发起都走同一套"，
+ * 这个字段就是把模型那一侧补齐。
+ */
+export interface CommandResult {
+  readonly outcome: CommandOutcome['outcome'];
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly durationMs: number;
 }
 
 export interface VerificationRun {

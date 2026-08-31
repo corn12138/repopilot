@@ -34,9 +34,11 @@ vi.mock('./paths', async () => {
 });
 
 import type { ApprovalRequest, PatchArtifact, RunEvent, RunView } from '@shared/domain';
+import { isTerminal } from '@shared/domain';
 import type { PushEvent } from '@shared/protocol';
 import { RunAuthority } from './authority';
 import { PATHS } from './paths';
+import { chatCompletionResponse } from './model/chatSse.testkit';
 
 /**
  * REQUEST_CHANGES 开新 Attempt（PRD-DIFF-003 / PRD §9：它不是 Run 终态）的权威层端到端。
@@ -139,10 +141,7 @@ class Harness {
         const host = new URL(String(url)).host;
         const queue = this.queues.get(host);
         if (!queue || queue.length === 0) throw new Error(`${host} 的模型脚本已耗尽`);
-        return new Response(JSON.stringify(queue.shift()!(String(init?.body ?? ''))), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
+        return chatCompletionResponse(queue.shift()!(String(init?.body ?? '')));
       }),
     );
   }
@@ -316,8 +315,14 @@ describe('REQUEST_CHANGES：开新 Attempt，不是终态', () => {
         note: '能过验证，但别用行内注释凑合，按项目风格重写',
       });
       expect(decided.reason).toBeNull();
-      // 不是终态：Run 继续，attempt 递增，attemptId 换新
-      expect(['CREATED', 'PLANNING', 'EXECUTING', 'AWAITING_PLAN_APPROVAL']).toContain(decided.run.status);
+      /*
+       * 不是终态：Run 继续，attempt 递增，attemptId 换新。
+       *
+       * 这里断言的是「非终态」这件事本身，而不是当时恰好会出现的几个枚举值 ——
+       * 新 Attempt 从重跑基线开始，那一段现在如实报 VERIFYING；此前写死的白名单
+       * 会因为这种"多了一个诚实的中间相位"而红，而它想保护的性质其实没变。
+       */
+      expect(isTerminal(decided.run.status)).toBe(false);
       expect(decided.run.attemptNo).toBe(2);
       expect(decided.run.attemptId).not.toBe(firstAttemptId);
       expect(decided.run.failureClass ?? null).toBeNull();

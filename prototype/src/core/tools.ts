@@ -449,6 +449,12 @@ export function commandOutcomeToTool(outcome: CommandOutcome): ToolOutcome {
     previewTruncated: p.truncated,
     artifactRef: p.artifactRef,
     ...(ok ? {} : { failureReason: outcome.outcome }),
+    /*
+     * 工具如实上报完整终局。**留多少**由 Core 决定（authority 的 readCommandResult
+     * 把它投影成不含正文的 CommandResult）—— 正文已经在 preview / artifactRef 里，
+     * 原样进事件 payload 会让每条 TOOL_CALL_RESOLVED 背上完整的命令输出。
+     * 分层在这里：工具不该替持久化层做取舍。
+     */
     meta: { outcome },
   };
 }

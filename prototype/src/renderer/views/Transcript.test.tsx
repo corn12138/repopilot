@@ -207,9 +207,16 @@ describe('平台发起的验证命令：合并进省略说明，不重复展示'
         toolCalls={[toolCall({ toolCallId: 'c-1', toolName: 'run_command', risk: 'R1', argsSummary: 'pnpm build' })]}
       />,
     );
-    // 模型发起的命令归在那一轮下面（turn 折叠块里），工具名与摘要都在
-    expect(screen.getByText('run_command')).toBeTruthy();
-    expect(screen.getByText(/pnpm build/)).toBeTruthy();
+    /*
+     * 模型发起的命令归进那一组里，摘要照常可见。
+     * 组标题说人话（"运行命令 pnpm build"），raw 工具名进 title ——
+     * 与 RUN_STATUS_TEXT / RiskBadge 同一条规矩。
+     */
+    const head = screen.getByText('运行命令 pnpm build');
+    // 组里那一行照常带着命令原文（组标题之外还有一处，所以用 getAllByText）
+    expect(screen.getAllByText(/pnpm build/).length).toBeGreaterThan(1);
+    // 命令组默认展开：输出通常就是用户要找的东西，藏进折叠层等于把信号收走
+    expect((head.closest('details') as HTMLDetailsElement).open).toBe(true);
   });
 });
 
@@ -270,10 +277,15 @@ describe('ATTEMPT_STARTED：新一次尝试是看得见的分隔', () => {
       />,
     );
     expect(screen.getByText(/开始第 2 次尝试/)).toBeTruthy();
-    // 第一次尝试的调用在那一轮的折叠块里；第二次的不在里面（currentTurn 被切断）
-    const turn = screen.getByText('PLANNING').closest('details')!;
-    expect(turn.textContent).toContain('src/one.ts');
-    expect(turn.textContent).not.toContain('src/two.ts');
+    /*
+     * 第一次尝试的调用在它那一组里；第二次的不在 —— ATTEMPT_STARTED 切断了
+     * currentTurn，所以 src/two.ts 根本不属于上一轮，也就并不进上一组。
+     * （切断之后没有新的 MODEL_INVOCATION，那次调用退回平铺，不丢事件。）
+     */
+    const groups = document.querySelectorAll('details.toolgroup');
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.textContent).toContain('src/one.ts');
+    expect(groups[0]!.textContent).not.toContain('src/two.ts');
     expect(screen.getByText('src/two.ts')).toBeTruthy();
   });
 });
@@ -368,5 +380,319 @@ describe('终端输出行数上限（交互评审 v0.2 N10）：折叠 + 报数'
     );
     expect(screen.getByText(/s-16/)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /展开全部/ })).toBeNull();
+  });
+});
+
+describe('相邻同族调用并成一组（Layer 0）', () => {
+  afterEach(() => {
+    seq = 0;
+    cleanup();
+  });
+
+  function reads(ids: string[]): ToolCallView[] {
+    return ids.map((id) => toolCall({ toolCallId: id, toolName: 'fs_read', argsSummary: `src/${id}.ts` }));
+  }
+
+  it('跨轮合并：一轮一调用的连续读取收成一组，不再一轮一张卡', () => {
+    // 真机上的形态：模型每轮只读一个文件，连读五轮
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'a' }),
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'b' }),
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'c' }),
+    ];
+    render(<Transcript events={events} toolCalls={reads(['a', 'b', 'c'])} />);
+
+    const groups = document.querySelectorAll('details.toolgroup');
+    expect(groups).toHaveLength(1);
+    expect(screen.getByText('读取文件 · 3 次')).toBeTruthy();
+    // 覆盖了哪几轮、哪个模型没有消失，只是降到 title
+    expect(groups[0]!.querySelector('summary')!.title).toContain('#1–#3');
+    // 三次调用都还在，一条都没丢
+    for (const p of ['src/a.ts', 'src/b.ts', 'src/c.ts']) {
+      expect(groups[0]!.textContent).toContain(p);
+    }
+    // 只读探索默认收起 —— 这是"啥也看不出来"的噪声主体
+    expect((groups[0] as HTMLDetailsElement).open).toBe(false);
+    // 而且没有任何东西被记成省略：调用全在组里
+    expect(screen.queryByText(/时间线省略了/)).toBeNull();
+  });
+
+  it('只有一次调用时标题就带上参数，不逼人为了看一个文件名去点开', () => {
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'a' }),
+    ];
+    render(<Transcript events={events} toolCalls={reads(['a'])} />);
+    expect(screen.getByText('读取文件 src/a.ts')).toBeTruthy();
+  });
+
+  it('不同族不合并，改文件的调用永远单独成行且默认展开', () => {
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'a' }),
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'w' }),
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'r' }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[
+          ...reads(['a']),
+          toolCall({ toolCallId: 'w', toolName: 'workspace_mutate', risk: 'R1', argsSummary: 'src/app.ts' }),
+          toolCall({ toolCallId: 'r', toolName: 'run_command', risk: 'R1', argsSummary: 'pnpm build' }),
+        ]}
+      />,
+    );
+    // 读 / 改 / 跑 三段各自独立：mutate 那一轮不并组，落回 turn 卡片
+    expect(document.querySelectorAll('details.toolgroup')).toHaveLength(2);
+    const mutate = screen.getByTitle('workspace_mutate').closest('details') as HTMLDetailsElement;
+    expect(mutate.open).toBe(true);
+  });
+
+  it('组里有失败就强制展开，失败不许藏在折叠层里', () => {
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'a' }),
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'b' }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[
+          ...reads(['a']),
+          toolCall({ toolCallId: 'b', toolName: 'fs_read', argsSummary: 'src/b.ts', resolution: 'FAILED' }),
+        ]}
+      />,
+    );
+    const group = document.querySelector('details.toolgroup') as HTMLDetailsElement;
+    expect(group.open).toBe(true);
+    expect(screen.getByText('1 失败')).toBeTruthy();
+  });
+
+  it('没有工具调用的那一轮是一条安静的行，不是一张写着「没有工具调用」的卡片', () => {
+    render(<Transcript events={[event('MODEL_INVOCATION', 'EXECUTION 调用 m')]} toolCalls={[]} />);
+    expect(screen.queryByText('没有工具调用')).toBeNull();
+    expect(document.querySelector('.turn-quiet')).toBeTruthy();
+    expect(document.querySelector('details.turn')).toBeNull();
+    // 用途说人话，raw 枚举进 title
+    expect(screen.getByText('执行').title).toBe('EXECUTION');
+  });
+});
+
+describe('活动指示（Layer 0）：非终态时说清楚在等什么', () => {
+  afterEach(() => {
+    seq = 0;
+    cleanup();
+  });
+
+  it('最后一条是模型调用 → 在等模型', () => {
+    render(
+      <Transcript events={[event('MODEL_INVOCATION', 'EXECUTION 调用 m')]} toolCalls={[]} runStatus="EXECUTING" />,
+    );
+    expect(screen.getByRole('status').textContent).toContain('模型正在思考');
+  });
+
+  it('有未 resolve 的调用 → 指名道姓说在跑哪一个', () => {
+    render(
+      <Transcript
+        events={[event('MODEL_INVOCATION', 'EXECUTION 调用 m'), event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'x' })]}
+        toolCalls={[toolCall({ toolCallId: 'x', toolName: 'run_command', argsSummary: 'pnpm build', resolution: null })]}
+        runStatus="EXECUTING"
+      />,
+    );
+    expect(screen.getByRole('status').textContent).toContain('正在运行命令：pnpm build');
+  });
+
+  it('终态不显示活动指示；等用户决定时也不显示（球在用户那边）', () => {
+    const events = [event('MODEL_INVOCATION', 'EXECUTION 调用 m')];
+    const { unmount } = render(<Transcript events={events} toolCalls={[]} runStatus="FAILED" />);
+    expect(screen.queryByRole('status')).toBeNull();
+    unmount();
+    render(<Transcript events={events} toolCalls={[]} runStatus="AWAITING_PLAN_APPROVAL" />);
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+});
+
+describe('模型正文按 Markdown 呈现（Layer 0）', () => {
+  afterEach(() => {
+    seq = 0;
+    cleanup();
+  });
+
+  it('标题/粗体/行内码/列表都成结构，标记字符不再当正文印出来', () => {
+    render(
+      <Transcript
+        events={[
+          event('NOTE', '## 我了解到的项目情况\n\n**Monorepo 结构**\n\n- `apps/web` — React 18\n- `apps/api` — NestJS'),
+        ]}
+        toolCalls={[]}
+      />,
+    );
+    expect(screen.getByText('我了解到的项目情况')).toBeTruthy();
+    expect(screen.getByText('Monorepo 结构').tagName).toBe('STRONG');
+    expect(screen.getByText('apps/web').tagName).toBe('CODE');
+    expect(document.querySelectorAll('.prose-list li')).toHaveLength(2);
+    // 标题不进标题大纲：这是聊天流里的一段话，不是文档
+    expect(document.querySelector('h1, h2, h3')).toBeNull();
+  });
+
+  it('用户自己打的字逐字原样显示，不走 Markdown 重排', () => {
+    render(<Transcript events={[event('RUN_CREATED', '任务已创建：修 **构建**')]} toolCalls={[]} />);
+    expect(screen.getByText('修 **构建**')).toBeTruthy();
+  });
+});
+
+describe('模型说的话回到模型名下（Layer 2）', () => {
+  afterEach(() => {
+    seq = 0;
+    cleanup();
+  });
+
+  it('ASSISTANT_MESSAGE 署名「AI」，NOTE 仍署名「平台」—— 归属不许混', () => {
+    render(
+      <Transcript
+        events={[
+          event('MODEL_INVOCATION', 'EXECUTION 调用 deepseek-v4-pro（in=1 out=2）'),
+          event('ASSISTANT_MESSAGE', '我读完了配置。', { purpose: 'EXECUTION', truncated: false, fullLength: 7 }),
+          event('NOTE', '未验证模式：不跑基线'),
+        ]}
+        toolCalls={[]}
+      />,
+    );
+    const ai = screen.getByText('AI').closest('.msg')!;
+    expect(ai.textContent).toContain('我读完了配置。');
+    expect(ai.className).toContain('agent');
+
+    const platform = screen.getByText('平台').closest('.msg')!;
+    expect(platform.textContent).toContain('未验证模式');
+    // 平台那条绝不能署名 AI —— 那是把平台的诚实标注记在模型头上
+    expect(platform.textContent).not.toContain('我读完了配置。');
+  });
+
+  it('归属跟着走：说话的是哪一轮、哪个模型、哪一段用途', () => {
+    render(
+      <Transcript
+        events={[
+          event('MODEL_INVOCATION', 'PLANNING 调用 deepseek-v4-pro（in=1 out=2）'),
+          event('ASSISTANT_MESSAGE', '先看一下目录结构。', { purpose: 'PLANNING', truncated: false, fullLength: 9 }),
+        ]}
+        toolCalls={[]}
+      />,
+    );
+    // 用途说人话，模型名与轮次都在
+    expect(screen.getByText('#1 · 规划 · deepseek-v4-pro')).toBeTruthy();
+  });
+
+  it('截断如实报数：说清只显示了多少、原文多长', () => {
+    render(
+      <Transcript
+        events={[
+          event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+          event('ASSISTANT_MESSAGE', '前一段', { purpose: 'EXECUTION', truncated: true, fullLength: 9000 }),
+        ]}
+        toolCalls={[]}
+      />,
+    );
+    const notice = screen.getByText(/这段话被截断了/);
+    expect(notice.textContent).toContain('只显示前 3 字');
+    expect(notice.textContent).toContain('原文共 9000 字');
+  });
+
+  it('正文提出折叠层，排在这一轮的调用之前 —— 最该读的东西不许藏起来', () => {
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('ASSISTANT_MESSAGE', '我要去读这两个文件。', { purpose: 'EXECUTION', truncated: false, fullLength: 10 }),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'a' }),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'b' }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[
+          toolCall({ toolCallId: 'a', argsSummary: 'src/a.ts' }),
+          toolCall({ toolCallId: 'b', argsSummary: 'src/b.ts' }),
+        ]}
+      />,
+    );
+    const say = screen.getByText('我要去读这两个文件。');
+    const group = document.querySelector('details.toolgroup')!;
+    // 正文在折叠层外
+    expect(group.contains(say)).toBe(false);
+    // 且排在调用组前面（说了要干什么，再干）
+    expect(say.closest('.msg')!.compareDocumentPosition(group) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText('读取文件 · 2 次')).toBeTruthy();
+  });
+
+  it('「读一批 → 说一句 → 再读一批」分成两组，不并成一坨', () => {
+    const events = [
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'a' }),
+      event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+      event('ASSISTANT_MESSAGE', '找到了，再看一处。', { purpose: 'EXECUTION', truncated: false, fullLength: 9 }),
+      event('TOOL_CALL_PROPOSED', '提议', { toolCallId: 'b' }),
+    ];
+    render(
+      <Transcript
+        events={events}
+        toolCalls={[
+          toolCall({ toolCallId: 'a', argsSummary: 'src/a.ts' }),
+          toolCall({ toolCallId: 'b', argsSummary: 'src/b.ts' }),
+        ]}
+      />,
+    );
+    const groups = document.querySelectorAll('details.toolgroup');
+    expect(groups).toHaveLength(2);
+    expect(groups[0]!.textContent).toContain('src/a.ts');
+    expect(groups[1]!.textContent).toContain('src/b.ts');
+  });
+
+  it('只说话没调工具的那一轮不再画空卡片，只留那段话', () => {
+    render(
+      <Transcript
+        events={[
+          event('MODEL_INVOCATION', 'EXECUTION 调用 m'),
+          event('ASSISTANT_MESSAGE', '## 我了解到的\n\n改完了。', { purpose: 'EXECUTION', truncated: false, fullLength: 12 }),
+        ]}
+        toolCalls={[]}
+      />,
+    );
+    expect(document.querySelector('details.turn')).toBeNull();
+    expect(document.querySelector('.turn-quiet')).toBeNull();
+    // 而且按 Markdown 呈现 —— 这正是真机上把 `##` 当正文印出来的那一段
+    expect(screen.getByText('我了解到的')).toBeTruthy();
+    expect(screen.queryByText(/^## /)).toBeNull();
+  });
+});
+
+describe('实时增量（Layer 3）：先看一眼，不是记录', () => {
+  afterEach(() => {
+    seq = 0;
+    cleanup();
+  });
+
+  it('流进来的正文按 Markdown 渲染，并与"已经写下来的"在视觉上有别', () => {
+    render(<Transcript events={[]} toolCalls={[]} runStatus="EXECUTING" liveText={'正在读 `src/a.ts`'} />);
+    const live = document.querySelector('.msg.agent.live')!;
+    expect(live).toBeTruthy();
+    expect(live.querySelector('code')!.textContent).toBe('src/a.ts');
+    // 还没说完，所以不给时间戳，也不带归属小字（那是记录才有的东西）
+    expect(live.querySelector('.say-attribution')).toBeNull();
+  });
+
+  it('只有实时增量、还没有任何事件时也要显示，不能报"还没有内容"', () => {
+    render(<Transcript events={[]} toolCalls={[]} runStatus="PLANNING" liveText="思考中的第一句" />);
+    expect(screen.queryByText(/还没有内容/)).toBeNull();
+    expect(screen.getByText('思考中的第一句')).toBeTruthy();
+  });
+
+  it('空字符串不渲染空气泡', () => {
+    render(<Transcript events={[event('RUN_CREATED', '任务已创建：修构建')]} toolCalls={[]} liveText="" />);
+    expect(document.querySelector('.msg.agent.live')).toBeNull();
   });
 });

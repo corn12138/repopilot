@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { anthropicAdapter, fetchJson, parseRetryAfterMs } from './anthropic';
+import { anthropicAdapter, fetchJson } from './anthropic';
+import { parseRetryAfterMs } from './http';
 import { openAiWireAdapter } from './openai-compatible';
 import { ModelCallError, type AdapterCallContext, type ModelRequest } from './types';
 

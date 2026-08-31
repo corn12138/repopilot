@@ -39,6 +39,7 @@ import { MACHINE_PASS_REASONS, classifyObservation } from './judge';
 import { EvalHarnessError, runObservation, type EvalObservation } from './runner';
 import { appendObservation, readObservations, resultsPath } from './results';
 import { buildAbReport, buildBlindPacket } from './report';
+import { chatCompletionResponse } from '../model/chatSse.testkit';
 
 /**
  * SPK-010 harness 端到端：真权威层（真 gateway/preflight/命令执行/落盘），
@@ -139,10 +140,7 @@ beforeEach(() => {
       const queue = queues.get(host);
       const bodyText = String(init?.body ?? '');
       if (!queue || queue.length === 0) throw new Error(`${host} 的模型脚本已耗尽：${bodyText.slice(-300)}`);
-      return new Response(JSON.stringify(queue.shift()!(bodyText)), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
+      return chatCompletionResponse(queue.shift()!(bodyText));
     }),
   );
 });

@@ -45,8 +45,14 @@ import type {
  * `ModelConnectionProfile` 增加 fallbackSource/fallbackEnvVar；
  * `RepositorySnapshot` 增加 untrackedCount；`RunView` 增加 snapshotId；
  * `retention.update` 的取值区间收紧到 Core 实际接受的范围。
+ *
+ * 0.6.0：新增事件种类 `ASSISTANT_MESSAGE`（模型自己写的话，与平台的 NOTE 分开归属）；
+ * `ToolCallView` 增加 `commandResult`（命令终局的判别联合投影，不含正文）。
+ * 两者都是加法：旧 Renderer 读不到新字段，但不会因为多出来的东西被拒 ——
+ * 事件是 append-only 且禁止回填，所以**旧 Run 的日志里没有 ASSISTANT_MESSAGE**，
+ * 它们的模型正文仍会以 NOTE 的形态显示成"平台"。这一层只对新 Run 生效。
  */
-export const PROTOCOL_VERSION = '0.5.0';
+export const PROTOCOL_VERSION = '0.6.0';
 
 export type ImportOutcome =
   | {
@@ -618,6 +624,28 @@ export type PushEvent =
   | { readonly type: 'toolcall.updated'; readonly toolCall: ToolCallView }
   | { readonly type: 'approval.updated'; readonly runId: string; readonly approvals: ApprovalRequest[] }
   | { readonly type: 'retention.swept'; readonly summary: PurgeSummaryView }
+  /**
+   * 模型正文的实时增量。**易失，不进事件流。**
+   *
+   * 存在的理由：模型调用是整个流程里最长的一段等待（几十秒），而在它返回之前
+   * Core 一条持久事件都不发 —— 界面在这段时间里一个像素都不动。
+   *
+   * 为什么不落盘：持久事实是那条 `ASSISTANT_MESSAGE` 事件。增量只是"先看一眼"，
+   * 流断了、重试了、进程没了，重新打开这个 Run 应该看到同一份记录，
+   * 而不是一堆半截文本。所以它不进 JSONL、不进状态快照、不参与证据核对。
+   *
+   *   delta —— 追加这段文本
+   *   reset —— **这一次尝试作废了**（同 route 重试或最终失败）：把已经显示的
+   *            增量全部丢掉。少了这一条，界面会把模型没说完的半句话留在那儿。
+   */
+  | {
+      readonly type: 'run.stream';
+      readonly runId: string;
+      readonly attemptId: string;
+      readonly signal:
+        | { readonly kind: 'delta'; readonly text: string }
+        | { readonly kind: 'reset'; readonly reason: string };
+    }
   | {
       readonly type: 'core.status';
       readonly status: 'READY' | 'RESTARTING' | 'DOWN';

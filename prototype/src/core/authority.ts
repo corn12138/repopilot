@@ -4,6 +4,7 @@ import type {
   ApprovalDecisionKind,
   ApprovalRequest,
   CommandDefinition,
+  CommandResult,
   DataEgressConsent,
   DataEgressDisclosure,
   CommandApproval,
@@ -66,6 +67,7 @@ import {
   type ModelInvoker,
 } from './agent';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
+import type { StreamSignal } from './model/types';
 import { DEFAULT_MUTATION_POLICY, type MutationPolicy } from './mutation';
 import { applyPatchWithGit, sealPatch } from './patch';
 import {
@@ -2535,6 +2537,8 @@ export class RunAuthority {
           preview: null,
           previewTruncated: false,
           artifactRef: null,
+          // 还没跑完，终局自然还不存在 —— null 是"没有这份事实"，不是"通过了"
+          commandResult: null,
           startedAt: nowIso(),
           resolvedAt: null,
           durationMs: null,
@@ -2555,9 +2559,17 @@ export class RunAuthority {
         preview: string,
         previewTruncated: boolean,
         artifactRef: string | null,
+        meta?: Record<string, unknown>,
       ): void => {
         const prev = record.toolCalls.get(toolCallId);
         if (!prev) return;
+        /*
+         * 命令终局的判别联合（不变式 5）。之前只有平台发起的验证命令留下
+         * CommandOutcome，模型发起的 run_command 到界面上只剩 SUCCEEDED/FAILED ——
+         * "退出码 1"、"被信号杀掉"、"超时"、"没起来"看起来一模一样。
+         * 认不出形状就当没有：宁可显示"未知"，也不能把它默认成某一种终局。
+         */
+        const commandResult = readCommandResult(meta?.outcome);
         const updated: ToolCallView = {
           ...prev,
           resolution,
@@ -2565,6 +2577,7 @@ export class RunAuthority {
           preview,
           previewTruncated,
           artifactRef,
+          commandResult,
           resolvedAt: nowIso(),
           durationMs: Date.now() - Date.parse(prev.startedAt),
         };
@@ -2573,9 +2586,27 @@ export class RunAuthority {
           toolCallId,
           resolution,
           reason,
+          ...(commandResult ? { command: commandResult } : {}),
         });
         this.persist(record);
         this.push({ type: 'toolcall.updated', toolCall: updated });
+      },
+
+      /*
+       * 模型正文的实时增量：**只推，不落盘**。
+       *
+       * 持久事实是那条 ASSISTANT_MESSAGE 事件。增量只是"先看一眼"——
+       * 流断了、重试了、进程没了，重新打开这个 Run 应该看到同一份记录，
+       * 而不是一堆半截文本。所以这里不 emit、不 persist、不动 eventHighWatermark，
+       * 证据核对（evidence.ts 按事件流比对状态快照）也就不受流的影响。
+       */
+      streamText: (signal: StreamSignal): void => {
+        this.push({
+          type: 'run.stream',
+          runId: record.view.runId,
+          attemptId: record.view.attemptId,
+          signal,
+        });
       },
 
       chargeModelTurn: (inputTokens: number | null, outputTokens: number | null) =>
@@ -3736,6 +3767,39 @@ export function platformError(
   detail: string | null = null,
 ): CoreError {
   return new CoreError({ code, message, detail });
+}
+
+const COMMAND_OUTCOME_KINDS = new Set<CommandResult['outcome']>([
+  'EXIT_ZERO',
+  'EXIT_NONZERO',
+  'SIGNAL',
+  'TIMEOUT',
+  'CANCELLED',
+  'SPAWN_ERROR',
+]);
+
+/**
+ * 把 run_command 的 `meta.outcome`（完整 CommandOutcome）投影成不含正文的
+ * CommandResult：正文已经在 preview / artifactRef 里，原样进事件 payload 会让
+ * 每条 TOOL_CALL_RESOLVED 背上完整的命令输出。
+ *
+ * `ToolOutcome.meta` 是 `Record<string, unknown>`，形状由各个工具自己决定。
+ * 这里只认得出 run_command 那一种，认不出就返回 null —— **不猜**：
+ * 把一个形状不对的对象强转成 CommandResult，等于让界面显示一个编出来的终局。
+ */
+function readCommandResult(value: unknown): CommandResult | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const outcome = v.outcome;
+  if (typeof outcome !== 'string' || !COMMAND_OUTCOME_KINDS.has(outcome as CommandResult['outcome'])) {
+    return null;
+  }
+  return {
+    outcome: outcome as CommandResult['outcome'],
+    exitCode: typeof v.exitCode === 'number' ? v.exitCode : null,
+    signal: typeof v.signal === 'string' ? v.signal : null,
+    durationMs: typeof v.durationMs === 'number' ? v.durationMs : 0,
+  };
 }
 
 /** IPC 仍是未知输入；generation 不能靠 `Number(...)` 把缺失、字符串或小数悄悄变成 owner。 */

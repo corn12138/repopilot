@@ -104,9 +104,36 @@ export class ModelCallError extends Error {
  *
  * 去哪由 Gateway 解析后通过 `ctx.baseUrl` 传入，适配器自己不决定目标地址。
  */
+/**
+ * 流式调用回传给上层的信号。
+ *
+ * 只有两种，而第二种是必需的：一次尝试作废时（同 route 重试、或调用失败），
+ * 已经显示出去的增量**必须撤回**。少了它，界面会把半截作废的文本留在那儿，
+ * 看起来像模型说过这些话 —— 那是最坏的一种谎。
+ */
+export type StreamSignal =
+  | { readonly kind: 'delta'; readonly text: string }
+  | { readonly kind: 'reset'; readonly reason: string };
+
+export type StreamListener = (signal: StreamSignal) => void;
+
 export interface ModelAdapter {
   readonly wire: 'anthropic' | 'openai';
   call(request: ModelRequest, ctx: AdapterCallContext): Promise<ModelResponse>;
+  /**
+   * 流式变体。返回的 `ModelResponse` 与 `call()` **逐字段同义** ——
+   * 流只让文本早一点到界面，不改变权威结果：工具分发、账本、封存
+   * 对"这次是不是流式"完全无知。
+   *
+   * 诚实边界：两个 wire 的 SSE 解析都有针对**文档所述帧格式**的合成流单测
+   * （含工具参数跨帧拼接、usage 收尾、中途断流的重试安全性），
+   * 但**没有对真实 provider 跑过** —— 这个环境里没有任何模型 key。
+   */
+  stream(
+    request: ModelRequest,
+    ctx: AdapterCallContext,
+    onSignal: StreamListener,
+  ): Promise<ModelResponse>;
 }
 
 export interface AdapterCallContext {

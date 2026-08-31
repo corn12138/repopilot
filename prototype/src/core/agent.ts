@@ -19,7 +19,7 @@ import type {
 import { CROSS_REVIEW_LIMITS } from '@shared/domain';
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
-import type { ContentBlock, ModelMessage, ToolSchema } from './model/types';
+import type { ContentBlock, ModelMessage, StreamSignal, ToolSchema } from './model/types';
 import { textOf, toolUsesOf } from './model/types';
 import type { MutationPolicy } from './mutation';
 import { PLANNING_TOOLS, TOOLS, TOOLS_BY_NAME, type ToolContext, type ToolDefinition } from './tools';
@@ -45,7 +45,18 @@ export interface AgentHost {
     preview: string,
     previewTruncated: boolean,
     artifactRef: string | null,
+    /**
+     * 工具自报的结构化补充（ToolOutcome.meta）。可选而非必选：
+     * 所有拒绝/取消路径都没有它，测试替身也不必一次性全改。
+     * 目前唯一的消费者是 `meta.command` —— run_command 的终局判别联合。
+     */
+    meta?: Record<string, unknown>,
   ): void;
+  /**
+   * 模型正文的实时增量。可选：老的测试替身不实现它，那就退回一次性请求 ——
+   * 有没有流不影响权威结果，只影响文本什么时候到界面。
+   */
+  streamText?(signal: StreamSignal): void;
   /** token 传 null 表示 provider 未回报 —— 账本记"未知轮次"，绝不折算成 0 */
   chargeModelTurn(inputTokens: number | null, outputTokens: number | null): void;
   chargeToolCall(): void;
@@ -199,7 +210,15 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
   let baseline: VerificationRun | null = null;
 
   if (verificationEnabled) {
-    host.setStatus('EXECUTING', '正在建立验证基线');
+    /*
+     * 基线验证是"验证"，不是"执行"。
+     *
+     * 之前这里报 EXECUTING，于是时间线上的相位读起来是「执行 → 规划 → 执行」——
+     * 用户看到的第一个相位是执行，而那时一行代码都还没改。同时 VERIFYING
+     * 在 RunStatus 里声明了却从来没有被任何生产代码设过（死状态），
+     * 相位锚点里的"验证"永远不亮。两个问题是同一个：状态没照实报。
+     */
+    host.setStatus('VERIFYING', '正在建立验证基线');
     host.emit('VERIFICATION_STARTED', `基线验证：${task.verificationCommandIds.join(', ')}`, {
       phase: 'BASELINE',
     });
@@ -231,7 +250,11 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
       };
     }
   } else {
-    host.setStatus('EXECUTING', '未选择验证命令，本次以未验证模式运行');
+    /*
+     * 未验证模式下这里**不报相位**：下一行就是 setStatus('PLANNING')，
+     * 而在它之前报一次 EXECUTING 只会在时间线上凭空多一个"执行"锚点 ——
+     * 那一刻既没在执行也没在验证，只是没有基线要建。事实由紧接着的 NOTE 交代。
+     */
     host.emit('NOTE', '未验证模式：不跑基线、不跑重验、不做自修复，补丁全部标记为未验证');
   }
 
@@ -395,6 +418,9 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
       };
     }
 
+    // 改后验证同样是"验证"相位：之前整段留在 EXECUTING 里，跑几十秒命令时
+    // 界面上的相位仍写着"执行"，看不出球已经交给验证了。
+    host.setStatus('VERIFYING', `正在验证 gen-${workspace.activeGeneration}`);
     host.emit('VERIFICATION_STARTED', `验证 gen-${workspace.activeGeneration}`, {
       phase: 'POST_MUTATION',
     });
@@ -440,6 +466,8 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
 
     round += 1;
     host.chargeSelfFixRound();
+    // 验证跑完、要回去改代码了 —— 相位得跟着回到执行，否则会一直停在"验证中"
+    host.setStatus('EXECUTING', `第 ${round}/${maxRounds} 轮自修复`);
     host.emit('SELF_FIX_ROUND', `进入第 ${round}/${maxRounds} 轮自修复`, { round });
     if (!deps.externalAuthor) {
       // 上一轮若以 BUDGET_EXHAUSTED 提前返回，末尾可能仍是 user —— 用 pushUser 合并
@@ -498,15 +526,48 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
    * **比例本身仍是开放问题（Q-026）**：没有模型 key 就做不了对照实验，
    * 所以这次只做"派生 + 如实报数"，不声称"这样更好用"。
    */
-  const maxPlanTurns = Math.max(2, Math.floor(deps.task.budget.maxModelTurns / 2));
+  const maxPlanTurns = planningTurnBudget(deps.task);
+
+  /*
+   * 规划期的探索账目。规划失败此前等于全盘作废 —— 这份账目让"这一趟看了哪儿"
+   * 在失败之后仍然读得到，用户据此判断是模型找错地方，还是任务本身太宽。
+   */
+  const calls: Array<{ name: string; summary: string; ok: boolean }> = [];
+  let spokenTurns = 0;
+  let turnsRun = 0;
 
   for (let turn = 0; turn < maxPlanTurns; turn += 1) {
     throwIfCancelled(deps.signal);
     const budget = host.budgetExceeded();
-    if (budget.exceeded) throw new PlanningFailed(`预算耗尽：${budget.reason}`);
+    if (budget.exceeded) {
+      emitPlanningDigest(host, { turns: turnsRun, calls, spokenTurns });
+      throw new PlanningFailed(`预算耗尽：${budget.reason}`);
+    }
 
-    const response = await callModel(deps, conversation, tools, 'PLANNING');
+    /*
+     * 最后一轮：把工具收窄到只剩 submit_plan，并明说这是最后一轮。
+     *
+     * 为什么必须**结构上**收窄，而不是只在提示词里请求：真实的失败样本
+     * （20 轮 / 43 次只读调用 / 一个字都没说 / 全盘作废）说明模型不会自己收口。
+     * 它一直在读，是因为平台一直允许它读，而且从没告诉过它有个头。
+     * 一份带着诚实风险声明的计划，比"探索了 20 轮然后什么都没有"有用得多 ——
+     * 计划仍然要经用户批准，不确定的部分写在 risks 里由人来判断。
+     */
+    const isFinalTurn = turn === maxPlanTurns - 1;
+    if (isFinalTurn) {
+      pushUser(conversation, [{ type: 'text', text: finalPlanTurnDirective(maxPlanTurns) }]);
+    }
+
+    const response = await callModel(
+      deps,
+      conversation,
+      isFinalTurn ? [submitPlan as unknown as ToolDefinition] : tools,
+      'PLANNING',
+    );
     const uses = toolUsesOf(response.content);
+    turnsRun += 1;
+    // 规划期模型的思考同样进时间线：之前这一段被原样吞掉，用户只看得见最后那份计划
+    if (sayIfAny(host, 'PLANNING', response.content)) spokenTurns += 1;
 
     if (uses.length === 0) {
       // 没有调用 submit_plan 就想结束 —— 明确要求它提交结构化计划
@@ -514,7 +575,9 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
       pushUser(conversation, [
         {
           type: 'text',
-          text: '请调用 submit_plan 工具提交结构化计划。纯文字回复不能进入审批流程。',
+          text:
+            '请调用 submit_plan 工具提交结构化计划。纯文字回复不能进入审批流程。' +
+            planTurnsLeftNotice(turn, maxPlanTurns),
         },
       ]);
       continue;
@@ -594,13 +657,35 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
         continue;
       }
 
-      const outcome = await dispatchTool(deps, use.name, use.input, 'PLANNING');
+      const outcome = await dispatchTool(
+        deps,
+        use.name,
+        use.input,
+        'PLANNING',
+        isFinalTurn ? FINAL_TURN_TOOLS : undefined,
+      );
+      // 只记真的派发出去的那些：被阶段闸门/风险门拒掉的没有摘要，也不代表"看过"
+      if (outcome.summary !== undefined) {
+        calls.push({ name: use.name, summary: outcome.summary, ok: outcome.ok });
+      }
       results.push({
         type: 'tool_result',
         toolUseId: use.id,
         content: outcome.text,
         isError: !outcome.ok,
       });
+    }
+
+    /*
+     * 倒计时跟着工具结果一起回去。
+     *
+     * 混合 block 的 user 消息两个 wire 都合法：OpenAI 侧 toWireMessages 把
+     * tool_result 拆成独立的 role:'tool' 再跟一条 user 文本，Anthropic 侧本来就
+     * 要求 tool_result 排在前面。findWireViolation 只管 tool_use 有没有被回填，
+     * 末尾多一条文本不影响它。
+     */
+    if (!submitted && !isFinalTurn) {
+      results.push({ type: 'text', text: planTurnsLeftNotice(turn, maxPlanTurns).trim() });
     }
 
     // 先写回历史，再决定是否返回 —— 顺序反了就是这个 bug 本身
@@ -613,15 +698,171 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
    * **其他预算根本没用完**。用户看不到这一点，就无从判断该放宽预算还是该收窄任务 ——
    * 这正是 EVI-PLANNING-CAP-001 里那三个 Run 的处境。
    */
+  /*
+   * 走到这里意味着**连最后一轮的强制收口都没提交计划** —— 那一轮模型手上只有
+   * submit_plan 这一个工具，还是没用。这与旧世界的"用满 N 轮探索"不是同一件事，
+   * 文案必须区分开，否则用户会误以为只要加预算就能过（加了也没用）。
+   */
+  emitPlanningDigest(host, { turns: turnsRun, calls, spokenTurns });
   const remaining = host.budgetExceeded();
   throw new PlanningFailed(
-    `规划阶段用满 ${maxPlanTurns} 轮仍未提交计划` +
-      `（规划子预算 = 本任务模型轮次预算 ${deps.task.budget.maxModelTurns} 轮的一半）。` +
+    `规划阶段用满 ${maxPlanTurns} 轮仍未提交计划（规划子预算 = 本任务模型轮次预算 ` +
+      `${deps.task.budget.maxModelTurns} 轮的一半）。最后一轮平台已经把工具收窄到只剩 ` +
+      `submit_plan，模型仍然没有提交 —— 所以这**不是探索时间不够**。` +
       (remaining.exceeded
         ? `此时 Run 预算也已耗尽：${remaining.reason}。`
-        : `此时 token 与工具调用预算尚未耗尽 —— 这是规划子预算到顶，不是资源不足。` +
-          `若该仓库确实需要更多探索，可提高任务的模型轮次预算；若不需要，通常说明任务描述过宽，先收窄范围。`),
+        : `此时 token 与工具调用预算尚未耗尽。加预算大概率无效；` +
+          `更可能是任务描述过宽或过于开放，先收窄成一件具体的事。`),
   );
+}
+
+/**
+ * 规划阶段的轮次子预算。
+ *
+ * 从 Run 自己的轮次预算派生一半：上限仍然存在（规划不能吃光整个 Run，
+ * 执行与自修复要留一半），但它跟随用户的选择。
+ *
+ * **一处定义，两处消费** —— 循环用它当上界，提示词用它告诉模型「你有几轮」。
+ * 分开写就会漂，而漂的后果是：平台按一个数杀，模型按另一个数规划。
+ */
+export function planningTurnBudget(task: TaskSpec): number {
+  return Math.max(2, Math.floor(task.budget.maxModelTurns / 2));
+}
+
+/**
+ * 每一轮回给模型的倒计时。
+ *
+ * 真实失败样本里模型用满 20 轮只读调用、一个字没说、全盘作废 —— 它不是不肯收口，
+ * 是**从来没被告知有个头**。提示词说的是"读到足够的证据后"，那是一条没有终点的指令：
+ * 模型按自己的"足够"探索，平台按 20 轮杀，两边用的不是同一把尺。
+ */
+function planTurnsLeftNotice(turn: number, maxPlanTurns: number): string {
+  const left = maxPlanTurns - turn - 1;
+  if (left <= 0) return '';
+  return (
+    `\n\n（规划还剩 ${left} 轮。用不完不必用完 —— 证据够了就提交；` +
+    `最后一轮平台只会留下 submit_plan，那时读不了文件了。）`
+  );
+}
+
+/**
+ * 最后一轮的收口指令。与"把工具收窄到只剩 submit_plan"配套：
+ * 结构上做不到再读，语义上也说清为什么，并且给出**怎么处理没查完的部分**——
+ * 否则模型会为了凑一份"完整"的计划去编它没验证过的东西。
+ */
+function finalPlanTurnDirective(maxPlanTurns: number): string {
+  return (
+    `这是**最后一轮规划**（共 ${maxPlanTurns} 轮）。平台已经把工具收窄为只有 submit_plan，` +
+    `现在读不了文件了。\n` +
+    `请用已经掌握的信息提交计划：已经确认的写进 steps；还没来得及核实的写进 risks，` +
+    `逐条写明"我没有验证过什么"。\n` +
+    `不要为了让计划看起来完整而编造你没读到的内容 —— ` +
+    `一份带着诚实风险声明的计划仍然要由用户批准，而一份编出来的计划会让人批准错的东西。`
+  );
+}
+
+/**
+ * 规划触顶/预算耗尽时，把**已经发生的事实**汇总成一份账目。
+ *
+ * 为什么需要：规划失败此前等于全盘作废 —— 用户看到的只有一行红字，而那 43 次
+ * 调用读到的东西全在折叠区里，要一条条展开才知道模型看过哪儿。这一条不解决
+ * "为什么失败"（那是上面那条 PlanningFailed 的事），它回答另一个问题：
+ * **这一趟到底看了哪儿** —— 用户据此才判断得出"它找错地方了"还是"这仓库确实太大"。
+ *
+ * 三条纪律：
+ *   1. **只汇总，不推断。** 这里一个字都不是模型的结论，全是平台记下的事实。
+ *      也刻意不再调一次模型去写总结：一个刚刚拒绝收口的模型，不是可信的总结者，
+ *      而且那要在一个已经失败的 Run 上再花一次钱。
+ *   2. **省略要报数**（不变式 8）：路径去重、列举截断，都如实写出数量。
+ *   3. 走 NOTE 而不是新事件种类 —— 这是平台的如实标注，与 ASSISTANT_MESSAGE
+ *      分属两个说话人，不能混。
+ */
+const DIGEST_LIST_MAX = 12;
+
+/** 规划最后一轮平台唯一放行的工具 —— 由 dispatchTool 强制，不只是少给几个 schema */
+const FINAL_TURN_TOOLS: ReadonlySet<string> = new Set(['submit_plan']);
+
+interface PlanningTrace {
+  /** 已经跑完的规划轮数 */
+  readonly turns: number;
+  /**
+   * 派发出去的只读调用：工具名 + 参数摘要（摘要由工具自己算，不含宿主绝对路径）+ 成败。
+   *
+   * 失败的也要留：模型反复去读一个不存在的路径，本身就是"它找错地方了"的直接证据。
+   * 但**不能混进"读过的文件"里当成读到了** —— 那是把一次落空说成一次探索。
+   */
+  readonly calls: ReadonlyArray<{ name: string; summary: string; ok: boolean }>;
+  /** 其中有多少轮模型真的说了话 */
+  readonly spokenTurns: number;
+}
+
+function renderNameList(items: readonly string[]): string {
+  const shown = items.slice(0, DIGEST_LIST_MAX);
+  const rest = items.length - shown.length;
+  // 截断要报数：省略的条数说出来，而不是让列表看起来就是全部
+  return shown.join('、') + (rest > 0 ? `（另有 ${rest} 个未列出，完整记录在上方调用里）` : '');
+}
+
+function emitPlanningDigest(host: AgentHost, trace: PlanningTrace): void {
+  const lines: string[] = [
+    '规划没有收口。下面是这一趟**已经发生的事实**（平台汇总，不是模型的结论）：',
+    '',
+  ];
+
+  if (trace.calls.length === 0) {
+    lines.push(`- ${trace.turns} 轮规划，**一次工具都没调用过**`);
+  } else {
+    // 按工具分类只报数量，具体目标进下面那条列表 —— 摘要本身已经自带动词
+    const counts = new Map<string, number>();
+    for (const c of trace.calls) counts.set(c.name, (counts.get(c.name) ?? 0) + 1);
+    const shape = [...counts.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, n]) => `${toolLabel(name)} ×${n}`)
+      .join('、');
+    lines.push(`- ${trace.turns} 轮规划，${trace.calls.length} 次只读调用：${shape}`);
+
+    const unique = [...new Set(trace.calls.map((c) => c.summary))];
+    const failed = trace.calls.filter((c) => !c.ok).length;
+    lines.push(
+      `- 去重后 ${unique.length} 个目标` +
+        (failed > 0 ? `（其中 ${failed} 次调用失败，没有读到内容）` : '') +
+        `：${renderNameList(unique)}`,
+    );
+  }
+
+  /*
+   * "一个字都没说"是这份账目里信号最强的一条：模型在读，但没有边读边收敛。
+   * 真实样本里 20 轮全程无输出，正是这个形态。它不是修辞，是可核对的计数。
+   */
+  lines.push(
+    trace.spokenTurns === 0
+      ? '- 模型**全程没有输出任何文字** —— 它一直在读，但没有边读边总结'
+      : `- 模型在 ${trace.spokenTurns}/${trace.turns} 轮里说过话（正文在上方时间线里）`,
+  );
+
+  host.emit('NOTE', lines.join('\n'), {
+    planningDigest: {
+      turns: trace.turns,
+      toolCalls: trace.calls.length,
+      spokenTurns: trace.spokenTurns,
+    },
+  });
+}
+
+/** 工具名的中文说法。与 Renderer 那份词典同源同义，但 Core 不依赖 Renderer。 */
+function toolLabel(name: string): string {
+  switch (name) {
+    case 'fs_read':
+      return '读文件';
+    case 'fs_grep':
+      return '搜内容';
+    case 'fs_glob':
+      return '匹配路径';
+    case 'fs_list':
+      return '列目录';
+    default:
+      return name;
+  }
 }
 
 export class PlanningFailed extends Error {}
@@ -767,6 +1008,8 @@ export async function runReviewPass(
       system,
     );
     const uses = toolUsesOf(response.content);
+    // 审核方说的话也归审核方：它是"第二意见"的正文，不该只剩一份结构化 findings
+    sayIfAny(host, 'CROSS_REVIEW', response.content);
 
     if (uses.length === 0) {
       // 只回了文本没提交结论 —— 要求它用 submit_review
@@ -1262,6 +1505,36 @@ function mapReviewFailure(err: unknown, host: AgentHost, signal: AbortSignal): C
  */
 type ExecutionEnd = { kind: 'MODEL_ENDED_TURN' } | { kind: 'BUDGET_EXHAUSTED'; reason: string };
 
+/**
+ * 模型正文的长度上限。
+ *
+ * 上一版是 400 字**且不报数** —— 真机上一段项目分析正好在第 400 个字符处被切断，
+ * 界面显示到半句话就没了，用户无从知道后面还有内容。这既违反"省略要报数"，
+ * 又让最该读的那段话变得读不完。
+ *
+ * 4000 字能装下模型的一段完整结论（实测一般 200–2000 字），同时给事件日志一个上界：
+ * 20 轮 × 4000 字 ≈ 80KB，不至于让 JSONL 失控。超出的部分如实报长度。
+ */
+const ASSISTANT_MESSAGE_MAX_CHARS = 4000;
+
+/**
+ * 把模型这一轮说的话记进事件流。
+ *
+ * 空文本不发事件：模型经常只调工具不说话，为它凭空造一条空消息只会让时间线更吵。
+ * 截断必须报数（不变式 8）—— payload 带 truncated 与原始长度，界面据此明说"还有多少"。
+ */
+function sayIfAny(host: AgentHost, purpose: string, content: readonly ContentBlock[]): boolean {
+  const said = textOf(content).trim();
+  if (!said) return false;
+  const truncated = said.length > ASSISTANT_MESSAGE_MAX_CHARS;
+  host.emit('ASSISTANT_MESSAGE', truncated ? said.slice(0, ASSISTANT_MESSAGE_MAX_CHARS) : said, {
+    purpose,
+    truncated,
+    fullLength: said.length,
+  });
+  return true;
+}
+
 async function executionTurns(
   deps: AgentDeps,
   conversation: ModelMessage[],
@@ -1281,11 +1554,16 @@ async function executionTurns(
     const uses = toolUsesOf(response.content);
     conversation.push({ role: 'assistant', content: response.content });
 
-    if (uses.length === 0) {
-      const said = textOf(response.content);
-      if (said) host.emit('NOTE', said.slice(0, 400));
-      return { kind: 'MODEL_ENDED_TURN' };
-    }
+    /*
+     * 每一轮都把模型说的话记下来 —— 不只是它停手的那一轮。
+     *
+     * 之前这一句在 `uses.length === 0` 分支里面，意思是：**有工具调用的那些轮，
+     * 模型写的东西整段丢弃**。那正是"每组工具调用之间那句有结论的话"消失的地方，
+     * 而它恰好是整条时间线里信息密度最高的东西。
+     */
+    sayIfAny(host, 'EXECUTION', response.content);
+
+    if (uses.length === 0) return { kind: 'MODEL_ENDED_TURN' };
 
     const results: ContentBlock[] = [];
     try {
@@ -1327,7 +1605,18 @@ async function dispatchTool(
   toolName: string,
   rawInput: unknown,
   phase: Phase,
-): Promise<{ ok: boolean; text: string }> {
+  /**
+   * 本轮**只允许**这些工具（不传 = 不额外收窄）。
+   *
+   * 为什么要在这一层而不是只把 schema 列表收窄：`dispatchTool` 查的是全局
+   * `TOOLS_BY_NAME`，模型只要凭记忆点名一个没给它的工具就会真的执行 ——
+   * 规划期只读闸门当年就是栽在这上面。少给几个 schema 只是"模型看不见"，
+   * 不是"平台不让"。规划最后一轮的强制收口必须是后者，否则一个不听话的模型
+   * 照样能接着读到超时。
+   */
+  allowOnly?: ReadonlySet<string>,
+  /** 真的派发出去时回报参数摘要 —— 摘要由工具自己算（不含宿主绝对路径），调用方不该自己拼 */
+): Promise<{ ok: boolean; text: string; summary?: string }> {
   const { host } = deps;
   const def = TOOLS_BY_NAME.get(toolName);
 
@@ -1374,6 +1663,23 @@ async function dispatchTool(
    * TOOLS_BY_NAME —— 模型只要凭记忆点名 workspace_mutate，之前就会真的执行。
    * PRD-PLAN-001 要求的是 capability envelope 强制，不是 prompt 自律。
    */
+  if (allowOnly && !allowOnly.has(def.name)) {
+    host.endToolCall(
+      toolCallId,
+      'DENIED',
+      'TURN_TOOL_RESTRICTED',
+      `本轮平台只允许 ${[...allowOnly].join(' / ')}`,
+      false,
+      null,
+    );
+    return {
+      ok: false,
+      text:
+        `工具 ${toolName} 在这一轮不可用 —— 平台只留下了 ${[...allowOnly].join(' / ')}。` +
+        `这是最后一轮规划，请用已经掌握的信息调用 submit_plan，没核实的写进 risks。`,
+    };
+  }
+
   if ((phase === 'PLANNING' || phase === 'REVIEW') && def.risk !== 'R0') {
     const label = phase === 'PLANNING' ? '规划阶段' : '交叉审核阶段';
     host.endToolCall(
@@ -1426,11 +1732,12 @@ async function dispatchTool(
       outcome.preview,
       outcome.previewTruncated,
       outcome.artifactRef,
+      outcome.meta,
     );
     if (def.name === 'workspace_mutate' && outcome.ok) {
       host.emit('MUTATION_APPLIED', outcome.preview, outcome.meta ?? {});
     }
-    return { ok: outcome.ok, text: outcome.modelText };
+    return { ok: outcome.ok, text: outcome.modelText, summary: def.summarize(args) };
   } catch (err) {
     if (err instanceof AgentCancelled || deps.signal.aborted) {
       host.endToolCall(toolCallId, 'CANCELLED', 'RUN_CANCELLED', '', false, null);
@@ -1476,6 +1783,11 @@ async function callModel(
       },
       contextFileRefs: [],
       signal: deps.signal,
+      /*
+       * 有人接增量才走流式。host 不实现 streamText（老的测试替身、headless 场景）
+       * 就退回一次性请求 —— 有没有流不影响权威结果，只影响文本什么时候到界面。
+       */
+      ...(deps.host.streamText ? { onStream: (sig: StreamSignal) => deps.host.streamText!(sig) } : {}),
     });
 
     // null 原样传递：?? 0 会把"provider 没回报"伪装成"零消耗"，账本层负责区分
@@ -1533,11 +1845,30 @@ ${task.acceptance.map((a) => `  - ${a}`).join('\n') || '  （无）'}
 - 你不能声称"修好了"，成功由 run_command 的真实退出码决定。`;
 
   if (purpose === 'PLANNING') {
+    const planTurns = planningTurnBudget(task);
+    /*
+     * 有验证命令 = 基线真的失败过（全绿会在规划之前就以 NO_CHANGES 收尾），
+     * 那时"找根因"才成立。没有验证命令时**根本没有失败可以复现** ——
+     * 再让模型去"把失败原因搞清楚"，它就会一直读下去找一个不存在的东西。
+     * 真实样本里那次 20 轮只读、一个字没说的规划，任务是"你能找出部分优化的点吗"。
+     */
+    const objective =
+      task.verificationCommandIds.length > 0
+        ? `先用 fs_read / fs_grep / fs_glob / fs_list 把失败原因搞清楚，读到足够的证据后，调用 submit_plan 提交计划。
+计划要说清根因，而不只是"修复报错"。`
+        : `本次任务**没有配置验证命令，也没有失败可以复现** —— 不要去找"根因"。
+先用 fs_read / fs_grep / fs_glob / fs_list 把相关代码看清楚，然后调用 submit_plan 提交一份具体的改动计划：
+改哪些文件、改成什么、为什么。看不准的地方写进 risks，不要用"进一步排查"占位。`;
+
     return `${common}
 
 当前阶段：**规划**。平台已经把你限制为只读工具，你现在**无法**修改任何文件。
-先用 fs_read / fs_grep / fs_glob / fs_list 把失败原因搞清楚，读到足够的证据后，调用 submit_plan 提交计划。
-计划要说清根因，而不只是"修复报错"。`;
+
+规划的轮次预算是 **${planTurns} 轮**（本任务模型轮次预算 ${task.budget.maxModelTurns} 轮的一半）。
+每一轮的工具结果后面会告诉你还剩几轮；**最后一轮平台只会留下 submit_plan**，那时读不了文件了。
+所以要边读边收敛：不要打算把仓库读完再动笔，够用就提交，没查清的写进 risks。
+
+${objective}`;
   }
 
   return `${common}

@@ -36,6 +36,7 @@ vi.mock('./paths', async () => {
 import type { ApprovalRequest, CommandApproval, RunEvent, RunView } from '@shared/domain';
 import type { PushEvent } from '@shared/protocol';
 import { RunAuthority } from './authority';
+import { chatCompletionResponse } from './model/chatSse.testkit';
 
 /**
  * 一次性精确命令批准的权威层端到端（Slice K）。
@@ -103,10 +104,7 @@ class Harness {
         const host = new URL(String(url)).host;
         const queue = this.queues.get(host);
         if (!queue || queue.length === 0) throw new Error(`${host} 的模型脚本已耗尽`);
-        return new Response(JSON.stringify(queue.shift()!(String(init?.body ?? ''))), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        });
+        return chatCompletionResponse(queue.shift()!(String(init?.body ?? '')));
       }),
     );
   }

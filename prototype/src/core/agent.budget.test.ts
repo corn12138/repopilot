@@ -169,7 +169,8 @@ interface RecordedToolCall {
 }
 
 class TestHost implements AgentHost {
-  readonly events: Array<{ kind: RunEventKind; summary: string }> = [];
+  /** payload 也要留：有些事实（截断报数、purpose 归属）只在 payload 里 */
+  readonly events: Array<{ kind: RunEventKind; summary: string; payload: Record<string, unknown> }> = [];
   readonly statuses: Array<{ status: RunStatus; reason: string | null }> = [];
   readonly toolCalls: RecordedToolCall[] = [];
   readonly ledger = { modelTurns: 0, toolCalls: 0, selfFixRounds: 0 };
@@ -178,8 +179,8 @@ class TestHost implements AgentHost {
   /** 模型轮次达到这个数就判定预算耗尽（模拟 authority 里的 ledger >= limit 语义） */
   budgetAfterModelTurns = Number.POSITIVE_INFINITY;
 
-  emit(kind: RunEventKind, summary: string): void {
-    this.events.push({ kind, summary });
+  emit(kind: RunEventKind, summary: string, payload: Record<string, unknown> = {}): void {
+    this.events.push({ kind, summary, payload });
   }
 
   setStatus(status: RunStatus, reason: string | null): void {
@@ -245,6 +246,8 @@ interface RecordedInvocation {
   purpose: string;
   system: string;
   messages: readonly ModelMessage[];
+  /** 这一轮模型手上有哪些工具 —— 规划最后一轮的强制收窄就靠它可断言 */
+  tools: readonly { name: string }[];
 }
 
 /** 按"第几次被调用"回应的确定性模型替身；同时留存请求内容供断言。 */
@@ -270,6 +273,7 @@ class ScriptedModel implements ModelInvoker {
       purpose: input.purpose,
       system: input.request.system,
       messages: [...input.request.messages],
+      tools: input.request.tools.map((t) => ({ name: t.name })),
     });
     // 先快照再校验：抛在快照前的话，出问题的那一次调用反而查不到。
     // 真实 provider 会对孤儿 tool_use 返回 400，测试替身不会 —— 所以这里
@@ -851,17 +855,22 @@ describe('规划阶段不会无限重试', () => {
     expect(gateway.callCount).toBeLessThan(50); // 守卫仍在：吃不掉整个预算
   });
 
-  it('规划触顶的文案如实报数：点明其他预算尚未耗尽，并给出下一步', async () => {
+  it('规划触顶的文案如实报数，并指出"加预算没用"（最后一轮已经强制收窄过）', async () => {
     /*
      * 不变式 8「省略要报数」的应用：旧文案只说"用满 12 轮"，把最关键的事实藏了 ——
-     * **其他预算根本没用完**。用户因此无法判断该放宽预算还是该收窄任务描述。
+     * **其他预算根本没用完**。
+     *
+     * 而现在最后一轮平台已经把工具收窄到只剩 submit_plan，模型手上没有别的选择还是
+     * 没提交 —— 那就不是探索时间不够。此时如果文案仍然建议"提高轮次预算"，
+     * 就是把用户往一个已经被证伪的方向推。
      */
     const gateway = new ScriptedModel(() => endTurn('再想想。'));
     const task = makeTask({ budget: { ...makeTask().budget, maxModelTurns: 6 } });
 
     await expect(run(gateway, task)).rejects.toThrow(/尚未耗尽/);
     await expect(run(gateway, task)).rejects.toThrow(/轮次预算 6 轮的一半/);
-    await expect(run(gateway, task)).rejects.toThrow(/提高任务的模型轮次预算|收窄范围/);
+    await expect(run(gateway, task)).rejects.toThrow(/最后一轮.*只剩 submit_plan/);
+    await expect(run(gateway, task)).rejects.toThrow(/加预算大概率无效/);
   });
 
   it('submit_plan 参数不合法：把校验错误回灌给模型，允许改正而不是直接失败', async () => {
@@ -1063,5 +1072,448 @@ describe('dispatchTool 的拒绝路径', () => {
 
     expect(host.toolCalls[0]!.resolution).toBe('DENIED');
     expect(ranCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 相位如实上报
+// ---------------------------------------------------------------------------
+
+describe('相位如实上报：验证阶段就报 VERIFYING', () => {
+  /**
+   * 背景：VERIFYING 在 RunStatus 里声明了，却**从来没有被任何生产代码设过** ——
+   * 一个死状态。同时基线验证报的是 EXECUTING，于是时间线上的相位读起来是
+   * 「执行 → 规划 → 执行」：用户看到的第一个相位是执行，而那时一行代码都没改。
+   *
+   * 这两件事是同一个问题：状态没照实报。相位是用户判断"现在轮到谁"的唯一依据，
+   * 报错了比不报更糟。
+   */
+  const flow = () => host.statuses.map((s) => s.status);
+
+  it('基线验证期间报 VERIFYING，不是 EXECUTING', async () => {
+    host.planDecision = 'REJECT';
+    const gateway = new ScriptedModel(() => toolUse('submit_plan', VALID_PLAN));
+
+    await run(gateway, makeTask({ verificationCommandIds: ['red'] }));
+
+    // 第一个相位必须是验证 —— 那时确实在跑命令，而不是在改代码
+    expect(flow()[0]).toBe('VERIFYING');
+    expect(host.statuses[0]!.reason).toContain('基线');
+    // 规划在验证之后，而不是夹在两个"执行"中间
+    expect(flow().slice(0, 3)).toEqual(['VERIFYING', 'PLANNING', 'AWAITING_PLAN_APPROVAL']);
+  });
+
+  it('基线全绿提前收尾时也只报过 VERIFYING —— 没执行过就不许说执行过', async () => {
+    const gateway = new ScriptedModel(() => {
+      throw new Error('基线全绿时不应该调用模型');
+    });
+    await run(gateway, makeTask({ verificationCommandIds: ['green'] }));
+    expect(flow()).toEqual(['VERIFYING']);
+  });
+
+  it('改后验证同样报 VERIFYING，自修复回到 EXECUTING', async () => {
+    /*
+     * red 永远非零：第一轮改后验证失败 → 进第 1 轮自修复 → 再验一次 → 用尽轮次。
+     * 相位应当来回摆：执行 → 验证 → 执行 → 验证，而不是整段停在"执行"。
+     */
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) =>
+      n === 1 ? toolUse('submit_plan', VALID_PLAN) : endTurn('改完了'),
+    );
+
+    const result = await run(
+      gateway,
+      makeTask({ verificationCommandIds: ['red'], budget: { ...makeTask().budget, maxSelfFixRounds: 1 } }),
+    );
+
+    expect(result.kind).toBe('VERIFICATION_FAILED');
+    expect(flow()).toEqual([
+      'VERIFYING', // 基线
+      'PLANNING',
+      'AWAITING_PLAN_APPROVAL',
+      'EXECUTING',
+      'VERIFYING', // 改后验证
+      'EXECUTING', // 第 1 轮自修复
+      'VERIFYING', // 再验一次
+    ]);
+  });
+
+  it('未验证模式不报凭空的 EXECUTING：第一个相位就是规划', async () => {
+    /*
+     * 这里既没在执行也没在验证，只是没有基线要建。之前会先报一次 EXECUTING，
+     * 在时间线上凭空多一个"执行"锚点 —— 事实由紧接着的 NOTE 交代就够了。
+     */
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) =>
+      n === 1 ? toolUse('submit_plan', VALID_PLAN) : endTurn('改完了'),
+    );
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    expect(flow()[0]).toBe('PLANNING');
+    expect(flow()).not.toContain('VERIFYING');
+    expect(host.events.some((e) => e.kind === 'NOTE' && e.summary.includes('未验证模式'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 模型说的话
+// ---------------------------------------------------------------------------
+
+describe('ASSISTANT_MESSAGE：模型说的话每一轮都记，且归属给模型', () => {
+  /**
+   * 之前只有模型**停止调用工具**的那一轮才取一次正文，截到 400 字、无披露，
+   * 而且以 NOTE 发出去（时间线上署名"平台"）。后果有三层：
+   *   1. 有工具调用的那些轮，模型写的东西整段丢弃 —— 参照物界面里"每组调用之间
+   *      那句有结论的话"在这套数据里根本不存在；
+   *   2. 唯一留下的那段被记在平台名下，界面上从来没出现过"AI"这个说话人；
+   *   3. 截断不报数，正好在第 400 个字符处切在半句话上。
+   */
+  const says = () => host.events.filter((e) => e.kind === 'ASSISTANT_MESSAGE');
+
+  /** 一轮里既说话又点名工具 —— 真实模型的常态，也正是此前被整段丢弃的那种 */
+  function sayAndUse(text: string, name: string, input: unknown): ModelResponse {
+    return {
+      content: [
+        { type: 'text', text },
+        { type: 'tool_use', id: `tu_${name}_${Math.random().toString(36).slice(2, 8)}`, name, input },
+      ],
+      stopReason: 'TOOL_USE',
+      inputTokens: 10,
+      outputTokens: 5,
+    };
+  }
+
+  it('有工具调用的那一轮也记 —— 这是此前整段丢弃的那一半', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) => {
+      if (n === 1) return toolUse('submit_plan', VALID_PLAN);
+      if (n === 2) return sayAndUse('我先看一眼 src/a.ts。', 'fs_read', { path: 'src/a.ts' });
+      return endTurn('改完了：把返回值解构成 amount。');
+    });
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    expect(says().map((e) => e.summary)).toEqual([
+      '我先看一眼 src/a.ts。',
+      '改完了：把返回值解构成 amount。',
+    ]);
+    // 不再借 NOTE 的名义发模型正文
+    expect(host.events.some((e) => e.kind === 'NOTE' && e.summary.includes('改完了'))).toBe(false);
+  });
+
+  it('规划期的思考同样进时间线，不再被原样吞掉', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) => {
+      if (n === 1) return sayAndUse('先读一下再定计划。', 'fs_read', { path: 'src/a.ts' });
+      if (n === 2) return toolUse('submit_plan', VALID_PLAN);
+      return endTurn('完成');
+    });
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    const planning = says().filter((e) => e.payload.purpose === 'PLANNING');
+    expect(planning.map((e) => e.summary)).toEqual(['先读一下再定计划。']);
+  });
+
+  it('只调工具不说话的那一轮不造空消息', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) => {
+      if (n === 1) return toolUse('submit_plan', VALID_PLAN);
+      if (n === 2) return toolUse('fs_read', { path: 'src/a.ts' });
+      return endTurn('好了');
+    });
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+    expect(says().map((e) => e.summary)).toEqual(['好了']);
+  });
+
+  it('超长正文截断，但如实报出原始长度 —— 不再是切在 400 字处一声不吭', async () => {
+    workspace.changed = ['src/a.ts'];
+    const long = '啊'.repeat(5000);
+    const gateway = new ScriptedModel((n) =>
+      n === 1 ? toolUse('submit_plan', VALID_PLAN) : endTurn(long),
+    );
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    const [said] = says();
+    expect(said).toBeTruthy();
+    expect(said!.payload.truncated).toBe(true);
+    expect(said!.payload.fullLength).toBe(5000);
+    expect(said!.summary).toHaveLength(4000);
+  });
+
+  it('没超长就不谎报截断', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) =>
+      n === 1 ? toolUse('submit_plan', VALID_PLAN) : endTurn('短短一句。'),
+    );
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    const [said] = says();
+    expect(said!.payload.truncated).toBe(false);
+    expect(said!.payload.fullLength).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 规划收口
+// ---------------------------------------------------------------------------
+
+describe('规划必须收口：告诉模型有几轮，最后一轮结构上强制提交', () => {
+  /**
+   * 真实失败样本（用户 2026-08-31 实机）：任务「你能找出部分优化的点吗」，
+   * 规划阶段跑满 20 轮、43 次只读调用、模型一个字都没说，然后 PLANNING → FAILED，
+   * 整个 Run 作废。
+   *
+   * 根因不是"20 太小"（这个数刚从写死的 12 改成预算的一半，放宽过了还是撞墙）。
+   * 根因是两条：
+   *   1. **模型不知道有预算**。提示词说的是"读到足够的证据后"—— 一条没有终点的指令。
+   *      模型按自己的"足够"探索，平台按 20 轮杀，两边不是同一把尺。
+   *   2. **没有任何强制点**。第 20 轮和第 1 轮给模型看到的东西一模一样，
+   *      它永远不会知道自己站在悬崖边。
+   *
+   * 所以修的是这两条，不是那个数字。
+   */
+  function planTurnsOf(maxModelTurns: number): number {
+    return Math.max(2, Math.floor(maxModelTurns / 2));
+  }
+
+  it('系统提示词说出轮次预算，并预告最后一轮会被收窄', async () => {
+    const gateway = new ScriptedModel(() => toolUse('submit_plan', VALID_PLAN));
+    host.planDecision = 'REJECT';
+
+    await run(gateway, makeTask({ budget: { ...makeTask().budget, maxModelTurns: 12 } }));
+
+    const system = gateway.calls[0]!.system;
+    expect(system).toContain('规划的轮次预算是 **6 轮**');
+    expect(system).toContain('最后一轮平台只会留下 submit_plan');
+  });
+
+  it('每一轮的工具结果后面挂倒计时 —— 模型据此自己收敛', async () => {
+    host.planDecision = 'REJECT';
+    const gateway = new ScriptedModel((n) =>
+      n === 1 ? toolUse('fs_read', { path: 'src/a.ts' }) : toolUse('submit_plan', VALID_PLAN),
+    );
+
+    await run(gateway, makeTask({ budget: { ...makeTask().budget, maxModelTurns: 8 } }));
+
+    // 第 2 次调用看到的最后一条消息里带着"还剩 N 轮"
+    expect(gateway.lastMessageText(2)).toContain('规划还剩 3 轮');
+  });
+
+  it('最后一轮：工具被收窄到只剩 submit_plan，且明说这是最后一轮', async () => {
+    /*
+     * 这是整条修复的关键。模型即使一直想读，最后一轮也**读不到** ——
+     * 不是靠提示词请求它收手，是结构上没有别的工具可用。
+     */
+    host.planDecision = 'REJECT';
+    const maxModelTurns = 6; // → 3 轮规划
+    const gateway = new ScriptedModel((n) =>
+      n < planTurnsOf(maxModelTurns)
+        ? toolUse('fs_read', { path: 'src/a.ts' })
+        : toolUse('submit_plan', VALID_PLAN),
+    );
+
+    await run(gateway, makeTask({ budget: { ...makeTask().budget, maxModelTurns } }));
+
+    const planningCalls = gateway.calls.filter((c) => c.purpose === 'PLANNING');
+    expect(planningCalls).toHaveLength(3);
+    // 前两轮工具齐全，最后一轮只剩 submit_plan
+    expect(planningCalls[0]!.tools.map((t) => t.name)).toContain('fs_read');
+    expect(planningCalls[2]!.tools.map((t) => t.name)).toEqual(['submit_plan']);
+    expect(gateway.lastMessageText(3)).toContain('最后一轮');
+    // 并且告诉它没查完的怎么办 —— 否则它会为了凑完整而编
+    expect(gateway.lastMessageText(3)).toContain('risks');
+  });
+
+  it('一直只读的模型现在能出计划了 —— 同一个剧本，旧逻辑下是全盘作废', async () => {
+    /*
+     * 剧本刻意复刻真实样本：模型只会读，从不主动提交。
+     * 旧逻辑：用满全部轮次 → PlanningFailed → Run FAILED，探索全丢。
+     * 新逻辑：最后一轮它手上只有 submit_plan，于是交出一份计划交给人判断。
+     */
+    host.planDecision = 'APPROVE';
+    workspace.changed = ['src/a.ts'];
+    let readCount = 0;
+    const gateway = new ScriptedModel((_n, input) => {
+      if (input.purpose !== 'PLANNING') return endTurn('改完了');
+      // 只有 submit_plan 可用时才提交 —— 模拟"给什么用什么"的模型
+      const only = input.request.tools.length === 1 && input.request.tools[0]!.name === 'submit_plan';
+      if (only) return toolUse('submit_plan', VALID_PLAN);
+      readCount += 1;
+      return toolUse('fs_read', { path: 'src/a.ts' });
+    });
+
+    const result = await run(gateway, makeTask({ verificationCommandIds: [], budget: { ...makeTask().budget, maxModelTurns: 8 } }));
+
+    expect(result.kind).toBe('PATCH_READY');
+    expect(readCount).toBe(3); // 4 轮规划里前 3 轮在读，第 4 轮被强制收口
+    expect(host.planApprovals).toBe(1);
+  });
+
+  it('没有验证命令时不让模型去找"根因" —— 那是一个不存在的东西', async () => {
+    /*
+     * 真实样本的任务是「你能找出部分优化的点吗」：未验证模式、没有失败、没有根因。
+     * 而提示词写的是"把失败原因搞清楚""计划要说清根因"。
+     * 模型被要求去找一个不存在的失败原因，于是它一直读下去。
+     */
+    host.planDecision = 'REJECT';
+    const gateway = new ScriptedModel(() => toolUse('submit_plan', VALID_PLAN));
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+    const system = gateway.calls[0]!.system;
+    expect(system).toContain('没有失败可以复现');
+    expect(system).not.toContain('把失败原因搞清楚');
+
+    // 对照：有验证命令时仍然要求说清根因
+    host.statuses.length = 0;
+    const g2 = new ScriptedModel(() => toolUse('submit_plan', VALID_PLAN));
+    await run(g2, makeTask({ verificationCommandIds: ['red'] }));
+    expect(g2.calls[0]!.system).toContain('把失败原因搞清楚');
+  });
+});
+
+describe('规划触顶时封存探索账目：失败不等于这一趟白跑', () => {
+  /**
+   * 规划失败此前等于全盘作废：用户看到的只有一行红字，那几十次调用读到的东西
+   * 全在折叠区里，要一条条展开才知道模型看过哪儿。
+   *
+   * 这份账目不回答"为什么失败"（那是 PlanningFailed 那条的事），它回答
+   * **这一趟到底看了哪儿** —— 用户据此判断是模型找错了地方，还是任务本身太宽。
+   *
+   * 它是**平台汇总的事实**，一个字都不是模型的结论；也刻意不再调一次模型去写总结：
+   * 一个刚拒绝收口的模型不是可信的总结者，而且那要在已经失败的 Run 上再花一次钱。
+   */
+  const digest = () =>
+    host.events.find((e) => e.kind === 'NOTE' && e.summary.startsWith('规划没有收口'));
+
+  /** 只读、从不提交的模型 —— 复刻真实样本 */
+  const alwaysReads = (paths: string[]) =>
+    new ScriptedModel((n) => toolUse('fs_read', { path: paths[(n - 1) % paths.length]! }));
+
+  it('触顶时发出账目：轮数、调用数、读过哪些文件都如实报出', async () => {
+    const gateway = alwaysReads(['src/a.ts', 'src/b.ts']);
+    await expect(
+      run(gateway, makeTask({ budget: { ...makeTask().budget, maxModelTurns: 6 } })),
+    ).rejects.toThrow(/规划阶段用满/);
+
+    const note = digest();
+    expect(note).toBeTruthy();
+    expect(note!.summary).toContain('3 轮规划');
+    expect(note!.summary).toContain('读文件 ×2');
+    expect(note!.summary).toContain('读取 src/a.ts');
+    expect(note!.summary).toContain('读取 src/b.ts');
+    // 结构化副本供将来的界面消费，正文供人读
+    expect(note!.payload.planningDigest).toMatchObject({ turns: 3, spokenTurns: 0 });
+  });
+
+  it('同一个文件读了多次 → 去重并报出重复次数（省略要报数）', async () => {
+    const gateway = alwaysReads(['src/a.ts']);
+    await expect(
+      run(gateway, makeTask({ budget: { ...makeTask().budget, maxModelTurns: 8 } })),
+    ).rejects.toThrow(/规划阶段用满/);
+
+    // 4 轮规划，最后一轮被平台拒 → 3 次读同一个文件，去重成 1 个目标
+    expect(digest()!.summary).toContain('3 次只读调用：读文件 ×3');
+    expect(digest()!.summary).toContain('去重后 1 个目标');
+    /*
+     * src/a.ts 在夹具里并不存在，三次都读失败。落空必须单独报出来 ——
+     * 把读不到的路径列在"读过的文件"里而不加区分，就是把一次落空说成一次探索，
+     * 而"它一直在读不存在的路径"恰恰是最有用的那条线索。
+     */
+    expect(digest()!.summary).toContain('其中 3 次调用失败，没有读到内容');
+  });
+
+  it('"模型全程没说过话"要被点名 —— 那是信号最强的一条', async () => {
+    const gateway = alwaysReads(['src/a.ts']);
+    await expect(run(gateway, makeTask())).rejects.toThrow(/规划阶段用满/);
+    expect(digest()!.summary).toContain('全程没有输出任何文字');
+  });
+
+  it('说过话就报几轮说过，不谎称沉默', async () => {
+    const gateway = new ScriptedModel(() => ({
+      content: [
+        { type: 'text', text: '我再看看这个文件。' },
+        { type: 'tool_use', id: `tu_${Math.random().toString(36).slice(2, 8)}`, name: 'fs_read', input: { path: 'src/a.ts' } },
+      ],
+      stopReason: 'TOOL_USE',
+      inputTokens: 10,
+      outputTokens: 5,
+    }));
+    await expect(
+      run(gateway, makeTask({ budget: { ...makeTask().budget, maxModelTurns: 6 } })),
+    ).rejects.toThrow(/规划阶段用满/);
+
+    // 3 轮规划：前 2 轮读+说，最后一轮只剩 submit_plan（模型仍回了文本）
+    expect(digest()!.summary).toMatch(/模型在 3\/3 轮里说过话/);
+    expect(digest()!.summary).not.toContain('全程没有输出');
+  });
+
+  it('顺利提交计划时不发账目 —— 它是失败时的交代，不是每次都吵一遍', async () => {
+    host.planDecision = 'REJECT';
+    const gateway = new ScriptedModel(() => toolUse('submit_plan', VALID_PLAN));
+    await run(gateway, makeTask());
+    expect(digest()).toBeUndefined();
+  });
+
+  it('被阶段闸门拒掉的调用不算"看过" —— 它根本没执行', async () => {
+    /*
+     * 规划期点名 workspace_mutate 会被平台强制只读挡下。那次调用有记录、有报数，
+     * 但它**什么都没读到**，混进"读过的文件"里就是把一次拒绝说成一次探索。
+     */
+    const gateway = new ScriptedModel((n) =>
+      n % 2 === 1
+        ? toolUse('workspace_mutate', {
+            operations: [{ kind: 'CREATE_FILE', path: 'src/x.ts', newText: 'x' }],
+          })
+        : toolUse('fs_read', { path: 'src/a.ts' }),
+    );
+    await expect(
+      run(gateway, makeTask({ budget: { ...makeTask().budget, maxModelTurns: 8 } })),
+    ).rejects.toThrow(/规划阶段用满/);
+
+    const note = digest()!;
+    expect(note.summary).not.toContain('workspace_mutate');
+    // 4 轮里：第 1、3 轮被拒，第 2 轮读到一次，第 4 轮只剩 submit_plan
+    expect(note.payload.planningDigest).toMatchObject({ toolCalls: 1 });
+  });
+});
+
+describe('最后一轮的收窄是平台闸门，不只是"少给几个 schema"', () => {
+  /**
+   * 规划期只读闸门当年栽过一次：`PLANNING_TOOLS` 决定的是模型**看得见**什么，
+   * 而 `dispatchTool` 查的是全局 `TOOLS_BY_NAME` —— 模型凭记忆点名一个没给它的
+   * 工具，之前就会真的执行。
+   *
+   * 最后一轮的强制收口有同样的陷阱：只把 schema 列表收窄成 [submit_plan]，
+   * 一个不听话的模型照样能接着 fs_read 到超时，而"强制收口"就成了纸面上的。
+   * 所以这一条钉的是**平台真的拒了**，不是"模型没看见"。
+   */
+  it('模型在最后一轮凭记忆点名 fs_read → 平台 DENIED，且留下记录', async () => {
+    // 全程只会 fs_read，从不理会平台给了哪些工具
+    // hello.txt 是夹具里真实存在的文件 —— 第一轮必须真的读成功，否则测不出"第二轮才被拒"
+    const gateway = new ScriptedModel(() => toolUse('fs_read', { path: 'hello.txt' }));
+
+    await expect(
+      run(gateway, makeTask({ budget: { ...makeTask().budget, maxModelTurns: 4 } })),
+    ).rejects.toThrow(/规划阶段用满/);
+
+    // 2 轮规划：第 1 轮真的读了，第 2 轮（最后一轮）被平台拒
+    const reads = host.toolCalls.filter((t) => t.toolName === 'fs_read');
+    expect(reads).toHaveLength(2);
+    expect(reads[0]!.resolution).toBe('SUCCEEDED');
+    expect(reads[1]!.resolution).toBe('DENIED');
+    expect(reads[1]!.reason).toBe('TURN_TOOL_RESTRICTED');
+
+    // 拒绝要说清楚"现在该干什么"，否则模型只会换个工具名再试一次
+    expect(gateway.lastMessageText(2)).toContain('submit_plan');
+    expect(gateway.lastMessageText(2)).toContain('risks');
+
+    // 被拒的那次不算"看过"——它什么都没读到
+    const note = host.events.find((e) => e.kind === 'NOTE' && e.summary.startsWith('规划没有收口'));
+    expect(note!.payload.planningDigest).toMatchObject({ toolCalls: 1 });
   });
 });

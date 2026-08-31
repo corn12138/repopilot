@@ -13,6 +13,7 @@ import { PATHS } from '../paths';
 import { readJson, writeJsonAtomic } from '../store';
 import { anthropicAdapter } from './anthropic';
 import { openAiWireAdapter } from './openai-compatible';
+import { resetStream } from './stream';
 import {
   DEFAULT_RETRY_POLICY,
   type RetryPolicy,
@@ -37,6 +38,7 @@ import {
   findWireViolation,
   ModelCallError,
   type ModelAdapter,
+  type StreamListener,
   type ModelMessage,
   type ModelRequest,
   type ModelResponse,
@@ -89,6 +91,17 @@ export interface InvocationInput {
    * 冻结路由不在同意覆盖范围内 → CONSENT_STALE。两者都在发送前阻断，P0 无"仍然发送"。
    */
   readonly consent?: { readonly disclosureDigest: string; readonly resolutionDigests: readonly string[] } | null;
+  /**
+   * 文本增量的接收方。给了就走流式，不给就走一次性请求。
+   *
+   * 流**只改变文本什么时候到界面**，不改变权威结果：返回的 `response` 与
+   * 非流式逐字段同义，账本、工具分发、封存对"这次是不是流式"完全无知。
+   *
+   * 一次尝试作废时（同 route 重试、或最终失败）这里会收到 `reset` ——
+   * 已经显示出去的增量必须撤回。少了它，界面会把半截作废的文本留着，
+   * 看起来像模型说过这些话。
+   */
+  readonly onStream?: StreamListener;
 }
 
 export interface InvocationOutput {
@@ -465,13 +478,16 @@ export class ModelGateway {
       const requestedAt = nowIso();
       const composed = attemptSignal(input.signal, policy.perAttemptTimeoutMs);
       try {
-        const response = await adapter.call(input.request, {
+        const callCtx = {
           apiKey, // 只在这一层展开，调用结束即离开作用域
           modelId: resolution.modelId,
           signal: composed.signal,
           // 用**冻结时**的地址，而不是当前配置 —— 运行中改设置不能改变已在飞的 Attempt
           baseUrl: resolution.origin,
-        });
+        };
+        const response = input.onStream
+          ? await adapter.stream(input.request, callCtx, input.onStream)
+          : await adapter.call(input.request, callCtx);
         const manifest: ModelEgressManifest = {
           ...base,
           requestedAt,
@@ -495,6 +511,12 @@ export class ModelGateway {
                 sendState: 'SENT_OUTCOME_UNKNOWN',
               });
         const cancelled = input.signal.aborted;
+        /*
+         * 这一次尝试作废了 —— 已经推给界面的增量必须撤回。
+         * 不撤的话，重试成功后新旧两段文本会首尾相接，而前一段是模型**没有**
+         * 完成的输出；最终失败时更糟：界面上留着半句话，看起来像模型说过。
+         */
+        resetStream(input.onStream, cancelled ? '调用已取消' : (e.message || '调用失败'));
         const manifest: ModelEgressManifest = {
           ...base,
           requestedAt,

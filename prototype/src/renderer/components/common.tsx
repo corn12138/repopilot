@@ -148,6 +148,100 @@ export function failureClassText(failureClass: string): string {
   return FAILURE_CLASS_TEXT[failureClass] ?? failureClass;
 }
 
+/**
+ * 工具名的中文词典。与 RUN_STATUS_TEXT / TOOL_RISK_TITLE 同一条规矩：
+ * 说人话，raw 标识符进 title —— 别处再开一份就会漂。
+ *
+ * 未登记的工具名原样显示：新工具上线时宁可露出标识符，也不能悄悄显示成别的东西。
+ */
+const TOOL_NAME_TEXT: Record<string, string> = {
+  fs_read: '读取文件',
+  fs_glob: '匹配文件',
+  fs_grep: '搜索内容',
+  fs_list: '列出目录',
+  run_command: '运行命令',
+  workspace_mutate: '修改文件',
+  verify_command: '验证命令',
+};
+
+export function toolNameText(toolName: string): string {
+  return TOOL_NAME_TEXT[toolName] ?? toolName;
+}
+
+/**
+ * 工具族：决定时间线上哪些相邻调用可以并成一组。
+ *
+ *   read   —— 只读探索。这一族最密、最不值得逐条看，是折叠的主要收益来源。
+ *   run    —— 模型自己发起的命令。输出重要，但同族相邻的可以并。
+ *   mutate —— 改文件。**永远单独成行、永远默认展开**：它是这个产品里
+ *             唯一会改变工作区的动作，把它折进"已读取 7 个文件"是不可接受的。
+ *   other  —— 未登记的工具，不并组（不确定语义时不做聚合）。
+ */
+export type ToolFamily = 'read' | 'run' | 'mutate' | 'other';
+
+const TOOL_FAMILY: Record<string, ToolFamily> = {
+  fs_read: 'read',
+  fs_glob: 'read',
+  fs_grep: 'read',
+  fs_list: 'read',
+  run_command: 'run',
+  workspace_mutate: 'mutate',
+};
+
+export function toolFamily(toolName: string): ToolFamily {
+  return TOOL_FAMILY[toolName] ?? 'other';
+}
+
+/**
+ * 模型调用的用途。Core 侧的枚举是 PLANNING / EXECUTION / REVIEW（agent.ts 的 Phase），
+ * 但时间线上还会出现历史事件里的其他写法，所以未登记的一律原样透出。
+ */
+const MODEL_PURPOSE_TEXT: Record<string, string> = {
+  PLANNING: '规划',
+  EXECUTION: '执行',
+  EXECUTING: '执行',
+  REVIEW: '审核',
+  CROSS_REVIEW: '交叉审核',
+};
+
+export function modelPurposeText(purpose: string): string {
+  return MODEL_PURPOSE_TEXT[purpose] ?? purpose;
+}
+
+/**
+ * 命令终局的词典（判别联合的六个终态说人话，raw 进 title —— v0.2 N7 同一红线）。
+ *
+ * 两处消费：平台验证命令的 CommandOutcome，与模型发起 run_command 的 CommandResult。
+ * 一处定义 —— 复制会漂，而这六个词恰恰是不变式 5 要求"必须可区分"的那六种。
+ */
+const COMMAND_OUTCOME_TEXT: Record<string, string> = {
+  EXIT_ZERO: '退出 0',
+  EXIT_NONZERO: '非零退出',
+  SIGNAL: '被信号终止',
+  TIMEOUT: '超时',
+  CANCELLED: '已取消',
+  SPAWN_ERROR: '无法启动',
+};
+
+export function commandOutcomeText(outcome: string): string {
+  return COMMAND_OUTCOME_TEXT[outcome] ?? outcome;
+}
+
+/**
+ * 命令终局的一行呈现：非零退出把退出码带上，被信号杀掉把信号名带上。
+ * "非零退出"和"非零退出 · 1"对排错的价值差得远。
+ */
+export function commandResultText(result: {
+  outcome: string;
+  exitCode: number | null;
+  signal: string | null;
+}): string {
+  const base = commandOutcomeText(result.outcome);
+  if (result.outcome === 'EXIT_NONZERO' && result.exitCode !== null) return `${base} · ${result.exitCode}`;
+  if (result.outcome === 'SIGNAL' && result.signal) return `${base} · ${result.signal}`;
+  return base;
+}
+
 /** 恢复态与证据完整性徽标。两者都必须一眼可见，否则用户会把只读当成能续跑。 */
 export function RestoredBadge({ run }: { run: { restored: boolean; evidence: string } }) {
   if (run.evidence === 'DAMAGED') return <Badge tone="err">证据损坏</Badge>;

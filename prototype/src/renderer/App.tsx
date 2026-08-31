@@ -62,6 +62,15 @@ export function App() {
 
   const [selectedProject, setSelectedProject] = useState<ProjectRef | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  /*
+   * 模型正文的实时缓冲。**易失，不属于事件流。**
+   *
+   * 模型调用是整个流程里最长的一段等待，而在它返回之前 Core 一条持久事件都不发。
+   * 这个缓冲让那段时间里有东西可看；一旦 MODEL_INVOCATION 落地（那一轮结束了，
+   * 持久的 ASSISTANT_MESSAGE 紧随其后），它的使命就结束，立刻清空 ——
+   * 否则同一段话会先以缓冲、再以事件出现两遍。
+   */
+  const [liveText, setLiveText] = useState('');
   const [error, setError] = useState<{ message: string; detail: string | null } | null>(null);
   const { state: importState, start: startProjectImport } = useProjectImport();
   const {
@@ -280,8 +289,19 @@ export function App() {
             return next;
           });
           break;
+        case 'run.stream':
+          if (event.runId === selectedRunRef.current) {
+            // reset = 这一次尝试作废了（重试或失败）：半截文本必须撤回，不能留着
+            setLiveText((prev) => (event.signal.kind === 'delta' ? prev + event.signal.text : ''));
+          }
+          break;
         case 'run.event':
           if (event.runId === selectedRunRef.current) {
+            /*
+             * 这一轮模型调用结束了 —— 成功、被阻断、失败三条路径都发 MODEL_INVOCATION。
+             * 持久记录正在落地，实时缓冲到此为止；不清的话同一段话会显示两遍。
+             */
+            if (event.event.kind === 'MODEL_INVOCATION') setLiveText('');
             appendEvent(event.runId, event.event);
           }
           break;
@@ -386,6 +406,8 @@ export function App() {
       setShowEvidence(false);
       setError(null);
       setSelectedRunId(run.runId);
+      // 换 Run 就丢掉上一个 Run 的实时缓冲 —— 它属于那一次调用，不属于这个视图
+      setLiveText('');
       if (selectedProject?.projectId !== run.projectId) {
         const project = projects.find((p) => p.projectId === run.projectId);
         if (project) {
@@ -889,6 +911,7 @@ export function App() {
                     onError={report}
                     onRefresh={() => void loadRunDetail(selectedRunId)}
                     onOpenDiff={openDiffInEditor}
+                    liveText={liveText}
                   />
                 ) : (
                   <RunDetailRequestPanel
@@ -957,7 +980,26 @@ export function App() {
               modelProfiles={modelProfiles}
               activeRun={activeProjectRun}
               onCreated={(run) => {
-                setRuns((prev) => [run, ...prev]);
+                /*
+                 * 按 runId upsert，不是无条件前插。
+                 *
+                 * task.create 的响应**不是**这个 Run 的第一手消息：Core 在 return 之前
+                 * 就 `void execute()`（authority.ts createTask），而 execute → runAgent
+                 * 在第一个 await 之前已经 setStatus('EXECUTING') 并 push 了一条
+                 * run.updated。push 与 response 走同一个 port，push 必然先出 Core。
+                 * 于是这里拿到的 view 停在 CREATED，而列表里那条已经是 EXECUTING。
+                 *
+                 * 无条件前插会把同一个 runId 插成两行，且此后的 run.updated 用
+                 * findIndex 只命中下标 0 那条 —— 另一条永远冻在 EXECUTING，被
+                 * isTerminal 分段排进"进行中"区（时间还更早），并把状态栏的
+                 * "运行中 N" 垫高一格。三个症状同源。
+                 *
+                 * 已存在就保留列表里那份：响应携带的是创建那一刻的快照，
+                 * 不可能比推送来的新。
+                 */
+                setRuns((prev) =>
+                  prev.some((r) => r.runId === run.runId) ? prev : [run, ...prev],
+                );
                 setSelectedRunId(run.runId);
               }}
               onReimport={() => importProject(selectedProject)}

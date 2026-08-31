@@ -1,6 +1,20 @@
 import { useMemo, useState } from 'react';
-import type { CommandOutcome, RunEvent, ToolCallView } from '@shared/domain';
-import { Badge, DiffView, ResolutionBadge, RiskBadge, timeOf } from '../components/common';
+import type { CommandOutcome, RunEvent, RunStatus, ToolCallView } from '@shared/domain';
+import { isTerminal } from '@shared/domain';
+import {
+  Badge,
+  DiffView,
+  ResolutionBadge,
+  RiskBadge,
+  commandOutcomeText,
+  commandResultText,
+  modelPurposeText,
+  timeOf,
+  toolFamily,
+  toolNameText,
+  type ToolFamily,
+} from '../components/common';
+import { Prose } from '../components/Prose';
 
 /**
  * 把持久化事件和工具调用合并成一条按时间排列的对话流。
@@ -18,7 +32,23 @@ import { Badge, DiffView, ResolutionBadge, RiskBadge, timeOf } from '../componen
  */
 
 type Item =
-  | { kind: 'text'; seq: number; at: string; role: 'user' | 'agent' | 'platform'; text: string }
+  | { kind: 'text'; seq: number; at: string; role: 'user' | 'platform'; text: string }
+  /**
+   * 模型自己写的话。与 `text` 分开是因为它多背三件事：
+   * 说这话的是哪个模型（并组之后仍要留得住归属）、是哪一段用途（规划/执行/审核）、
+   * 以及**有没有被截断**（截断必须报数，不能像上一版那样切在第 400 个字符就没了）。
+   */
+  | {
+      kind: 'say';
+      seq: number;
+      at: string;
+      text: string;
+      truncated: boolean;
+      fullLength: number | null;
+      turnIndex: number | null;
+      model: string | null;
+      purpose: string | null;
+    }
   | { kind: 'plan'; seq: number; at: string; summary: string; steps: string[]; risks: string[] }
   | { kind: 'tool'; seq: number; at: string; call: ToolCallView }
   | { kind: 'command'; seq: number; at: string; call: ToolCallView; outcome: CommandOutcome | null }
@@ -33,6 +63,27 @@ type Item =
       index: number;
       purpose: string;
       detail: string;
+      children: Item[];
+    }
+  /**
+   * 若干**相邻**的、同族的、没有正文的模型轮次，并成一组可折叠的调用。
+   *
+   * 为什么要跨轮：轮次边界是实现细节，用户不关心"模型第几次开口"，只关心
+   * "它读了些什么"。一轮一调用时按轮折叠等于没折 —— 每个调用反而多背一个
+   * 轮次头。真机上 33 次调用铺成十几张卡片，主因就在这里。
+   *
+   * 为什么只并"没有正文"的轮次：模型说了话，那段话就是这一组的结论，
+   * 必须成为分隔。Layer 2 让正文进时间线之后，这条规则会自动把
+   * "读一批 → 说一句 → 再读一批"分成两组，不需要再改这里。
+   */
+  | {
+      kind: 'toolgroup';
+      seq: number;
+      at: string;
+      family: ToolFamily;
+      /** 覆盖的轮次序号区间与模型名 —— 并组不能让"这是哪一轮、哪个模型"消失 */
+      turnRange: [number, number];
+      models: string[];
       children: Item[];
     };
 
@@ -93,13 +144,32 @@ const MERGED_KINDS = new Set<string>([
 export function Transcript({
   events,
   toolCalls,
+  runStatus = null,
+  liveText = '',
 }: {
   events: readonly RunEvent[];
   toolCalls: readonly ToolCallView[];
+  /**
+   * 当前 Run 的状态。非终态时时间线末尾要有活动指示 ——
+   * 模型调用期间**一条事件都不发**（MODEL_INVOCATION 在响应回来之后才 emit），
+   * 那是整个流程里最长的一段等待，而界面在这段时间里一个像素都不动。
+   * 不传（比如证据页的只读投影）就退回纯静态呈现。
+   */
+  runStatus?: RunStatus | null;
+  /**
+   * 正在流进来的模型正文。**易失**：它不来自事件流，也不会被写下来 ——
+   * 模型这一轮一返回，App 就清空它，同一段话改由 ASSISTANT_MESSAGE 事件接手。
+   * 所以这里不会出现"缓冲与事件各显示一遍"。
+   */
+  liveText?: string;
 }) {
   const { items, omissions } = useMemo(() => build(events, toolCalls), [events, toolCalls]);
+  const activity = useMemo(
+    () => (runStatus && !isTerminal(runStatus) ? describeActivity(runStatus, events, toolCalls) : null),
+    [runStatus, events, toolCalls],
+  );
 
-  if (items.length === 0 && omissions.length === 0) {
+  if (items.length === 0 && omissions.length === 0 && !activity && !liveText) {
     return <div className="empty">还没有内容。任务开始后这里会实时出现。</div>;
   }
 
@@ -108,7 +178,63 @@ export function Transcript({
       {items.map((item) => (
         <Row key={`${item.kind}-${item.seq}`} item={item} />
       ))}
+      {/*
+        正在流进来的这一段。刻意**不**署名 "AI" 的完整形态、也不带归属小字 ——
+        它还没说完，也还没被写下来。等这一轮结束，同一段话会以 ASSISTANT_MESSAGE
+        的身份重新出现在同一位置，那时才是记录。
+      */}
+      {liveText && (
+        <div className="msg agent live" aria-live="polite">
+          <div className="msg-gutter">AI</div>
+          <div className="msg-body">
+            <Prose text={liveText} />
+          </div>
+          <div className="msg-time">…</div>
+        </div>
+      )}
+      {activity && <ActivityLine text={activity} />}
       <OmissionNotice omissions={omissions} />
+    </div>
+  );
+}
+
+/**
+ * "现在在干什么"。
+ *
+ * 只从**已有事实**推断，不新造事实：最后一条事件是模型调用就是在等模型，
+ * 有未 resolve 的工具调用就是在等那个调用。推不出来时说"进行中"，
+ * 而不是编一个具体的动作 —— 界面宁可含糊，也不能替系统撒谎。
+ */
+function describeActivity(
+  status: RunStatus,
+  events: readonly RunEvent[],
+  toolCalls: readonly ToolCallView[],
+): string | null {
+  // 等人做决定不是"进行中"：球在用户那边，审批卡自己会说话
+  if (status === 'AWAITING_PLAN_APPROVAL' || status === 'AWAITING_PATCH_REVIEW') return null;
+
+  const pending = toolCalls.find((t) => t.resolution === null);
+  if (pending) return `正在${toolNameText(pending.toolName)}：${pending.argsSummary}`;
+
+  const last = events[events.length - 1];
+  if (last?.kind === 'MODEL_INVOCATION') return '模型正在思考…';
+  if (status === 'VERIFYING') return '正在跑验证命令…';
+  if (status === 'CROSS_REVIEWING') return '第二个模型正在审补丁…';
+  if (status === 'PLANNING') return '模型正在规划…';
+  return '进行中…';
+}
+
+/**
+ * 活动指示只用文字与一个空心点，不做持续动画：
+ * styles.css 的动效纪律是"只动 opacity/transform、reduced-motion 下关闭"，
+ * 而一个永不停止的 spinner 在这条纪律下没有诚实的实现方式 ——
+ * 它还会让"卡住了"和"在跑"长得一模一样。
+ */
+function ActivityLine({ text }: { text: string }) {
+  return (
+    <div className="transcript-activity" role="status" aria-live="polite">
+      <span className="transcript-activity-dot" aria-hidden="true" />
+      <span>{text}</span>
     </div>
   );
 }
@@ -297,6 +423,29 @@ function build(events: readonly RunEvent[], toolCalls: readonly ToolCallView[]):
         items.push({ kind: 'text', seq: e.seq, at: e.at, role: 'platform', text: e.summary });
         break;
 
+      case 'ASSISTANT_MESSAGE': {
+        /*
+         * 时间线上第一次真的出现"AI"这个说话人。
+         *
+         * 挂到当前轮次名下（而不是平铺）是为了保住归属：它是哪一轮、哪个模型说的。
+         * 渲染时 coalesceTurns 会把它从折叠层里**提出来**放在调用组前面 ——
+         * 模型说的话是这一组调用的由头与结论，藏进折叠层等于把最该读的东西收走。
+         */
+        const say: Item = {
+          kind: 'say',
+          seq: e.seq,
+          at: e.at,
+          text: e.summary,
+          truncated: e.payload.truncated === true,
+          fullLength: typeof e.payload.fullLength === 'number' ? e.payload.fullLength : null,
+          turnIndex: currentTurn?.index ?? null,
+          model: currentTurn ? splitMeter(currentTurn.detail).text : null,
+          purpose: typeof e.payload.purpose === 'string' ? e.payload.purpose : null,
+        };
+        (currentTurn?.children ?? items).push(say);
+        break;
+      }
+
       case 'MUTATION_APPLIED':
         items.push({ kind: 'status', seq: e.seq, at: e.at, text: e.summary, tone: 'ok' });
         break;
@@ -412,7 +561,101 @@ function build(events: readonly RunEvent[], toolCalls: readonly ToolCallView[]):
     });
   }
 
-  return { items, omissions };
+  return { items: coalesceTurns(items), omissions };
+}
+
+/** 这一轮里真正的工具调用（tool / command 两种呈现形态都算） */
+function callsOf(turn: Extract<Item, { kind: 'turn' }>): ToolCallView[] {
+  return turn.children
+    .filter((c): c is Extract<Item, { kind: 'tool' | 'command' }> => c.kind === 'tool' || c.kind === 'command')
+    .map((c) => c.call);
+}
+
+/**
+ * 这一轮能不能并进组里，能的话属于哪一族。
+ *
+ * 三条否决：
+ *   - 没有调用 → 它是"模型只说了话"的一轮，本身就是分隔，不并；
+ *   - 有正文（Layer 2 起会有）→ 那段话是这一组的结论，不能被折进去；
+ *   - 族不唯一，或族是 mutate/other → 改文件的调用永远单独成行、默认展开，
+ *     未登记的工具语义不明，不做聚合。
+ */
+function mergeFamilyOf(children: readonly Item[]): ToolFamily | null {
+  const calls = children
+    .filter((c): c is Extract<Item, { kind: 'tool' | 'command' }> => c.kind === 'tool' || c.kind === 'command')
+    .map((c) => c.call);
+  if (calls.length === 0) return null;
+  const families = new Set(calls.map((c) => toolFamily(c.toolName)));
+  if (families.size !== 1) return null;
+  const family = [...families][0]!;
+  return family === 'read' || family === 'run' ? family : null;
+}
+
+/**
+ * 把相邻的可并轮次收成 toolgroup。
+ *
+ * 只合并**紧挨着**的轮次：中间只要出现任何别的行（相位锚点、状态、审批、
+ * ATTEMPT_STARTED、模型正文），组就断开 —— 那些行本来就是叙事的断点，
+ * 跨过它们合并会把时间顺序弄乱。
+ *
+ * 单个可并轮次也转成 toolgroup：一轮一调用时，"#7 执行 模型 1 次工具 fs_read"
+ * 这样的轮次头没有任何增量信息，换成"读取文件 src/app.ts"才是人能读的。
+ */
+function coalesceTurns(items: Item[]): Item[] {
+  const out: Item[] = [];
+  let group: Extract<Item, { kind: 'toolgroup' }> | null = null;
+
+  for (const item of items) {
+    if (item.kind !== 'turn') {
+      group = null;
+      out.push(item);
+      continue;
+    }
+
+    /*
+     * 模型正文从折叠层里**提出来**，放在这一轮的调用之前。
+     *
+     * 它在 children 里排在调用前面（Core 先 emit ASSISTANT_MESSAGE 再派发工具），
+     * 所以提出来之后顺序仍是真的：先说要干什么，再干。
+     *
+     * 提出来还有第二个作用：它天然断开了折叠组 —— 模型说了话，那段话就是
+     * 前一组调用的结论、下一组调用的由头，两组不该并成一坨。这正是
+     * 「读一批 → 说一句 → 再读一批」应有的分段，不需要另写规则。
+     */
+    const says = item.children.filter((c) => c.kind === 'say');
+    const rest = item.children.filter((c) => c.kind !== 'say');
+    for (const say of says) {
+      group = null;
+      out.push(say);
+    }
+
+    // 只说了话、没调工具：说完就完了，不必再画一张空卡片
+    if (rest.length === 0 && says.length > 0) continue;
+
+    const family = mergeFamilyOf(rest);
+    if (family === null) {
+      group = null;
+      out.push(says.length > 0 ? { ...item, children: rest } : item);
+      continue;
+    }
+    if (group && group.family === family) {
+      group.children.push(...rest);
+      group.turnRange = [group.turnRange[0], item.index];
+      if (!group.models.includes(item.detail)) group.models.push(item.detail);
+      continue;
+    }
+    group = {
+      kind: 'toolgroup',
+      seq: item.seq,
+      at: item.at,
+      family,
+      turnRange: [item.index, item.index],
+      models: [item.detail],
+      children: [...rest],
+    };
+    out.push(group);
+  }
+  return out;
 }
 
 function countedKinds(counts: Map<string, number>): { total: number; text: string } {
@@ -428,10 +671,17 @@ function Row({ item }: { item: Item }) {
     case 'text':
       return (
         <div className={`msg ${item.role}`}>
-          <div className="msg-gutter">
-            {item.role === 'user' ? '你' : item.role === 'agent' ? 'AI' : '平台'}
+          {/* 「AI」这个说话人现在有自己的行（SayRow）—— 这里只剩用户与平台两种 */}
+          <div className="msg-gutter">{item.role === 'user' ? '你' : '平台'}</div>
+          <div className="msg-body">
+            {/*
+              用户输入逐字原样显示 —— 那是他自己打的字，重排版会让人怀疑
+              发出去的到底是不是这些字。模型与平台的正文走 Markdown 呈现：
+              模型写的就是 Markdown，直接 {text} 会把 `**`、反引号、`##`
+              当正文印出来。
+            */}
+            {item.role === 'user' ? item.text : <Prose text={item.text} />}
           </div>
-          <div className="msg-body">{item.text}</div>
           <div className="msg-time">{timeOf(item.at)}</div>
         </div>
       );
@@ -457,8 +707,14 @@ function Row({ item }: { item: Item }) {
         </div>
       );
 
+    case 'say':
+      return <SayRow item={item} />;
+
     case 'turn':
       return <TurnBlock item={item} />;
+
+    case 'toolgroup':
+      return <ToolGroupBlock item={item} />;
 
     case 'status':
       return (
@@ -506,46 +762,175 @@ function Row({ item }: { item: Item }) {
   }
 }
 
-/** run_command 的调用：渲染成终端块 */
 /**
- * 一轮模型思考及其工具调用。默认折叠成一行摘要 —— 平铺几十条 fs_read
- * 是"信息太杂"的主因；真正要看细节时再展开。
- * 有失败的调用时默认展开：失败不该藏在折叠层里。
+ * 模型说的话。时间线上唯一署名「AI」的行 —— 别的行要么是用户，要么是平台。
+ *
+ * 三件事必须一起给：
+ *   1. 正文按 Markdown 呈现（模型写的就是 Markdown）；
+ *   2. 归属（哪一轮、哪个模型、哪一段用途）—— 否则并组之后就说不清是谁说的；
+ *   3. **截断如实报数**。上一版切在第 400 个字符且一声不吭，界面上就是半句话没了。
+ */
+function SayRow({ item }: { item: Extract<Item, { kind: 'say' }> }) {
+  const attribution = [
+    item.turnIndex !== null ? `#${item.turnIndex}` : null,
+    item.purpose ? modelPurposeText(item.purpose) : null,
+    item.model,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  return (
+    <div className="msg agent">
+      <div className="msg-gutter" title={attribution || undefined}>
+        AI
+      </div>
+      <div className="msg-body">
+        <Prose text={item.text} />
+        {attribution && <div className="say-attribution">{attribution}</div>}
+        {item.truncated && (
+          <div className="say-truncated">
+            这段话被截断了
+            {item.fullLength !== null
+              ? `：只显示前 ${item.text.length} 字，原文共 ${item.fullLength} 字`
+              : ''}
+            。完整正文没有被封存，找不回来。
+          </div>
+        )}
+      </div>
+      <div className="msg-time">{timeOf(item.at)}</div>
+    </div>
+  );
+}
+
+/**
+ * 「deepseek-v4-pro（in=12938 out=1485）」：行上留模型名，per-call token 计量
+ * 进 title（交互评审 v0.2 N5）—— 总量在用量面板，逐笔在数据出站，这里不再第三遍。
+ * 括号必须同时接受全角与半角：Core 的真实 summary 用的是全角（in=…），
+ * 只匹配半角曾让这条降噪在真机上从未生效 —— 测试也用半角，恰好互相印证成假绿。
+ */
+function splitMeter(detail: string): { text: string; title: string | undefined } {
+  const meter = /^(.*?)\s*[（(](in=.*?)[)）]\s*$/.exec(detail);
+  return meter
+    ? { text: meter[1]!, title: `${meter[1]!} · ${meter[2]!}` }
+    : { text: detail, title: undefined };
+}
+
+function failedCount(calls: readonly ToolCallView[]): number {
+  return calls.filter((c) => c.resolution !== null && c.resolution !== 'SUCCEEDED').length;
+}
+
+/**
+ * 一组调用的标题。目标是**读起来像一句话**，而不是把内部标识符抄一遍：
+ * 参照物那行是「已读取 MEMORY.md」「Ran 2 commands」，不是「fs_read / run_command」。
+ *
+ * 只有一次调用时连参数一起写进标题 —— 那种情况折叠头就是全部信息，
+ * 逼人点开只为看一个文件名是纯粹的摩擦。
+ */
+function groupTitle(family: ToolFamily, calls: readonly ToolCallView[]): string {
+  if (calls.length === 1) {
+    const only = calls[0]!;
+    return `${toolNameText(only.toolName)} ${only.argsSummary}`.trim();
+  }
+  if (family === 'run') {
+    /*
+     * 命令组的标题带上"有几条没退出 0"。只数拿得到终局的那些 ——
+     * 旧记录没有 commandResult，不能把"不知道"算进"通过"。
+     */
+    const bad = calls.filter((c) => c.commandResult && c.commandResult.outcome !== 'EXIT_ZERO').length;
+    return bad > 0
+      ? `运行命令 · ${calls.length} 条 · ${bad} 条未退出 0`
+      : `运行命令 · ${calls.length} 条`;
+  }
+  const names = new Set(calls.map((c) => c.toolName));
+  if (names.size === 1) return `${toolNameText([...names][0]!)} · ${calls.length} 次`;
+  return `读取与搜索 · ${calls.length} 次`;
+}
+
+/**
+ * 一组相邻的同族调用。
+ *
+ * 默认开合按"这一族的输出值不值得直接看"决定，而不是一刀切：
+ *   read —— 默认收起。这是噪声的主体：几十条 fs_read 铺开正是"啥也看不出来"的来源。
+ *   run  —— 默认展开。命令输出通常就是用户要找的东西（构建到底错在哪一行），
+ *           把它藏进折叠层等于把信号也一起收走。
+ * 任何一条失败都强制展开 —— 失败不该藏在折叠层里。
+ */
+function ToolGroupBlock({ item }: { item: Extract<Item, { kind: 'toolgroup' }> }) {
+  const calls = item.children
+    .filter((c): c is Extract<Item, { kind: 'tool' | 'command' }> => c.kind === 'tool' || c.kind === 'command')
+    .map((c) => c.call);
+  const failed = failedCount(calls);
+  const [from, to] = item.turnRange;
+  // 并组不能让"这是哪几轮、哪个模型"消失：区间与模型名进 title
+  const turns = from === to ? `#${from}` : `#${from}–#${to}`;
+  const models = item.models.map((m) => splitMeter(m).title ?? m).join('；');
+
+  return (
+    <details className={`toolgroup ${item.family}`} open={failed > 0 || item.family === 'run'}>
+      <summary className="toolgroup-head" title={`${turns} · ${models}`}>
+        <span className="toolgroup-title">{groupTitle(item.family, calls)}</span>
+        <span className="spacer" />
+        {failed > 0 && <span className="toolgroup-failed">{failed} 失败</span>}
+        {from !== to && <span className="toolgroup-turns">{to - from + 1} 轮</span>}
+        <span className="msg-time">{timeOf(item.at)}</span>
+      </summary>
+      <div className="toolgroup-body">
+        {item.children.map((c) => (
+          <Row key={`${c.kind}-${c.seq}`} item={c} />
+        ))}
+      </div>
+    </details>
+  );
+}
+
+/**
+ * 一轮模型思考，**没有**并进 toolgroup 的那种：要么它没调工具（只说了话），
+ * 要么它这一轮里同时干了不同族的事（比如既读了文件又改了文件）。
+ *
+ * 没有调用的那一轮不画成卡片，只留一条安静的行。之前它渲染成一张写着
+ * "没有工具调用"的折叠卡 —— 一整张卡片用来说"这里什么都没有"，
+ * 正是真机截图里最刺眼的那一块。Layer 2 让模型正文进时间线之后，
+ * 这一行会长出内容；在那之前它至少不该占着版面喊空。
  */
 function TurnBlock({ item }: { item: Extract<Item, { kind: 'turn' }> }) {
-  const calls = item.children.filter((c) => c.kind === 'tool' || c.kind === 'command');
-  const failed = calls.filter(
-    (c) =>
-      (c.kind === 'tool' || c.kind === 'command') &&
-      c.call.resolution !== null &&
-      c.call.resolution !== 'SUCCEEDED',
-  ).length;
-  const names = calls
-    .map((c) => (c.kind === 'tool' || c.kind === 'command' ? c.call.toolName : ''))
-    .filter(Boolean);
-  const summary = names.length > 0 ? [...new Set(names)].join(' / ') : '没有工具调用';
+  const calls = callsOf(item);
+  const failed = failedCount(calls);
+  const { text: detailText, title: detailTitle } = splitMeter(item.detail);
+  const purpose = modelPurposeText(item.purpose);
 
-  // 「deepseek-v4-pro (in=12938 out=1485)」：行上留模型名，per-call token 计量
-  // 进 title（交互评审 v0.2 N5）—— 总量在用量面板，逐笔在数据出站，这里不再第三遍。
-  // 括号必须同时接受全角与半角：Core 的真实 summary 用的是全角（in=…），
-  // 只匹配半角曾让这条降噪在真机上从未生效 —— 测试也用半角，恰好互相印证成假绿
-  const meter = /^(.*?)\s*[（(](in=.*?)[)）]\s*$/.exec(item.detail);
-  const detailText = meter ? meter[1]! : item.detail;
-  const detailTitle = meter ? `${meter[1]!} · ${meter[2]!}` : undefined;
+  if (calls.length === 0) {
+    return (
+      <div className="turn-quiet">
+        <span className="turn-index">#{item.index}</span>
+        <span className="turn-purpose" title={item.purpose}>
+          {purpose}
+        </span>
+        <span className="turn-detail" title={detailTitle}>
+          {detailText}
+        </span>
+        <span className="spacer" />
+        <span className="msg-time">{timeOf(item.at)}</span>
+      </div>
+    );
+  }
 
   return (
     <details className="turn" open={failed > 0}>
       <summary className="turn-head">
         <span className="turn-index">#{item.index}</span>
-        <span className="turn-purpose">{item.purpose}</span>
-        <span className="turn-detail" title={detailTitle}>{detailText}</span>
+        <span className="turn-purpose" title={item.purpose}>
+          {purpose}
+        </span>
+        <span className="turn-detail" title={detailTitle}>
+          {detailText}
+        </span>
         <span className="spacer" />
-        {calls.length > 0 && (
-          <span className={`turn-count ${failed > 0 ? 'bad' : ''}`}>
-            {calls.length} 次工具{failed > 0 ? ` · ${failed} 失败` : ''}
-          </span>
-        )}
-        <span className="turn-tools">{summary}</span>
+        <span className={`turn-count ${failed > 0 ? 'bad' : ''}`}>
+          {calls.length} 次工具{failed > 0 ? ` · ${failed} 失败` : ''}
+        </span>
+        <span className="turn-tools">
+          {[...new Set(calls.map((c) => toolNameText(c.toolName)))].join(' / ')}
+        </span>
         <span className="msg-time">{timeOf(item.at)}</span>
       </summary>
       <div className="turn-body">
@@ -591,6 +976,20 @@ function TerminalBlock({ call, at }: { call: ToolCallView; at: string }) {
         <RiskBadge risk={call.risk} />
         <code>{call.argsSummary}</code>
         <span className="spacer" />
+        {/*
+          终局的判别联合，不是布尔（不变式 5）。之前这里只有"成功/失败"徽章 ——
+          "退出码 1"、"被信号杀掉"、"超时"、"根本没起来"长得一模一样，
+          而这四种要采取的行动完全不同。commandResult 缺失（旧记录）时不猜，
+          仍然只显示徽章。
+        */}
+        {call.commandResult && (
+          <span
+            className={call.commandResult.outcome === 'EXIT_ZERO' ? 'ok' : 'err'}
+            title={call.commandResult.outcome}
+          >
+            {commandResultText(call.commandResult)}
+          </span>
+        )}
         {call.durationMs !== null && <span className="msg-time">{call.durationMs}ms</span>}
         <ResolutionBadge resolution={call.resolution} />
         <span className="msg-time">{timeOf(at)}</span>
@@ -628,16 +1027,6 @@ function PreviewFooter({ call }: { call: ToolCallView }) {
   );
 }
 
-/** 命令终局的词典（判别联合的六个终态说人话，raw 进 title —— v0.2 N7 同一红线） */
-const COMMAND_OUTCOME_TEXT: Record<string, string> = {
-  EXIT_ZERO: '退出 0',
-  EXIT_NONZERO: '非零退出',
-  SIGNAL: '被信号终止',
-  TIMEOUT: '超时',
-  CANCELLED: '已取消',
-  SPAWN_ERROR: '无法启动',
-};
-
 function CommandOutput({ outcome }: { outcome: CommandOutcome }) {
   const body = [outcome.stderrPreview, outcome.stdoutPreview].filter(Boolean).join('\n').trim();
   return (
@@ -646,7 +1035,7 @@ function CommandOutput({ outcome }: { outcome: CommandOutcome }) {
         <span className="term-prompt">$</span> {outcome.argv.join(' ') || outcome.commandId}
         <span className="spacer" />
         <span className={outcome.outcome === 'EXIT_ZERO' ? 'ok' : 'err'} title={outcome.outcome}>
-          {COMMAND_OUTCOME_TEXT[outcome.outcome] ?? outcome.outcome} · {outcome.durationMs}ms
+          {commandOutcomeText(outcome.outcome)} · {outcome.durationMs}ms
         </span>
       </div>
       {body && <TermOutput text={body} />}
@@ -662,7 +1051,10 @@ function ToolBlock({ call, at }: { call: ToolCallView; at: string }) {
     <details className="toolrow" open={isMutation || failed}>
       <summary>
         <RiskBadge risk={call.risk} />
-        <code>{call.toolName}</code>
+        {/* 说人话，raw 工具名进 title —— 与 RUN_STATUS_TEXT / RiskBadge 同一条规矩 */}
+        <span className="toolrow-name" title={call.toolName}>
+          {toolNameText(call.toolName)}
+        </span>
         <span style={{ color: 'var(--text-secondary)' }}>{call.argsSummary}</span>
         <span className="spacer" />
         {call.durationMs !== null && <span className="msg-time">{call.durationMs}ms</span>}

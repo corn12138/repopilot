@@ -8,7 +8,9 @@ import {
   type ModelRequest,
   type ModelResponse,
   type StopReason,
+  type StreamListener,
 } from './types';
+import { emitDelta, isDone, openSse, parseJsonFrame, readSse } from './stream';
 
 interface ChatToolCall {
   id?: string;
@@ -64,32 +66,10 @@ export const openAiWireAdapter: ModelAdapter = {
   wire: 'openai',
 
   async call(request: ModelRequest, ctx: AdapterCallContext): Promise<ModelResponse> {
-    const messages: WireMessage[] = [{ role: 'system', content: request.system }];
-    for (const m of request.messages) messages.push(...toWireMessages(m));
-
-    const body = {
-      model: ctx.modelId,
-      messages,
-      temperature: request.temperature,
-      max_tokens: request.maxOutputTokens,
-      ...(request.tools.length > 0
-        ? {
-            tools: request.tools.map((t) => ({
-              type: 'function' as const,
-              function: { name: t.name, description: t.description, parameters: t.parameters },
-            })),
-            tool_choice: 'auto' as const,
-          }
-        : {}),
-    };
-
     const raw = await fetchJson(`${ctx.baseUrl}/chat/completions`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${ctx.apiKey}`,
-      },
-      body: JSON.stringify(body),
+      headers: headersFor(ctx, false),
+      body: JSON.stringify(requestBody(request, ctx, false)),
       signal: ctx.signal,
     });
 
@@ -123,30 +103,167 @@ export const openAiWireAdapter: ModelAdapter = {
     return {
       content,
       stopReason: mapStop(choice.finish_reason, content),
-      /*
-       * 注意与 anthropic.ts 的**非对称性**：这里的 prompt_tokens 本来就是含缓存的
-       * 总输入（DeepSeek 官方：hit + miss == prompt_tokens；OpenAI：cached ⊂ prompt），
-       * 所以**不能**照搬 Anthropic 那边的求和 —— 那边的 input_tokens 明确不含缓存。
-       * 同理 cache_write 在这一侧是子集（OpenAI 官方算式
-       * ordinary = input − cached − cache_write），也不参与任何求和。
-       */
-      inputTokens: data.usage?.prompt_tokens ?? null,
-      outputTokens: data.usage?.completion_tokens ?? null,
-      cacheReadTokens: reportedTokens(
-        data.usage?.prompt_cache_hit_tokens, // DeepSeek / SiliconFlow
-        data.usage?.prompt_tokens_details?.cached_tokens, // OpenAI / 智谱 / 百炼 / 方舟 / xAI / OpenRouter
-        data.usage?.cached_tokens, // Moonshot：放在 usage 顶层，只认前两个会把它漏成"未回报"
-        data.usage?.cache_read_input_tokens, // 中转透传 Anthropic 口径的防御位
-      ),
-      cacheWriteTokens: reportedTokens(
-        data.usage?.prompt_tokens_details?.cache_write_tokens, // OpenAI / OpenRouter
-        data.usage?.cache_creation?.cache_creation_input_tokens, // 百炼显式缓存
-        data.usage?.cache_creation?.ephemeral_5m_input_tokens,
-        data.usage?.cache_creation_input_tokens, // 中转透传
-      ),
+      ...normalizeUsage(data.usage),
     };
   },
+
+  async stream(
+    request: ModelRequest,
+    ctx: AdapterCallContext,
+    onSignal: StreamListener,
+  ): Promise<ModelResponse> {
+    const res = await openSse(`${ctx.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: headersFor(ctx, true),
+      // stream_options 让 OpenAI 系在最后一帧补上 usage —— 不要的话整轮没有账本数字
+      body: JSON.stringify(requestBody(request, ctx, true)),
+      signal: ctx.signal,
+    });
+
+    let text = '';
+    let finish: string | undefined;
+    let usage: ChatResponse['usage'];
+    /*
+     * tool_calls 按 `index` 累积：函数名通常只在第一帧出现，
+     * `arguments` 分很多帧到达，必须拼完整再解析 —— 半截 JSON 会被当成畸形参数，
+     * 把一次本来正常的调用记成失败。
+     */
+    const calls = new Map<number, { id: string; name: string; args: string }>();
+
+    for await (const chunk of readSse(res)) {
+      if (isDone(chunk)) break;
+      const frame = parseJsonFrame(chunk);
+      if (!frame) continue;
+
+      const err = frame.error as { message?: string } | undefined;
+      if (err) {
+        throw new ModelCallError(err.message ?? '流中返回错误', 'BAD_REQUEST', null, {
+          sendState: 'SENT_OUTCOME_UNKNOWN',
+        });
+      }
+
+      // usage 可能出现在任意一帧（多数在最后一帧，choices 为空）
+      if (frame.usage) usage = frame.usage as ChatResponse['usage'];
+
+      const choice = (frame.choices as Array<Record<string, unknown>> | undefined)?.[0];
+      if (!choice) continue;
+      if (typeof choice.finish_reason === 'string') finish = choice.finish_reason;
+
+      const delta = choice.delta as
+        | { content?: string | null; tool_calls?: Array<Record<string, unknown>> }
+        | undefined;
+      if (typeof delta?.content === 'string' && delta.content) {
+        text += delta.content;
+        emitDelta(onSignal, delta.content);
+      }
+      for (const raw of delta?.tool_calls ?? []) {
+        const index = typeof raw.index === 'number' ? raw.index : 0;
+        const fn = raw.function as { name?: string; arguments?: string } | undefined;
+        const slot = calls.get(index) ?? { id: '', name: '', args: '' };
+        if (typeof raw.id === 'string' && raw.id) slot.id = raw.id;
+        if (fn?.name) slot.name = fn.name;
+        if (typeof fn?.arguments === 'string') slot.args += fn.arguments;
+        calls.set(index, slot);
+      }
+    }
+
+    const content: ContentBlock[] = [];
+    if (text.trim()) content.push({ type: 'text', text });
+    for (const index of [...calls.keys()].sort((a, b) => a - b)) {
+      const slot = calls.get(index)!;
+      // 没有函数名的槽位不是工具调用，是没拼完的噪声 —— 不硬造一个调用出来
+      if (!slot.name) continue;
+      content.push({
+        type: 'tool_use',
+        id: slot.id || `call_${index}`,
+        name: slot.name,
+        input: parseToolArguments(slot.args),
+      });
+    }
+
+    return { content, stopReason: mapStop(finish, content), ...normalizeUsage(usage) };
+  },
 };
+
+/** 请求体。流式与非流式只差 `stream`/`stream_options`，其余逐字段相同 —— 分开写必漂。 */
+function requestBody(request: ModelRequest, ctx: AdapterCallContext, stream: boolean): unknown {
+  const messages: WireMessage[] = [{ role: 'system', content: request.system }];
+  for (const m of request.messages) messages.push(...toWireMessages(m));
+  return {
+    model: ctx.modelId,
+    messages,
+    temperature: request.temperature,
+    max_tokens: request.maxOutputTokens,
+    ...(request.tools.length > 0
+      ? {
+          tools: request.tools.map((t) => ({
+            type: 'function' as const,
+            function: { name: t.name, description: t.description, parameters: t.parameters },
+          })),
+          tool_choice: 'auto' as const,
+        }
+      : {}),
+    /*
+     * `include_usage` 不加的话，OpenAI 系流式**整轮都不回报 usage** ——
+     * 账本会把每一轮都记成"未知用量轮"，预算止损随之失灵。
+     * 不认识这个字段的兼容端会忽略它（它在 stream_options 下，不是顶层未知字段）。
+     */
+    ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
+  };
+}
+
+function headersFor(ctx: AdapterCallContext, stream: boolean): Record<string, string> {
+  return {
+    'content-type': 'application/json',
+    authorization: `Bearer ${ctx.apiKey}`,
+    ...(stream ? { accept: 'text/event-stream' } : {}),
+  };
+}
+
+/**
+ * 工具参数解析。与非流式同一条底线：**不做 JSON 修复、不 fallback 成 `{}`** ——
+ * 畸形参数原样上报，由 Tool Gateway 的 schema 校验判成 FAILED（PRD-RUN-002）。
+ */
+function parseToolArguments(raw: string): unknown {
+  if (!raw.trim()) return {};
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return { __malformed_arguments__: raw.slice(0, 500) };
+  }
+}
+
+/*
+ * 缓存口径的归一化。流式与非流式共用这一份 —— 复制会漂，而漂的后果是
+ * 账本少报或多报实际计费构成。
+ *
+ * 注意与 anthropic.ts 的**非对称性**：这里的 prompt_tokens 本来就是含缓存的
+ * 总输入（DeepSeek 官方：hit + miss == prompt_tokens；OpenAI：cached ⊂ prompt），
+ * 所以**不能**照搬 Anthropic 那边的求和 —— 那边的 input_tokens 明确不含缓存。
+ * 同理 cache_write 在这一侧是子集（OpenAI 官方算式
+ * ordinary = input − cached − cache_write），也不参与任何求和。
+ */
+function normalizeUsage(usage: ChatResponse['usage']): Pick<
+  ModelResponse,
+  'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'
+> {
+  return {
+    inputTokens: usage?.prompt_tokens ?? null,
+    outputTokens: usage?.completion_tokens ?? null,
+    cacheReadTokens: reportedTokens(
+      usage?.prompt_cache_hit_tokens, // DeepSeek / SiliconFlow
+      usage?.prompt_tokens_details?.cached_tokens, // OpenAI / 智谱 / 百炼 / 方舟 / xAI / OpenRouter
+      usage?.cached_tokens, // Moonshot：放在 usage 顶层，只认前两个会把它漏成"未回报"
+      usage?.cache_read_input_tokens, // 中转透传 Anthropic 口径的防御位
+    ),
+    cacheWriteTokens: reportedTokens(
+      usage?.prompt_tokens_details?.cache_write_tokens, // OpenAI / OpenRouter
+      usage?.cache_creation?.cache_creation_input_tokens, // 百炼显式缓存
+      usage?.cache_creation?.ephemeral_5m_input_tokens,
+      usage?.cache_creation_input_tokens, // 中转透传
+    ),
+  };
+}
 
 /**
  * 从多个候选字段里取"provider 真的回报了的那个数"。

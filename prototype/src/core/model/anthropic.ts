@@ -6,7 +6,10 @@ import {
   type ModelRequest,
   type ModelResponse,
   type StopReason,
+  type StreamListener,
 } from './types';
+import { causeCode, httpErrorKind, parseRetryAfterMs, sendStateForNetworkError, summarizeError } from './http';
+import { emitDelta, openSse, parseJsonFrame, readSse } from './stream';
 
 interface AnthropicBlock {
   type: string;
@@ -29,38 +32,47 @@ interface AnthropicResponse {
   error?: { type?: string; message?: string };
 }
 
+/** 请求体。流式与非流式只差一个 `stream` 开关，其余逐字段相同 —— 分开写必漂。 */
+function requestBody(request: ModelRequest, ctx: AdapterCallContext, stream: boolean): unknown {
+  return {
+    model: ctx.modelId,
+    max_tokens: request.maxOutputTokens,
+    temperature: request.temperature,
+    system: request.system,
+    messages: request.messages.map((m) => ({
+      role: m.role,
+      content: m.content.map(toAnthropicBlock),
+    })),
+    ...(request.tools.length > 0
+      ? {
+          tools: request.tools.map((t) => ({
+            name: t.name,
+            description: t.description,
+            input_schema: t.parameters,
+          })),
+        }
+      : {}),
+    ...(stream ? { stream: true } : {}),
+  };
+}
+
+function headersFor(ctx: AdapterCallContext, stream: boolean): Record<string, string> {
+  return {
+    'content-type': 'application/json',
+    'x-api-key': ctx.apiKey,
+    'anthropic-version': '2023-06-01',
+    ...(stream ? { accept: 'text/event-stream' } : {}),
+  };
+}
+
 export const anthropicAdapter: ModelAdapter = {
   wire: 'anthropic',
 
   async call(request: ModelRequest, ctx: AdapterCallContext): Promise<ModelResponse> {
-    const body = {
-      model: ctx.modelId,
-      max_tokens: request.maxOutputTokens,
-      temperature: request.temperature,
-      system: request.system,
-      messages: request.messages.map((m) => ({
-        role: m.role,
-        content: m.content.map(toAnthropicBlock),
-      })),
-      ...(request.tools.length > 0
-        ? {
-            tools: request.tools.map((t) => ({
-              name: t.name,
-              description: t.description,
-              input_schema: t.parameters,
-            })),
-          }
-        : {}),
-    };
-
     const res = await fetchJson(`${ctx.baseUrl}/messages`, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': ctx.apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(body),
+      headers: headersFor(ctx, false),
+      body: JSON.stringify(requestBody(request, ctx, false)),
       signal: ctx.signal,
     });
 
@@ -100,20 +112,139 @@ export const anthropicAdapter: ModelAdapter = {
      * 没有活动就没有这部分 token。但**对外报告的 cacheReadTokens 仍保留 null**
      * （未回报 ≠ 命中 0）—— 求和用的 0 和展示用的"未知"是两件事。
      */
-    const cacheRead = data.usage?.cache_read_input_tokens ?? null;
-    const cacheWrite = data.usage?.cache_creation_input_tokens ?? null;
-    const rawInput = data.usage?.input_tokens ?? null;
-
     return {
       content,
       stopReason: mapStop(data.stop_reason),
-      inputTokens: rawInput === null ? null : rawInput + (cacheRead ?? 0) + (cacheWrite ?? 0),
-      outputTokens: data.usage?.output_tokens ?? null,
-      cacheReadTokens: cacheRead,
-      cacheWriteTokens: cacheWrite,
+      ...normalizeUsage(data.usage),
     };
   },
+
+  async stream(
+    request: ModelRequest,
+    ctx: AdapterCallContext,
+    onSignal: StreamListener,
+  ): Promise<ModelResponse> {
+    const res = await openSse(`${ctx.baseUrl}/messages`, {
+      method: 'POST',
+      headers: headersFor(ctx, true),
+      body: JSON.stringify(requestBody(request, ctx, true)),
+      signal: ctx.signal,
+    });
+
+    /*
+     * 按 index 重建内容块。Anthropic 的流是「块开始 → 若干增量 → 块结束」，
+     * 工具参数以 `input_json_delta.partial_json` 分片到达，必须**拼完整**再解析：
+     * 半截 JSON 解析失败就当成畸形参数上报，那会把一次本来正常的调用记成失败。
+     */
+    const blocks = new Map<number, { type: string; id?: string; name?: string; text: string; json: string }>();
+    let stopReason: string | undefined;
+    const usage: NonNullable<AnthropicResponse['usage']> = {};
+    let sawError: string | null = null;
+
+    for await (const chunk of readSse(res)) {
+      const frame = parseJsonFrame(chunk);
+      if (!frame) continue;
+      const type = String(frame.type ?? chunk.event ?? '');
+
+      if (type === 'error') {
+        const err = frame.error as { message?: string } | undefined;
+        sawError = err?.message ?? 'Anthropic 流中返回错误';
+        break;
+      }
+
+      if (type === 'message_start') {
+        const message = frame.message as { usage?: AnthropicResponse['usage'] } | undefined;
+        Object.assign(usage, message?.usage ?? {});
+        continue;
+      }
+
+      if (type === 'content_block_start') {
+        const index = Number(frame.index ?? 0);
+        const block = frame.content_block as AnthropicBlock | undefined;
+        blocks.set(index, {
+          type: String(block?.type ?? 'text'),
+          ...(block?.id ? { id: block.id } : {}),
+          ...(block?.name ? { name: block.name } : {}),
+          text: typeof block?.text === 'string' ? block.text : '',
+          json: '',
+        });
+        continue;
+      }
+
+      if (type === 'content_block_delta') {
+        const index = Number(frame.index ?? 0);
+        const slot = blocks.get(index);
+        if (!slot) continue;
+        const delta = frame.delta as { type?: string; text?: string; partial_json?: string } | undefined;
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+          slot.text += delta.text;
+          emitDelta(onSignal, delta.text);
+        } else if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+          slot.json += delta.partial_json;
+        }
+        continue;
+      }
+
+      if (type === 'message_delta') {
+        const delta = frame.delta as { stop_reason?: string } | undefined;
+        if (delta?.stop_reason) stopReason = delta.stop_reason;
+        // 输出 token 只在这一帧给出；输入 token 在 message_start
+        Object.assign(usage, (frame.usage as AnthropicResponse['usage']) ?? {});
+        continue;
+      }
+    }
+
+    if (sawError) throw new ModelCallError(sawError, 'BAD_REQUEST', null, { sendState: 'SENT_OUTCOME_UNKNOWN' });
+
+    const content: ContentBlock[] = [];
+    for (const index of [...blocks.keys()].sort((a, b) => a - b)) {
+      const slot = blocks.get(index)!;
+      if (slot.type === 'text') {
+        if (slot.text) content.push({ type: 'text', text: slot.text });
+      } else if (slot.type === 'tool_use' && slot.id && slot.name) {
+        content.push({ type: 'tool_use', id: slot.id, name: slot.name, input: parseToolInput(slot.json) });
+      }
+    }
+
+    return { content, stopReason: mapStop(stopReason), ...normalizeUsage(usage) };
+  },
 };
+
+/**
+ * 工具参数按分片拼回来之后再解析。
+ *
+ * 与非流式同一条底线：**不做 JSON 修复、不 fallback 成 `{}`** —— 畸形参数原样上报，
+ * 由 Tool Gateway 的 schema 校验判成 FAILED（PRD-RUN-002）。悄悄补成空对象
+ * 会让一次参数错误变成一次"参数为空的正常调用"。
+ */
+function parseToolInput(json: string): unknown {
+  if (!json.trim()) return {};
+  try {
+    return JSON.parse(json) as unknown;
+  } catch {
+    return { __malformed_arguments__: json.slice(0, 500) };
+  }
+}
+
+/*
+ * ⚠️ Anthropic 的 input_tokens 与 OpenAI 的 prompt_tokens **语义相反** ——
+ * 详见 call() 里那段长注释。归一化只有这一处实现：流式与非流式共用，
+ * 复制一份就会漂，而漂的后果是预算止损失灵。
+ */
+function normalizeUsage(usage: AnthropicResponse['usage']): Pick<
+  ModelResponse,
+  'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'
+> {
+  const cacheRead = usage?.cache_read_input_tokens ?? null;
+  const cacheWrite = usage?.cache_creation_input_tokens ?? null;
+  const rawInput = usage?.input_tokens ?? null;
+  return {
+    inputTokens: rawInput === null ? null : rawInput + (cacheRead ?? 0) + (cacheWrite ?? 0),
+    outputTokens: usage?.output_tokens ?? null,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
+  };
+}
 
 function toAnthropicBlock(block: ContentBlock): unknown {
   switch (block.type) {
@@ -153,26 +284,6 @@ function mapStop(reason: string | undefined): StopReason {
  * "发出去了但结局不明"处理：provider 可能已经执行并计费，默认不可重发。
  * 对应 TD model-invocation §4：BEFORE_BYTES 可重试，AFTER_BYTES_UNKNOWN 默认禁止。
  */
-const NOT_SENT_CODES = new Set([
-  'ECONNREFUSED',
-  'ENOTFOUND',
-  'EAI_AGAIN',
-  'ENETUNREACH',
-  'EHOSTUNREACH',
-  'UND_ERR_CONNECT_TIMEOUT',
-  // TLS 握手失败也没把请求发出去；能不能靠重试恢复由 retry 层另行判断
-  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
-  'DEPTH_ZERO_SELF_SIGNED_CERT',
-  'CERT_HAS_EXPIRED',
-  'ERR_TLS_CERT_ALTNAME_INVALID',
-]);
-
-function causeCode(err: unknown): string {
-  const e = err as { cause?: { code?: unknown }; code?: unknown };
-  const c = e?.cause?.code ?? e?.code;
-  return typeof c === 'string' ? c : '';
-}
-
 export async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
   let res: Response;
   try {
@@ -191,12 +302,11 @@ export async function fetchJson(url: string, init: RequestInit): Promise<unknown
     }
     if (e.name === 'AbortError') throw new ModelCallError('调用已取消', 'CANCELLED');
     const code = causeCode(err);
-    const sendState = NOT_SENT_CODES.has(code) ? 'NOT_SENT' : 'SENT_OUTCOME_UNKNOWN';
     throw new ModelCallError(
       `网络错误: ${e.message}${code ? ` (${code})` : ''}`,
       'NETWORK',
       null,
-      { sendState },
+      { sendState: sendStateForNetworkError(err) },
     );
   }
 
@@ -211,18 +321,12 @@ export async function fetchJson(url: string, init: RequestInit): Promise<unknown
   }
 
   if (!res.ok) {
-    const kind =
-      res.status === 401 || res.status === 403
-        ? 'AUTH'
-        : res.status === 429
-          ? 'RATE_LIMIT'
-          : res.status >= 500
-            ? 'SERVER'
-            : 'BAD_REQUEST';
-    // 只回传状态与 provider 的错误摘要，不把整个请求体或 header 带出去
-    throw new ModelCallError(`HTTP ${res.status}: ${summarizeError(text)}`, kind, res.status, {
-      retryAfterMs: parseRetryAfterMs(res.headers.get('retry-after')),
-    });
+    throw new ModelCallError(
+      `HTTP ${res.status}: ${summarizeError(text)}`,
+      httpErrorKind(res.status),
+      res.status,
+      { retryAfterMs: parseRetryAfterMs(res.headers.get('retry-after')) },
+    );
   }
 
   try {
@@ -232,20 +336,4 @@ export async function fetchJson(url: string, init: RequestInit): Promise<unknown
   }
 }
 
-/** 只认秒数形式；HTTP-date 形式少见且时钟相关，解析不出就交给指数退避 */
-export function parseRetryAfterMs(header: string | null): number | null {
-  if (!header) return null;
-  const seconds = Number(header.trim());
-  if (!Number.isFinite(seconds) || seconds < 0) return null;
-  return Math.round(seconds * 1000);
-}
 
-function summarizeError(text: string): string {
-  try {
-    const parsed = JSON.parse(text) as { error?: { message?: string } | string; message?: string };
-    if (typeof parsed.error === 'string') return parsed.error.slice(0, 300);
-    return (parsed.error?.message ?? parsed.message ?? text).slice(0, 300);
-  } catch {
-    return text.slice(0, 300);
-  }
-}

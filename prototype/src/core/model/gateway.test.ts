@@ -317,6 +317,66 @@ describe('invoke: 有界同 route 重试 + 单次尝试超时', () => {
     expect(err.manifest.errorKind).toBe('CANCELLED');
     expect(fn).toHaveBeenCalledTimes(1);
   });
+
+  /**
+   * 流式路径的重试语义。
+   *
+   * 这里钉的不是"能不能流"，是**一次尝试作废时界面上那半截文本会怎样**：
+   * 不撤回的话，重试成功后新旧两段会首尾相接，而前一段是模型没有完成的输出；
+   * 最终失败时更糟 —— 界面留着半句话，看起来像模型说过。
+   */
+  describe('流式：作废的尝试必须撤回已推出去的增量', () => {
+    const sse = (body: string): Response =>
+      new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+
+    const SSE_OK =
+      'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n' +
+      'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}\n\n' +
+      'data: [DONE]\n\n';
+
+    it('给了 onStream 就走流式，增量按序到达，权威结果与非流式同构', async () => {
+      scriptFetch([sse(SSE_OK)]);
+      const gw = new ModelGateway(FAST);
+      const signals: Array<{ kind: string; text?: string; reason?: string }> = [];
+
+      const out = await gw.invoke({ ...makeInput(gw), onStream: (s) => signals.push(s) });
+
+      expect(signals).toEqual([{ kind: 'delta', text: 'ok' }]);
+      expect(out.response.content).toEqual([{ type: 'text', text: 'ok' }]);
+      // 账本数字照常 —— 流式不能把每一轮都变成"未知用量轮"
+      expect(out.manifest.inputTokens).toBe(3);
+      expect(out.manifest.outputTokens).toBe(5);
+    });
+
+    it('第一次连接被拒 → 重试前先 reset，第二次的增量不会接在废文本后面', async () => {
+      scriptFetch([connRefused(), sse(SSE_OK)]);
+      const gw = new ModelGateway(FAST);
+      const signals: Array<{ kind: string; text?: string; reason?: string }> = [];
+
+      await gw.invoke({ ...makeInput(gw), onStream: (s) => signals.push(s) });
+
+      expect(signals.map((s) => s.kind)).toEqual(['reset', 'delta']);
+    });
+
+    it('最终失败也 reset —— 半截文本不许留在界面上冒充模型说过的话', async () => {
+      scriptFetch([http(503)]);
+      const gw = new ModelGateway(FAST);
+      const signals: Array<{ kind: string; reason?: string }> = [];
+
+      await gw.invoke({ ...makeInput(gw), onStream: (s) => signals.push(s) }).catch(() => {});
+
+      expect(signals.every((s) => s.kind === 'reset')).toBe(true);
+      expect(signals.length).toBeGreaterThan(0);
+    });
+
+    it('不给 onStream 就不走流式：请求体里没有 stream 开关', async () => {
+      const fetchMock = scriptFetch([ok()]);
+      const gw = new ModelGateway(FAST);
+      await gw.invoke(makeInput(gw));
+      const body = JSON.parse(String(fetchMock.mock.calls[0]![1]!.body)) as Record<string, unknown>;
+      expect(body.stream).toBeUndefined();
+    });
+  });
 });
 
 describe('retry 策略纯函数：什么能重试、等多久', () => {

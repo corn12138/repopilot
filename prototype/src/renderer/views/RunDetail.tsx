@@ -43,6 +43,7 @@ export function RunDetail({
   onError,
   onRefresh,
   onOpenDiff,
+  liveText = '',
 }: {
   run: RunView;
   events: RunEvent[];
@@ -58,6 +59,11 @@ export function RunDetail({
   onRefresh: () => void;
   /** 在编辑器里打开补丁文件的 diff（v0.2 P2）；不接线则补丁卡不显示该入口 */
   onOpenDiff?: (file: { path: string; diff: string; truncated: boolean }) => void;
+  /**
+   * 模型正文的实时缓冲（易失，不属于事件流）。模型这一轮返回之后由 App 清空，
+   * 持久记录以 ASSISTANT_MESSAGE 接手 —— 所以它不会和事件里的同一段话并存。
+   */
+  liveText?: string;
 }) {
   const [showRaw, setShowRaw] = useState(false);
   const active = !TERMINAL_RUN_STATUSES.includes(run.status);
@@ -308,7 +314,7 @@ export function RunDetail({
             {events.length === 0 && <div className="empty">暂无事件</div>}
           </div>
         ) : (
-          <Transcript events={events} toolCalls={toolCalls} />
+          <Transcript events={events} toolCalls={toolCalls} runStatus={run.status} liveText={liveText} />
         )}
       </Card>
     </div>
