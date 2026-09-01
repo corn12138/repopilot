@@ -2264,6 +2264,18 @@ select:focus-visible {
  * 加一段列不可用原因的长 help —— 收起来,但 summary 上报数（不变式 8）。
  * 选中外部作者时默认展开:那时它不再是可忽略的东西。
  */
+/* 「允许修改的路径」的事前命中数：0 命中用警示色 —— 那是最值得说的一条 */
+.path-hits {
+  margin-top: 4px;
+}
+.path-hits code {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.path-hits-none {
+  color: var(--state-warning-fg);
+}
+
 .author-external {
   margin: 4px 0 0;
 }

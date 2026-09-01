@@ -162,6 +162,17 @@ beforeEach(() => {
   callMock.mockReset();
   callMock.mockImplementation(async (method: string, payload: Record<string, unknown>) => {
     if (method === 'crossreview.reviewers') return { reviewers };
+    if (method === 'files.tree') {
+      return {
+        entries: [
+          { path: 'src/app.ts', bytes: 10, changed: false },
+          { path: 'src/lib/util.ts', bytes: 10, changed: false },
+          { path: 'docs/readme.md', bytes: 10, changed: false },
+        ],
+        source: 'SNAPSHOT',
+        generation: null,
+      };
+    }
     if (method === 'egress.disclosure') return { disclosure: disclosureFor(payload) };
     if (method === 'task.create') return { run: { runId: 'run-1' } };
     throw new Error(`unexpected ${method}`);
@@ -308,5 +319,53 @@ describe('出站披露与同意：不点头不能发；目的地一变同意作�
     );
     expect(screen.queryByRole('checkbox', { name: /我确认/ })).toBeNull();
     expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe('允许修改的路径：事前报命中数，但不拦提交', () => {
+  it('0 命中要当场说出来 —— 不该等模型改到一半被整笔拒才知道', async () => {
+    render(composer());
+    await openOptions();
+
+    const input = screen.getByPlaceholderText(/留空 = 整个仓库都可改/);
+    fireEvent.change(input, { target: { value: 'lib/**' } });
+
+    // 快照里只有 src/** 与 docs/**，lib/** 一个都不匹配
+    expect(await screen.findByText(/匹配这份快照里的 0 个文件/)).toBeTruthy();
+  });
+
+  it('命中数用的是 Core 门禁那同一份 globMatch —— `*` 不跨目录', async () => {
+    /*
+     * 这条是这个提示存在的前提：界面若另写一份规则，会出现"提示说匹配上了、
+     * 跑起来却 PATH_NOT_ALLOWED"。所以刻意挑一个能区分两种实现的用例 ——
+     * `src/*` 只匹配 src 下一级（src/app.ts），不匹配 src/lib/util.ts。
+     */
+    render(composer());
+    await openOptions();
+
+    const input = screen.getByPlaceholderText(/留空 = 整个仓库都可改/);
+    fireEvent.change(input, { target: { value: 'src/*' } });
+    expect(await screen.findByText(/匹配 1 个文件/)).toBeTruthy();
+
+    // 对照：src/** 跨目录，两个都算
+    fireEvent.change(input, { target: { value: 'src/**' } });
+    expect(await screen.findByText(/匹配 2 个文件/)).toBeTruthy();
+  });
+
+  it('填了匹配不到的路径仍然可以提交 —— 这是提示，不是门禁', async () => {
+    render(composer());
+    await openOptions();
+    fireEvent.change(screen.getByPlaceholderText(/留空 = 整个仓库都可改/), {
+      target: { value: 'lib/**' },
+    });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
+    fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
+    await consent();
+
+    /*
+     * 任务选项的既定原则是"锦上添花，不设置就必须不干扰" —— 那也意味着
+     * 填得不好不该拦人：用户可能故意写一条为将来准备的路径。
+     */
+    expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(false);
   });
 });

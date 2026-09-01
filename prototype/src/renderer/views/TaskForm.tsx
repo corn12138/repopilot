@@ -10,6 +10,7 @@ import type { DataEgressDisclosure } from '@shared/domain';
 import type { ResponsePayload, ReviewerOption } from '@shared/protocol';
 
 type CommandClassification = ResponsePayload<'command.classify'>;
+import { globMatch } from '@shared/glob';
 import { RequestError, call } from '../bridge';
 
 const DATA_CLASS_LABEL: Record<string, string> = {
@@ -104,10 +105,34 @@ export function Composer({
       cancelled = true;
     };
   }, []);
+  /**
+   * 快照的文件清单，用于对「允许修改的路径」做**事前**命中数试算。
+   *
+   * 懒加载：只在任务选项弹层第一次打开时拉一次。这份清单不随输入变化，
+   * 所以不需要防抖 —— 每次按键只是在内存里跑一遍 glob，代价可以忽略。
+   * 拉失败不影响任何事：拿不到清单就不显示提示（少一条帮助，不是多一个错误）。
+   */
+  const [snapshotPaths, setSnapshotPaths] = useState<readonly string[] | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [customCommand, setCustomCommand] = useState('');
   const [useCustom, setUseCustom] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  useEffect(() => {
+    if (!advancedOpen || snapshotPaths !== null) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await call('files.tree', { snapshotId: snapshot.snapshotId });
+        if (!cancelled) setSnapshotPaths(res.entries.map((e) => e.path));
+      } catch {
+        // 拿不到清单就不给提示 —— 这是锦上添花，不该变成一条错误
+        if (!cancelled) setSnapshotPaths([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [advancedOpen, snapshotPaths, snapshot.snapshotId]);
   /** 快照已被清理回收 —— 提交时才发现，就地自救 */
   const [staleSnapshot, setStaleSnapshot] = useState(false);
   const boxRef = useRef<HTMLTextAreaElement>(null);
@@ -246,6 +271,26 @@ export function Composer({
     if (authorOption) out.push({ label: '作者', value: `${authorOption.label}（外部 CLI）` });
     return out;
   }, [hasCustom, customCommand, allowedPaths, acceptance, reviewerProfileId, reviewerResolved, authorOption]);
+
+  /**
+   * 逐条 glob 的命中数。
+   *
+   * 用的是 Core 门禁那**同一个** globMatch（已搬到 shared/）—— 在界面里另写一份
+   * 的话，会出现"提示说匹配上了、跑起来却 PATH_NOT_ALLOWED"，那比没有提示更糟。
+   *
+   * 这只是提示，**不是门禁**：`canSubmit` 一个字都没动。任务选项的既定原则是
+   * "锦上添花，不设置就必须不干扰"，那也意味着填得不好不该拦住人 ——
+   * 用户可能故意写一条为将来准备的路径。我们只负责如实说"它现在匹配 0 个文件"。
+   */
+  const pathHits = useMemo(() => {
+    if (snapshotPaths === null) return null;
+    const patterns = allowedPaths.split(/[,\n]/).map((p) => p.trim()).filter(Boolean);
+    if (patterns.length === 0) return null;
+    return patterns.map((pattern) => ({
+      pattern,
+      hits: snapshotPaths.filter((path) => globMatch(pattern, path)).length,
+    }));
+  }, [allowedPaths, snapshotPaths]);
 
   const canSubmit =
     goal.trim().length > 0 &&
@@ -612,6 +657,26 @@ export function Composer({
                 <div className="help">
                   逗号或换行分隔。无论填不填，受保护路径（{profile.protectedPaths.slice(0, 3).join(', ')}…）都禁止修改。
                 </div>
+                {/*
+                  事前把 PATH_NOT_ALLOWED 提前到"填的时候"。
+                  0 命中是最值得说的一条：写了 src/** 而仓库根本没有 src/ 时，
+                  以前要等模型改到一半被整笔拒才知道。
+                */}
+                {pathHits && (
+                  <div className="help path-hits">
+                    {pathHits.map(({ pattern, hits }) => (
+                      <div key={pattern} className={hits === 0 ? 'path-hits-none' : undefined}>
+                        <code>{pattern}</code> —{' '}
+                        {hits === 0
+                          ? '匹配这份快照里的 0 个文件（是不是想写 src/** ？）'
+                          : `匹配 ${hits} 个文件`}
+                      </div>
+                    ))}
+                    <div>
+                      这只是提示，不拦你提交 —— 快照共 {snapshotPaths?.length ?? 0} 个文件。
+                    </div>
+                  </div>
+                )}
               </div>
 
 

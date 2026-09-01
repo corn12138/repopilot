@@ -8,6 +8,13 @@ import type {
   MutationResult,
 } from '@shared/domain';
 import { sha256 } from '@shared/ids';
+/*
+ * glob 匹配搬到了 shared/：Renderer 的「允许修改的路径」事前试算要用同一份规则。
+ * 这里原样再导出，既有引用点（coverage / tools / 测试）不必改路径，
+ * 但**实现只有一处** —— 两份规则漂移的后果是界面说匹配、Core 说不允许。
+ */
+export { globMatch } from '@shared/glob';
+import { globMatch } from '@shared/glob';
 import { MaterializedWorkspace, PathViolation, fileDigestAt, resolveManaged } from './workspace';
 
 export interface MutationPolicy {
@@ -292,35 +299,6 @@ function blocked(reason: MutationBlockReason, detail: string, gen: number): Muta
 }
 
 /** 极简 glob：支持 `**\/`、`**`、`*` 与精确匹配 */
-export function globMatch(pattern: string, path: string): boolean {
-  if (pattern === '**') return true;
-  let re = '';
-  let i = 0;
-  while (i < pattern.length) {
-    const ch = pattern[i]!;
-    if (ch === '*') {
-      if (pattern[i + 1] === '*') {
-        if (pattern[i + 2] === '/') {
-          re += '(?:.*/)?';
-          i += 3;
-        } else {
-          re += '.*';
-          i += 2;
-        }
-      } else {
-        re += '[^/]*';
-        i += 1;
-      }
-    } else if ('.+^${}()|[]\\?'.includes(ch)) {
-      re += `\\${ch}`;
-      i += 1;
-    } else {
-      re += ch;
-      i += 1;
-    }
-  }
-  return new RegExp(`^${re}$`).test(path);
-}
 
 function isAllowed(path: string, allowed: readonly string[]): boolean {
   if (allowed.length === 0) return false;
