@@ -219,8 +219,35 @@ describe('外部作者与外部 CLI 审核方：可达且传对字段', () => {
     fireEvent.click(screen.getByRole('button', { name: /Codex · 0\.1（CLI）/ }));
     fireEvent.click(screen.getByRole('button', { name: /Codex · 0\.1$/ })); // 再把它选成作者
     expect(screen.queryByRole('button', { name: /Codex · 0\.1（CLI）/ })).toBeNull();
-    const reviewerBox = screen.getAllByRole('textbox').find((t) => (t as HTMLTextAreaElement).placeholder.includes('审核方'));
-    expect((reviewerBox as HTMLTextAreaElement).value).toBe('');
+    /*
+     * 审核选择确实被清掉了 —— 现在的判据是 off 态 chip 回到选中,
+     * 而不是去读一个自由文本框的 value（那个 textarea 已经退役:
+     * 取值集合本来就等于这排 chips,自由文本唯一的增量是"多行"和"拼错"
+     * 两类必被拒的输入）。
+     */
+    const offChip = screen.getByRole('button', { name: '不做交叉审核（默认）' });
+    expect(offChip.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('审核方 chip 可以点回来 —— 选了不是就关不掉了', async () => {
+    /*
+     * 旧控件的实际缺陷：chips 挂了 aria-pressed 宣称自己是开关,却只赋值不切换。
+     * 选中之后除了手动去 textarea 里删字,没有任何关闭路径 —— 而 textarea
+     * 正是这次要退役的东西。所以 off 态必须先存在,再谈删 textarea。
+     */
+    render(composer());
+    await openOptions();
+    const off = () => screen.getByRole('button', { name: '不做交叉审核（默认）' });
+    expect(off().getAttribute('aria-pressed')).toBe('true');
+
+    fireEvent.click(screen.getByRole('button', { name: /Codex · 0\.1（CLI）/ }));
+    expect(off().getAttribute('aria-pressed')).toBe('false');
+
+    fireEvent.click(off());
+    expect(off().getAttribute('aria-pressed')).toBe('true');
+    expect(
+      screen.getByRole('button', { name: /Codex · 0\.1（CLI）/ }).getAttribute('aria-pressed'),
+    ).toBe('false');
   });
 });
 

@@ -2259,6 +2259,25 @@ select:focus-visible {
   font-size: 10px;
   color: var(--text-tertiary);
 }
+/*
+ * 任务选项里的「外部作者」折叠层。几乎没人会用它,却无条件铺开三个 chip
+ * 加一段列不可用原因的长 help —— 收起来,但 summary 上报数（不变式 8）。
+ * 选中外部作者时默认展开:那时它不再是可忽略的东西。
+ */
+.author-external {
+  margin: 4px 0 0;
+}
+.author-external > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  padding: 2px 0;
+  list-style-position: inside;
+}
+.author-external > summary:hover {
+  color: var(--text-secondary);
+}
+
 .run-history {
   margin: 2px 0 4px;
 }

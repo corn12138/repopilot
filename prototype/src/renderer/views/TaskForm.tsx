@@ -5,9 +5,7 @@ import type {
   RepositoryHarnessProfile,
   RepositorySnapshot,
   RunView,
-  TaskClass,
 } from '@shared/domain';
-import { COMMON_TASK_CLASSES } from '@shared/domain';
 import type { DataEgressDisclosure } from '@shared/domain';
 import type { ResponsePayload, ReviewerOption } from '@shared/protocol';
 
@@ -21,13 +19,6 @@ const DATA_CLASS_LABEL: Record<string, string> = {
   PATCH_DIFF: '补丁 diff',
   REVIEW_FINDINGS: '审核发现',
   REPOSITORY_FULL_COPY_VIA_CLI: '整个仓库的一次性副本（CLI 可读取其中任何文件）',
-};
-
-/** 常见值的中文说明，仅用于 datalist 的提示文案 —— 不是可选项清单 */
-const TASK_CLASS_HINT: Record<string, string> = {
-  BUILD_FAILURE_FIX: '构建失败修复',
-  TEST_FAILURE_FIX: '测试失败修复',
-  TYPE_ERROR_FIX: '类型错误修复',
 };
 
 /**
@@ -68,8 +59,6 @@ export function Composer({
   const commandIds = useMemo(() => Object.keys(profile.commands), [profile]);
 
   const [goal, setGoal] = useState('');
-  // 默认留空：它不设门禁也不进提示词，预填一个值只会让人以为"必须选一个"
-  const [taskClass, setTaskClass] = useState<TaskClass>('');
   /**
    * 默认为空 = 整个仓库都可改（受保护路径除外）。
    * 以前默认 'src/**'：用户什么都没选，却被一条看不见的规则收窄了范围 ——
@@ -247,7 +236,6 @@ export function Composer({
    */
   const configured = useMemo(() => {
     const out: Array<{ label: string; value: string }> = [];
-    if (taskClass.trim()) out.push({ label: '任务类型', value: taskClass.trim() });
     if (hasCustom) out.push({ label: '自定义命令', value: customCommand.trim() });
     if (allowedPaths.trim()) out.push({ label: '限定路径', value: allowedPaths.trim() });
     const acc = acceptance.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -257,7 +245,7 @@ export function Composer({
     }
     if (authorOption) out.push({ label: '作者', value: `${authorOption.label}（外部 CLI）` });
     return out;
-  }, [taskClass, hasCustom, customCommand, allowedPaths, acceptance, reviewerProfileId, reviewerResolved, authorOption]);
+  }, [hasCustom, customCommand, allowedPaths, acceptance, reviewerProfileId, reviewerResolved, authorOption]);
 
   const canSubmit =
     goal.trim().length > 0 &&
@@ -295,7 +283,13 @@ export function Composer({
         profileId: profile.profileId,
         modelProfileId: effectiveModelId,
         goal: goal.trim(),
-        taskClass,
+        /*
+         * 字段保留、UI 删除。taskClass 在 Core 里**只被写入、从无读取**
+         * （ipcContract 自陈"不设门禁、不进提示词"），是一个纯装饰的输入框,
+         * 却占着弹层第一位和最大版面。从合同里摘掉要动 protocol / ipcContract /
+         * authority / eval 四处白名单,收益全在 UI 侧 —— 不值得,所以固定传空串。
+         */
+        taskClass: '',
         allowedPaths: allowedPaths
           .split(/[,\n]/)
           .map((s) => s.trim())
@@ -318,6 +312,11 @@ export function Composer({
         egressConsentDigest: disclosure!.digest,
       });
       setGoal('');
+      /*
+       * 验收条件是**逐任务**的,粘到下一个不相关的任务上是错的。
+       * 其余几项（路由、限定路径、作者、审核方）作为偏好粘住是合理的,不清。
+       */
+      setAcceptance('');
       setStaleSnapshot(false);
       onCreated(run);
     } catch (err) {
@@ -413,10 +412,7 @@ export function Composer({
                 ? '已打开自定义，但还没填命令 —— 现在不会生效'
                 : '添加一条自己的验证命令'
           }
-          onClick={() => {
-            setUseCustom((v) => !v);
-            setAdvancedOpen(true);
-          }}
+          onClick={() => setUseCustom((v) => !v)}
         >
           {hasCustom
             ? `自定义 · ${customCommand.length > 24 ? `${customCommand.slice(0, 24)}…` : customCommand}`
@@ -430,6 +426,49 @@ export function Composer({
           </span>
         )}
       </div>
+
+      {/*
+        自定义验证命令是「验证」这一行的展开态，不是一项任务选项。
+        它此前住在弹层里,但**只能由外面这行的 chip 打开** —— 一个"从外面开、
+        在里面填"的字段没有理由待在那儿:点了 chip 还得再去弹层找输入框。
+        搬回它所属的那一行,顺带去掉 chip 点击时 setAdvancedOpen(true) 的副作用。
+      */}
+      {useCustom && (
+        <div className="field">
+          <label>自定义验证命令</label>
+          <input
+            value={customCommand}
+            placeholder="例如：pnpm --filter web build（按空格拆成 argv，不经过 shell）"
+            onChange={(e) => setCustomCommand(e.target.value)}
+          />
+          {risk && risk.risk !== 'R1' && (
+            <div className={`banner ${risk.approvable ? 'warn' : 'err'}`} role="status">
+              <strong>
+                {risk.approvable ? `需要你逐条批准（${risk.risk}）` : `不能作为验证命令（${risk.risk}）`}
+              </strong>
+              <div>{risk.reason}</div>
+              {risk.remediation && <div className="help">{risk.remediation}</div>}
+              {risk.approvable &&
+                (approvedNow ? (
+                  <div className="help">
+            已批准「{customKey}」—— 一次性，只对本次运行有效；改动命令内容需要重批。
+                  </div>
+                ) : (
+                  <>
+            <button type="button" className="chip" onClick={() => void approveCustom()}>
+              我了解风险，批准这一条
+            </button>
+            <div className="help">
+              批准绑定整条命令（多一个参数就是另一条），15 分钟内有效，只能进这一个任务，
+              执行次数全部进事件流。
+            </div>
+                  </>
+                ))}
+              {approvalError && <div className="help">批准失败：{approvalError}</div>}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 出站披露与同意：必须在明面上，不进高级抽屉 —— 它决定的是"什么会离开这台机器" */}
       <div className="composer-disclosure" data-testid="egress-disclosure">
@@ -547,70 +586,21 @@ export function Composer({
           )}
           {advancedOpen && (
             <AdvancedPopover onClose={() => setAdvancedOpen(false)}>
+              {/*
+                验收条件排第一:它是弹层里**唯一填了立刻有回报**的字段 ——
+                真进规划/执行/交叉审核/外部作者四处提示词。原来它排在被删掉的
+                「任务类型」（纯装饰）后面。
+              */}
               <div className="field">
-                <label>任务类型（可留空，也可自己写）</label>
+                <label>验收条件（每行一条，可留空）</label>
                 <textarea
-                  value={taskClass}
-                  rows={2}
-                  placeholder={'例如：构建失败修复\n也可以写长一点：文档站升级 vite 后样式回归，只在生产构建复现'}
-                  onChange={(e) => setTaskClass(e.target.value)}
+                  value={acceptance}
+                  placeholder={'不引入新的类型错误\n不修改测试文件'}
+                  onChange={(e) => setAcceptance(e.target.value)}
+                  style={{ minHeight: 48 }}
                 />
-                {/* 建议值用 chips 而不是 datalist：不点也看得见，且不会让输入框长得像下拉 */}
-                <div className="suggest-row">
-                  {[...new Set([...profile.supportedTaskClasses, ...COMMON_TASK_CLASSES])].map((c) => (
-                    <button
-                      key={c}
-                      type="button"
-                      className="chip"
-                      title={TASK_CLASS_HINT[c] ?? c}
-                      onClick={() => setTaskClass(TASK_CLASS_HINT[c] ?? c)}
-                    >
-                      {TASK_CLASS_HINT[c] ?? c}
-                    </button>
-                  ))}
-                </div>
-                <div className="help">
-                  纯描述性元数据，不设门禁、也不进提示词 —— 写你自己的说法就行，
-                  上面几个只是常见写法。
-                </div>
               </div>
 
-              {useCustom && (
-                <div className="field">
-                  <label>自定义验证命令</label>
-                  <input
-                    value={customCommand}
-                    placeholder="例如：pnpm --filter web build（按空格拆成 argv，不经过 shell）"
-                    onChange={(e) => setCustomCommand(e.target.value)}
-                  />
-                  {risk && risk.risk !== 'R1' && (
-                    <div className={`banner ${risk.approvable ? 'warn' : 'err'}`} role="status">
-                      <strong>
-                        {risk.approvable ? `需要你逐条批准（${risk.risk}）` : `不能作为验证命令（${risk.risk}）`}
-                      </strong>
-                      <div>{risk.reason}</div>
-                      {risk.remediation && <div className="help">{risk.remediation}</div>}
-                      {risk.approvable &&
-                        (approvedNow ? (
-                          <div className="help">
-                            已批准「{customKey}」—— 一次性，只对本次运行有效；改动命令内容需要重批。
-                          </div>
-                        ) : (
-                          <>
-                            <button type="button" className="chip" onClick={() => void approveCustom()}>
-                              我了解风险，批准这一条
-                            </button>
-                            <div className="help">
-                              批准绑定整条命令（多一个参数就是另一条），15 分钟内有效，只能进这一个任务，
-                              执行次数全部进事件流。
-                            </div>
-                          </>
-                        ))}
-                      {approvalError && <div className="help">批准失败：{approvalError}</div>}
-                    </div>
-                  )}
-                </div>
-              )}
 
               <div className="field">
                 <label>允许修改的路径（可留空）</label>
@@ -624,15 +614,6 @@ export function Composer({
                 </div>
               </div>
 
-              <div className="field">
-                <label>验收条件（每行一条，可留空）</label>
-                <textarea
-                  value={acceptance}
-                  placeholder={'不引入新的类型错误\n不修改测试文件'}
-                  onChange={(e) => setAcceptance(e.target.value)}
-                  style={{ minHeight: 48 }}
-                />
-              </div>
 
               <div className="field">
                 <label>实现方（作者）：谁来改代码</label>
@@ -646,95 +627,108 @@ export function Composer({
                   >
                     RepoPilot 内部 Agent（默认）
                   </button>
-                  {externalOptions.map((o) => (
-                    <button
-                      key={o.id}
-                      type="button"
-                      className={`chip ${authorConnectorId === o.id ? 'selected' : ''}`}
-                      aria-pressed={authorConnectorId === o.id}
-                      disabled={!o.available}
-                      title={o.available ? o.detail : (o.reason ?? o.detail)}
-                      onClick={() => {
-                        setAuthorConnectorId(o.id);
-                        // 作者与审核方不能是同一个连接器：把撞车的审核选择清掉并明说
-                        if (reviewerProfileId === o.id) setReviewerInput('');
-                      }}
-                    >
-                      {o.label}
-                      {!o.available ? '（不可用）' : ''}
-                    </button>
-                  ))}
                 </div>
-                <div className="help">
-                  外部 CLI 当作者时，它只在一份<b>一次性副本</b>里改，平台把差异归一化后才进主线；
-                  规划、审批、验证、封存仍由平台执行。与审核方必须是不同厂商。
-                  {externalOptions.some((o) => !o.available) && (
-                    <>
-                      {' '}
-                      不可用的原因：
-                      {externalOptions
-                        .filter((o) => !o.available)
-                        .map((o) => `${o.label} — ${o.reason ?? o.detail}`)
-                        .join('；')}
-                    </>
-                  )}
-                </div>
-              </div>
-
-              <div className="field" style={{ marginBottom: 4 }}>
-                <label>交叉审核：第二个模型只读审补丁（可留空）</label>
-                <textarea
-                  value={reviewerInput}
-                  rows={2}
-                  placeholder={'留空 = 不做交叉审核\n填一个审核方 id，例如 profile_anthropic（下面可点）'}
-                  onChange={(e) => setReviewerInput(e.target.value)}
-                />
-                <div className="suggest-row">
-                  {reviewerCandidates.length === 0 && reviewerCliCandidates.length === 0 ? (
-                    <span className="help" style={{ padding: 0 }}>
-                      没有可用的第二个审核方 —— 再配一个供应商的 API Key 就有了。
-                    </span>
-                  ) : (
-                    <>
-                      {reviewerCandidates.map((m) => (
-                        <button
-                          key={m.profileId}
-                          type="button"
-                          className={`chip ${reviewerProfileId === m.profileId ? 'selected' : ''}`}
-                          aria-pressed={reviewerProfileId === m.profileId}
-                          title={`${m.label} · ${m.modelId}`}
-                          onClick={() => setReviewerInput(m.profileId)}
-                        >
-                          {m.label}
-                        </button>
-                      ))}
-                      {reviewerCliCandidates.map((o) => (
+                {/*
+                  外部作者收进折叠层,但**报数**（不变式 8）:几乎没人会用它,
+                  而它无条件铺开三个 chip 加一段列不可用原因的长 help,是弹层里
+                  最占版面的一块。收起来不是删 —— summary 上写清有几个、几个可用,
+                  展开就能看到每个不可用的原因。
+                */}
+                {externalOptions.length > 0 && (
+                  <details className="author-external" open={authorConnectorId !== ''}>
+                    <summary>
+                      外部编码代理当作者 · {externalOptions.length} 个，
+                      {externalOptions.filter((o) => o.available).length} 个可用
+                    </summary>
+                    <div className="suggest-row">
+                      {externalOptions.map((o) => (
                         <button
                           key={o.id}
                           type="button"
-                          className={`chip ${reviewerProfileId === o.id ? 'selected' : ''}`}
-                          aria-pressed={reviewerProfileId === o.id}
-                          title={`${o.detail}（外部 CLI，只读审核）`}
-                          onClick={() => setReviewerInput(o.id)}
+                          className={`chip ${authorConnectorId === o.id ? 'selected' : ''}`}
+                          aria-pressed={authorConnectorId === o.id}
+                          disabled={!o.available}
+                          title={o.available ? o.detail : (o.reason ?? o.detail)}
+                          onClick={() => {
+                            setAuthorConnectorId(o.id);
+                            // 作者与审核方不能是同一个连接器：把撞车的审核选择清掉并明说
+                            if (reviewerProfileId === o.id) setReviewerInput('');
+                          }}
                         >
-                          {o.label}（CLI）
+                          {o.label}
+                          {!o.available ? '（不可用）' : ''}
                         </button>
                       ))}
-                    </>
-                  )}
-                </div>
-                {reviewerLines.length > 1 && (
-                  // 多行是输入形态，不是"支持多个审核方"—— 别静默只取第一行
-                  <div className="help" style={{ color: 'var(--state-failed-fg)' }}>
-                    目前只支持一个审核方，这里填了 {reviewerLines.length} 个。
-                  </div>
+                    </div>
+                    <div className="help">
+                      外部 CLI 当作者时，它只在一份<b>一次性副本</b>里改，平台把差异归一化后才进主线；
+                      规划、审批、验证、封存仍由平台执行。与审核方必须是不同厂商。
+                      {externalOptions.some((o) => !o.available) && (
+                        <>
+                          {' '}
+                          不可用的原因：
+                          {externalOptions
+                            .filter((o) => !o.available)
+                            .map((o) => `${o.label} — ${o.reason ?? o.detail}`)
+                            .join('；')}
+                        </>
+                      )}
+                    </div>
+                  </details>
                 )}
-                {reviewerLines.length === 1 && !reviewerResolved && (
-                  // 不做模糊匹配：填错就明说，并列出可用的，不静默忽略
-                  <div className="help" style={{ color: 'var(--state-failed-fg)' }}>
-                    没有这个审核方。可用：
-                    {[...reviewerCandidates.map((m) => m.profileId), ...reviewerCliCandidates.map((o) => o.id)].join('、') ||
-                      '（无）'}
+              </div>
+
+              <div className="field" style={{ marginBottom: 4 }}>
+                <label>交叉审核：第二个模型只读审补丁</label>
+                {/*
+                  单选组,不是自由文本。
+                  这里原本是个 textarea,而可接受的取值集合**恰好等于**下面那排 chips ——
+                  自由文本唯一的增量就是"多行"和"拼错"两类必被拒的输入,于是又要写两段
+                  错误提示去收拾它自己造的错。取值只能来自候选,「不做模糊匹配」这条底线
+                  就从"事后报错"变成了结构上不可能,那两段提示也随之不再可达。
+
+                  首位的 off 态 chip 是必需的:原来的 chips 挂了 aria-pressed 宣称自己是
+                  开关,却只赋值不切换 —— 选中之后除了手动去 textarea 里删字,没有任何
+                  关闭路径。对照作者字段,它一直有显式的「RepoPilot 内部 Agent（默认）」当 off。
+                */}
+                <div className="suggest-row">
+                  <button
+                    type="button"
+                    className={`chip ${reviewerProfileId === '' ? 'selected' : ''}`}
+                    aria-pressed={reviewerProfileId === ''}
+                    title="不做交叉审核：补丁只经平台验证与你的判断"
+                    onClick={() => setReviewerInput('')}
+                  >
+                    不做交叉审核（默认）
+                  </button>
+                  {reviewerCandidates.map((m) => (
+                    <button
+                      key={m.profileId}
+                      type="button"
+                      className={`chip ${reviewerProfileId === m.profileId ? 'selected' : ''}`}
+                      aria-pressed={reviewerProfileId === m.profileId}
+                      title={`${m.label} · ${m.modelId}`}
+                      onClick={() => setReviewerInput(m.profileId)}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                  {reviewerCliCandidates.map((o) => (
+                    <button
+                      key={o.id}
+                      type="button"
+                      className={`chip ${reviewerProfileId === o.id ? 'selected' : ''}`}
+                      aria-pressed={reviewerProfileId === o.id}
+                      title={`${o.detail}（外部 CLI，只读审核）`}
+                      onClick={() => setReviewerInput(o.id)}
+                    >
+                      {o.label}（CLI）
+                    </button>
+                  ))}
+                </div>
+                {reviewerCandidates.length === 0 && reviewerCliCandidates.length === 0 && (
+                  <div className="help">
+                    没有可用的第二个审核方 —— 再配一个供应商的 API Key 就有了。
                   </div>
                 )}
                 <div className="help">
@@ -745,6 +739,12 @@ export function Composer({
             </AdvancedPopover>
           )}
         </div>
+        {authorOption && (
+          // 全表单后果最大的选择（整仓副本交给本机 CLI）—— 与「交叉审核已开」同构的常驻标记
+          <span className="composer-hint" title={`由 ${authorOption.label} 在一次性副本里改代码`}>
+            外部作者：{authorOption.label}
+          </span>
+        )}
         {reviewerResolved && (
           <span className="composer-hint" title="补丁封存后由第二个模型只读审核">
             交叉审核已开
