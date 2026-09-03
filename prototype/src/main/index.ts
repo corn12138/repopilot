@@ -31,6 +31,7 @@ import {
 import { probeRenderedStyles } from './renderProbe';
 import { DATA_ROOT_ENV, isIsolatedDataRoot, resolveDataRoot } from '@shared/dataRoot';
 import { CoreRequestBroker } from './coreChannel';
+import { registerObserverIpc } from './observer/observerIpc';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -69,6 +70,9 @@ const broker = new CoreRequestBroker({
     core.postMessage(message);
   },
 });
+
+// 观察通道（用户能力面，Renderer ⇄ Main 直连，不经 Core）—— TD-DEC-022 (a)
+registerObserverIpc(() => mainWindow);
 
 // ---------------------------------------------------------------------------
 // Core 监督

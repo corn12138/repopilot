@@ -41,6 +41,7 @@ import { FileTreePanel } from './views/FileTree';
 import { EditorPane, type EditorTab } from './views/Editor';
 import { SettingsView } from './views/Settings';
 import { EvidenceView } from './views/Evidence';
+import { ObserverView } from './views/Observer';
 
 interface ImportRequest {
   subPath?: string;
@@ -148,6 +149,11 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
   /**
+   * 观察面板（PRD-WKB-002 spike）：本机代理会话的只读镜像。授权在 Main（原生目录手势），
+   * 这里只有开关 —— 第三个全屏视图，与设置/证据同级互斥。
+   */
+  const [showObserver, setShowObserver] = useState(false);
+  /**
    * 打开设置页时要不要滚到某张卡。侧栏历史折叠里的"清理"入口跳的是数据保留卡
    * （交互评审 v0.2 N9：归档/删除走 retention，缺的是列表层的出口）；
    * 普通"设置"按钮进来则不滚 —— 所以每个入口都显式声明自己的意图。
@@ -155,7 +161,7 @@ export function App() {
   const [settingsFocus, setSettingsFocus] = useState<'retention' | null>(null);
   // 设置与证据都是全屏视图：选中 Run 的顶栏/新事件提示/审批停靠条/Composer 一律让位。
   // 只判 showSettings 会让证据页下仍可发任务、批准计划（交互评审 v0.2 N1）。
-  const fullScreenView = showSettings || showEvidence;
+  const fullScreenView = showSettings || showEvidence || showObserver;
   /** ⌘K 命令面板（v0.1 #10）：动作/运行/项目/文件的统一入口 */
   const [paletteOpen, setPaletteOpen] = useState(false);
 
@@ -171,10 +177,11 @@ export function App() {
         setPaletteOpen((v) => !v);
         return;
       }
-      if (e.key === 'Escape' && !paletteOpen && (showSettings || showEvidence)) {
+      if (e.key === 'Escape' && !paletteOpen && (showSettings || showEvidence || showObserver)) {
         // 设置/证据是"层"：Esc 退回之前的运行/项目视图（v0.1 病根 B 的"只进不出"）
         setShowSettings(false);
         setShowEvidence(false);
+        setShowObserver(false);
         return;
       }
       if (e.key === 'F6') {
@@ -195,7 +202,7 @@ export function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [paletteOpen, showSettings, showEvidence]);
+  }, [paletteOpen, showSettings, showEvidence, showObserver]);
 
   const coreStatusRef = useRef(coreStatus);
   coreStatusRef.current = coreStatus;
@@ -216,10 +223,10 @@ export function App() {
    * 也应该回到底部，而不是继承上一次的未读计数。计数来源是 durable events 的数量 ——
    * 它对应时间线上真实存在的行，不是估算出来的进度。
    */
-  const followOwnerKey = showSettings ? '__settings__' : showEvidence ? '__evidence__' : selectedRunId;
+  const followOwnerKey = showSettings ? '__settings__' : showEvidence ? '__evidence__' : showObserver ? '__observer__' : selectedRunId;
   const follow = useStickToBottom<HTMLDivElement>({
     ownerKey: followOwnerKey,
-    itemCount: showSettings || showEvidence ? 0 : (selectedRunDetail?.events.length ?? 0),
+    itemCount: showSettings || showEvidence || showObserver ? 0 : (selectedRunDetail?.events.length ?? 0),
   });
 
   const report = useCallback((err: unknown) => {
@@ -387,6 +394,7 @@ export function App() {
     (project: ProjectRef) => {
       setShowSettings(false);
       setShowEvidence(false);
+      setShowObserver(false);
       setSelectedProject(project);
       setSelectedRunId(null);
       void importProject(project);
@@ -404,6 +412,7 @@ export function App() {
     (run: RunView) => {
       setShowSettings(false);
       setShowEvidence(false);
+      setShowObserver(false);
       setError(null);
       setSelectedRunId(run.runId);
       // 换 Run 就丢掉上一个 Run 的实时缓冲 —— 它属于那一次调用，不属于这个视图
@@ -553,6 +562,7 @@ export function App() {
         run: () => {
           setShowSettings(false);
           setShowEvidence(false);
+          setShowObserver(false);
           // Composer 常驻主栏底部；等全屏视图退场后聚焦输入框
           setTimeout(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(), 0);
         },
@@ -566,6 +576,7 @@ export function App() {
         setSettingsFocus(null);
         setShowSettings(true);
         setShowEvidence(false);
+        setShowObserver(false);
       },
     });
     actions.push({
@@ -574,7 +585,19 @@ export function App() {
       label: '打开证据页',
       run: () => {
         setShowEvidence(true);
+        setShowObserver(false);
         setShowSettings(false);
+      },
+    });
+    actions.push({
+      id: 'act:observer',
+      group: '动作',
+      label: '打开观察面板',
+      detail: '本机代理会话只读镜像（零出站）',
+      run: () => {
+        setShowObserver(true);
+        setShowSettings(false);
+        setShowEvidence(false);
       },
     });
     actions.push({
@@ -586,6 +609,7 @@ export function App() {
         setSettingsFocus('retention');
         setShowSettings(true);
         setShowEvidence(false);
+        setShowObserver(false);
       },
     });
     if (canShowFiles && coreStatus === 'READY') {
@@ -791,6 +815,7 @@ export function App() {
                               setSettingsFocus('retention');
                               setShowSettings(true);
                               setShowEvidence(false);
+                              setShowObserver(false);
                               setError(null);
                             }}
                           >
@@ -823,6 +848,7 @@ export function App() {
               setSettingsFocus(null);
               setShowSettings(true);
               setShowEvidence(false);
+              setShowObserver(false);
               setError(null);
             }}
           >
@@ -833,12 +859,25 @@ export function App() {
             className={showEvidence ? 'primary' : ''}
             onClick={() => {
               setShowEvidence(true);
+              setShowObserver(false);
               setShowSettings(false);
               setError(null);
             }}
             title="跨 Run 证据聚合（观察性事实，不构成 A/B 结论）"
           >
             📊 证据
+          </button>
+          <button
+            className={showObserver ? 'primary' : ''}
+            onClick={() => {
+              setShowObserver(true);
+              setShowSettings(false);
+              setShowEvidence(false);
+              setError(null);
+            }}
+            title="本机 Claude/Codex 会话只读镜像（Herdr 式 · 内容零出站）"
+          >
+            👁 观察
           </button>
         </div>
       </aside>
@@ -881,7 +920,9 @@ export function App() {
               aria-disabled={coreStatus !== 'READY'}
               style={{ border: 0, margin: 0, padding: 0, minInlineSize: 0 }}
             >
-              {showEvidence ? (
+              {showObserver ? (
+                <ObserverView />
+              ) : showEvidence ? (
                 <EvidenceView onError={(message, detail) => setError({ message, detail })} />
               ) : showSettings ? (
                 <SettingsView
@@ -932,7 +973,7 @@ export function App() {
                   checks={checks}
                   enabledModelCount={enabledModelCount}
                   onPick={pickProject}
-                  onSettings={() => { setSettingsFocus(null); setShowSettings(true); }}
+                  onSettings={() => { setSettingsFocus(null); setShowSettings(true); setShowObserver(false); }}
                 />
               )}
             </fieldset>
@@ -1004,7 +1045,7 @@ export function App() {
               }}
               onReimport={() => importProject(selectedProject)}
               onOpenRun={openRun}
-              onOpenSettings={() => { setSettingsFocus(null); setShowSettings(true); }}
+              onOpenSettings={() => { setSettingsFocus(null); setShowSettings(true); setShowObserver(false); }}
               onError={report}
             />
           </fieldset>
@@ -1098,6 +1139,7 @@ export function App() {
             setSettingsFocus(null);
             setShowSettings(true);
             setShowEvidence(false);
+            setShowObserver(false);
           }}
           title="模型连接在「设置 · API」里配置"
         >
@@ -1114,6 +1156,7 @@ export function App() {
           // 从面板开文件 = 想看代码：全屏视图退场，编辑器以预览标签打开
           setShowSettings(false);
           setShowEvidence(false);
+          setShowObserver(false);
           openFileInEditor(path);
         }}
       />

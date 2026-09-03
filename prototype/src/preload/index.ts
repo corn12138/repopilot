@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import { IPC_CHANNEL, PROTOCOL_VERSION, type PushEvent, type RepoPilotBridge } from '@shared/protocol';
+import {
+  OBSERVER_CHANNEL,
+  OBSERVER_PROTOCOL_VERSION,
+  type ObserverBridge,
+  type ObserverPushEvent,
+} from '@shared/observerProtocol';
 
 /**
  * Typed Preload Bridge。
@@ -32,3 +38,23 @@ const bridge: RepoPilotBridge = {
 };
 
 contextBridge.exposeInMainWorld('repopilot', bridge);
+
+/**
+ * 观察通道的桥（TD-DEC-022 (a)：独立通道，不与 Core 契约共用）。
+ * 同样只有 request + 只读订阅；没有 epoch —— 观察状态活在 Main，与 Core 代次无关。
+ */
+const observerBridge: ObserverBridge = {
+  protocolVersion: OBSERVER_PROTOCOL_VERSION,
+
+  request(method, payload) {
+    return ipcRenderer.invoke(OBSERVER_CHANNEL.request, { method, payload });
+  },
+
+  subscribe(handler: (event: ObserverPushEvent) => void) {
+    const listener = (_e: unknown, event: ObserverPushEvent): void => handler(event);
+    ipcRenderer.on(OBSERVER_CHANNEL.event, listener);
+    return () => ipcRenderer.removeListener(OBSERVER_CHANNEL.event, listener);
+  },
+};
+
+contextBridge.exposeInMainWorld('repopilotObserver', observerBridge);

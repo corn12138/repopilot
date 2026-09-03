@@ -32,7 +32,9 @@ import { join } from 'node:path';
  *   REPOPILOT_PROBE_JOURNALS=update pnpm probe:journals   # 重新生成快照（升级两家后跑）
  */
 
-export type JournalVendor = 'CLAUDE_JOURNAL' | 'CODEX_ROLLOUT';
+import type { JournalVendor } from '@shared/observerProtocol';
+
+export type { JournalVendor };
 
 export interface TypeShape {
   readonly required: readonly string[];
@@ -258,6 +260,44 @@ export function diffShape(
     unobservedTypes,
     unobservedPayloadTypes,
   };
+}
+
+/**
+ * 单条记录 vs 基线的必现键检查 —— 观察面板逐条调用的守卫。
+ *
+ * 语义与 diffShape 的 MISSING 一致但粒度更细：某条记录的 type 在基线里存在、
+ * 却缺了基线必现键 → 返回违规（`top:type.key` / `payload:type.key`）。
+ * 基线不认识的 type 不算违规（增量漂移不定罪）。调用方拿到非空返回时应当
+ * 把整个会话降级为「格式未知」—— 错读比不读更糟。
+ */
+export function recordShapeViolations(
+  baseline: JournalShapeSnapshot,
+  record: Record<string, unknown>,
+): string[] {
+  const out: string[] = [];
+  const check = (
+    level: string,
+    shapes: Readonly<Record<string, TypeShape>>,
+    typeName: string,
+    keys: readonly string[],
+  ): void => {
+    const base = shapes[typeName];
+    if (!base) return;
+    const keySet = new Set(keys);
+    for (const k of base.required) {
+      if (!keySet.has(k)) out.push(`${level}:${typeName}.${k}`);
+    }
+  };
+  check('top', baseline.types, typeNameOf(record.type), Object.keys(record));
+  if (baseline.payloadTypes && isPlainRecord(record.payload)) {
+    check(
+      'payload',
+      baseline.payloadTypes,
+      typeNameOf(record.payload.type),
+      Object.keys(record.payload),
+    );
+  }
+  return out;
 }
 
 /** 稳定序列化：结构在 capture 阶段已排序，这里只负责缩进与收尾换行 */

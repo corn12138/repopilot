@@ -10,6 +10,7 @@ import {
   diffShape,
   discoverJournalFiles,
   parseSnapshot,
+  recordShapeViolations,
   serializeSnapshot,
   type JournalShapeSnapshot,
 } from './journalShape';
@@ -237,5 +238,32 @@ describe('已提交的字段快照基线', () => {
       expect(Object.keys(s.types).length).toBeGreaterThan(0);
       expect(s.records).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('recordShapeViolations：单条记录守卫（观察面板逐条用）', () => {
+  const baseline = snap({
+    vendor: 'CODEX_ROLLOUT',
+    types: { user: { required: ['type', 'uuid'], optional: ['cwd'] } },
+    payloadTypes: { token_count: { required: ['total', 'type'], optional: [] } },
+  });
+
+  it('已知 type 缺必现键 → 逐键报违规', () => {
+    expect(recordShapeViolations(baseline, { type: 'user' })).toEqual(['top:user.uuid']);
+  });
+
+  it('optional 键缺席不算违规；未知 type 不算违规（增量漂移不定罪）', () => {
+    expect(recordShapeViolations(baseline, { type: 'user', uuid: 'x' })).toEqual([]);
+    expect(recordShapeViolations(baseline, { type: 'brand-new', whatever: 1 })).toEqual([]);
+  });
+
+  it('payload 层同规则；基线无 payloadTypes 时 payload 不参与判定', () => {
+    expect(
+      recordShapeViolations(baseline, { type: 'user', uuid: 'x', payload: { type: 'token_count' } }),
+    ).toEqual(['payload:token_count.total']);
+    const noPayloadBaseline = snap({ types: { user: { required: ['type'], optional: [] } } });
+    expect(
+      recordShapeViolations(noPayloadBaseline, { type: 'user', payload: { type: 'token_count' } }),
+    ).toEqual([]);
   });
 });
