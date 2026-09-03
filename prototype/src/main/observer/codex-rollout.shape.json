@@ -1,0 +1,376 @@
+{
+  "vendor": "CODEX_ROLLOUT",
+  "capturedAt": "2026-09-02T11:51:38.743Z",
+  "files": 39,
+  "records": 18052,
+  "unparseableLines": 0,
+  "blankLines": 39,
+  "truncatedLines": 0,
+  "droppedForTypeCap": 0,
+  "types": {
+    "compacted": {
+      "required": [
+        "payload",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "ordinal"
+      ]
+    },
+    "event_msg": {
+      "required": [
+        "payload",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "ordinal"
+      ]
+    },
+    "inter_agent_communication_metadata": {
+      "required": [
+        "payload",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "ordinal"
+      ]
+    },
+    "response_item": {
+      "required": [
+        "payload",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "ordinal"
+      ]
+    },
+    "session_meta": {
+      "required": [
+        "payload",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "ordinal"
+      ]
+    },
+    "turn_context": {
+      "required": [
+        "payload",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "ordinal"
+      ]
+    },
+    "world_state": {
+      "required": [
+        "payload",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "ordinal"
+      ]
+    }
+  },
+  "payloadTypes": {
+    "UNTYPED": {
+      "required": [],
+      "optional": [
+        "active_permission_profile",
+        "agent_nickname",
+        "agent_path",
+        "approval_policy",
+        "approvals_reviewer",
+        "base_instructions",
+        "cli_version",
+        "collaboration_mode",
+        "comp_hash",
+        "context_window",
+        "current_date",
+        "cwd",
+        "dynamic_tools",
+        "effort",
+        "first_window_id",
+        "forked_from_id",
+        "full",
+        "git",
+        "history_mode",
+        "id",
+        "memory_mode",
+        "message",
+        "model",
+        "model_provider",
+        "multi_agent_version",
+        "originator",
+        "parent_thread_id",
+        "permission_profile",
+        "personality",
+        "previous_window_id",
+        "realtime_active",
+        "replacement_history",
+        "sandbox_policy",
+        "session_id",
+        "source",
+        "state",
+        "subagent_history_start_ordinal",
+        "summary",
+        "thread_source",
+        "timestamp",
+        "timezone",
+        "trigger_turn",
+        "turn_id",
+        "window_id",
+        "window_number",
+        "workspace_roots"
+      ]
+    },
+    "agent_message": {
+      "required": [
+        "type"
+      ],
+      "optional": [
+        "author",
+        "content",
+        "id",
+        "internal_chat_message_metadata_passthrough",
+        "memory_citation",
+        "message",
+        "phase",
+        "recipient"
+      ]
+    },
+    "agent_reasoning": {
+      "required": [
+        "text",
+        "type"
+      ],
+      "optional": []
+    },
+    "context_compacted": {
+      "required": [
+        "type"
+      ],
+      "optional": []
+    },
+    "custom_tool_call": {
+      "required": [
+        "call_id",
+        "id",
+        "input",
+        "internal_chat_message_metadata_passthrough",
+        "name",
+        "status",
+        "type"
+      ],
+      "optional": []
+    },
+    "custom_tool_call_output": {
+      "required": [
+        "call_id",
+        "id",
+        "internal_chat_message_metadata_passthrough",
+        "output",
+        "type"
+      ],
+      "optional": []
+    },
+    "function_call": {
+      "required": [
+        "arguments",
+        "call_id",
+        "id",
+        "internal_chat_message_metadata_passthrough",
+        "name",
+        "type"
+      ],
+      "optional": [
+        "namespace"
+      ]
+    },
+    "function_call_output": {
+      "required": [
+        "call_id",
+        "id",
+        "internal_chat_message_metadata_passthrough",
+        "output",
+        "type"
+      ],
+      "optional": []
+    },
+    "item_completed": {
+      "required": [
+        "completed_at_ms",
+        "item",
+        "started_at_ms",
+        "thread_id",
+        "turn_id",
+        "type"
+      ],
+      "optional": []
+    },
+    "mcp_tool_call_end": {
+      "required": [
+        "call_id",
+        "duration",
+        "invocation",
+        "read_only_hint",
+        "result",
+        "type"
+      ],
+      "optional": [
+        "action_name",
+        "app_name",
+        "connector_id",
+        "link_id"
+      ]
+    },
+    "message": {
+      "required": [
+        "content",
+        "id",
+        "role",
+        "type"
+      ],
+      "optional": [
+        "internal_chat_message_metadata_passthrough",
+        "phase"
+      ]
+    },
+    "patch_apply_end": {
+      "required": [
+        "call_id",
+        "changes",
+        "status",
+        "stderr",
+        "stdout",
+        "success",
+        "turn_id",
+        "type"
+      ],
+      "optional": []
+    },
+    "reasoning": {
+      "required": [
+        "encrypted_content",
+        "id",
+        "internal_chat_message_metadata_passthrough",
+        "summary",
+        "type"
+      ],
+      "optional": []
+    },
+    "sub_agent_activity": {
+      "required": [
+        "agent_path",
+        "agent_thread_id",
+        "event_id",
+        "kind",
+        "occurred_at_ms",
+        "type"
+      ],
+      "optional": []
+    },
+    "task_complete": {
+      "required": [
+        "completed_at",
+        "duration_ms",
+        "last_agent_message",
+        "started_at",
+        "time_to_first_token_ms",
+        "turn_id",
+        "type"
+      ],
+      "optional": []
+    },
+    "task_started": {
+      "required": [
+        "collaboration_mode_kind",
+        "model_context_window",
+        "started_at",
+        "turn_id",
+        "type"
+      ],
+      "optional": []
+    },
+    "thread_settings_applied": {
+      "required": [
+        "thread_settings",
+        "type"
+      ],
+      "optional": []
+    },
+    "token_count": {
+      "required": [
+        "info",
+        "rate_limits",
+        "type"
+      ],
+      "optional": []
+    },
+    "tool_search_call": {
+      "required": [
+        "arguments",
+        "call_id",
+        "execution",
+        "id",
+        "internal_chat_message_metadata_passthrough",
+        "status",
+        "type"
+      ],
+      "optional": []
+    },
+    "tool_search_output": {
+      "required": [
+        "call_id",
+        "execution",
+        "id",
+        "internal_chat_message_metadata_passthrough",
+        "status",
+        "tools",
+        "type"
+      ],
+      "optional": []
+    },
+    "turn_aborted": {
+      "required": [
+        "completed_at",
+        "duration_ms",
+        "reason",
+        "started_at",
+        "turn_id",
+        "type"
+      ],
+      "optional": []
+    },
+    "user_message": {
+      "required": [
+        "audio",
+        "client_id",
+        "images",
+        "local_audio",
+        "local_images",
+        "message",
+        "text_elements",
+        "type"
+      ],
+      "optional": []
+    },
+    "web_search_end": {
+      "required": [
+        "action",
+        "call_id",
+        "query",
+        "results",
+        "type"
+      ],
+      "optional": []
+    }
+  }
+}

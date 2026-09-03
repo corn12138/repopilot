@@ -14,7 +14,8 @@
     "selftest": "electron-vite build && REPOPILOT_SELFTEST=1 electron .",
     "dist:mac": "npm run build && electron-builder --mac --config electron-builder.yml",
     "dist:mac:x64": "npm run build && electron-builder --mac --x64 --config electron-builder.yml",
-    "eval:spk010": "vite build --config eval.vite.config.ts && node eval-out/.build/run-experiment.js"
+    "eval:spk010": "vite build --config eval.vite.config.ts && node eval-out/.build/run-experiment.js",
+    "probe:journals": "REPOPILOT_PROBE_JOURNALS=${REPOPILOT_PROBE_JOURNALS:-1} vitest run src/main/observer/journalShape.probe.test.ts"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.2",

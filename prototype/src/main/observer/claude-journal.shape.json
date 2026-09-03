@@ -1,0 +1,276 @@
+{
+  "vendor": "CLAUDE_JOURNAL",
+  "capturedAt": "2026-09-02T11:51:35.532Z",
+  "files": 40,
+  "records": 46777,
+  "unparseableLines": 0,
+  "blankLines": 39,
+  "truncatedLines": 5815,
+  "droppedForTypeCap": 0,
+  "types": {
+    "ai-title": {
+      "required": [
+        "aiTitle",
+        "sessionId",
+        "type"
+      ],
+      "optional": []
+    },
+    "assistant": {
+      "required": [
+        "cwd",
+        "entrypoint",
+        "gitBranch",
+        "isSidechain",
+        "message",
+        "parentUuid",
+        "sessionId",
+        "timestamp",
+        "type",
+        "userType",
+        "uuid",
+        "version"
+      ],
+      "optional": [
+        "agentId",
+        "apiErrorStatus",
+        "attributionAgent",
+        "attributionMcpServer",
+        "attributionMcpTool",
+        "attributionPlugin",
+        "attributionSkill",
+        "effort",
+        "error",
+        "errorDetails",
+        "isApiErrorMessage",
+        "requestId",
+        "session_id",
+        "slug"
+      ]
+    },
+    "atis-latch": {
+      "required": [
+        "atis",
+        "sessionId",
+        "type"
+      ],
+      "optional": []
+    },
+    "attachment": {
+      "required": [
+        "attachment",
+        "cwd",
+        "entrypoint",
+        "gitBranch",
+        "isSidechain",
+        "parentUuid",
+        "sessionId",
+        "timestamp",
+        "type",
+        "userType",
+        "uuid",
+        "version"
+      ],
+      "optional": [
+        "agentId",
+        "slug"
+      ]
+    },
+    "bridge-session": {
+      "required": [
+        "bridgeSessionId",
+        "lastSequenceNum",
+        "ownerAccountUuid",
+        "ownerOrganizationUuid",
+        "sessionId",
+        "type"
+      ],
+      "optional": []
+    },
+    "cost-state": {
+      "required": [
+        "hasUnknownModelCost",
+        "modelUsage",
+        "sessionId",
+        "startTime",
+        "totalAPIDuration",
+        "totalAPIDurationWithoutRetries",
+        "totalCostUSD",
+        "totalDuration",
+        "totalLinesAdded",
+        "totalLinesRemoved",
+        "totalToolDuration",
+        "type"
+      ],
+      "optional": []
+    },
+    "custom-title": {
+      "required": [
+        "customTitle",
+        "sessionId",
+        "type"
+      ],
+      "optional": []
+    },
+    "file-history-snapshot": {
+      "required": [
+        "isSnapshotUpdate",
+        "messageId",
+        "snapshot",
+        "type"
+      ],
+      "optional": []
+    },
+    "last-prompt": {
+      "required": [
+        "leafUuid",
+        "sessionId",
+        "type"
+      ],
+      "optional": [
+        "lastPrompt"
+      ]
+    },
+    "mode": {
+      "required": [
+        "mode",
+        "sessionId",
+        "type"
+      ],
+      "optional": []
+    },
+    "permission-mode": {
+      "required": [
+        "permissionMode",
+        "sessionId",
+        "type"
+      ],
+      "optional": []
+    },
+    "pr-link": {
+      "required": [
+        "prNumber",
+        "prRepository",
+        "prUrl",
+        "sessionId",
+        "timestamp",
+        "type"
+      ],
+      "optional": []
+    },
+    "queue-operation": {
+      "required": [
+        "operation",
+        "sessionId",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "content",
+        "reason"
+      ]
+    },
+    "result": {
+      "required": [
+        "agentId",
+        "key",
+        "result",
+        "type"
+      ],
+      "optional": []
+    },
+    "started": {
+      "required": [
+        "agentId",
+        "key",
+        "type"
+      ],
+      "optional": []
+    },
+    "system": {
+      "required": [
+        "cwd",
+        "entrypoint",
+        "gitBranch",
+        "isSidechain",
+        "parentUuid",
+        "sessionId",
+        "subtype",
+        "timestamp",
+        "type",
+        "userType",
+        "uuid",
+        "version"
+      ],
+      "optional": [
+        "apiRefusalCategory",
+        "apiRefusalExplanation",
+        "cause",
+        "compactMetadata",
+        "content",
+        "direction",
+        "durationMs",
+        "error",
+        "fallbackModel",
+        "hasOutput",
+        "hookAdditionalContext",
+        "hookCount",
+        "hookErrors",
+        "hookInfos",
+        "isMeta",
+        "level",
+        "logicalParentUuid",
+        "maxRetries",
+        "messageCount",
+        "originalModel",
+        "preventedContinuation",
+        "refusedUserMessageUuid",
+        "requestId",
+        "retractedMessageUuids",
+        "retryAttempt",
+        "retryInMs",
+        "scope",
+        "slug",
+        "source",
+        "stopReason",
+        "toolUseID",
+        "trigger"
+      ]
+    },
+    "user": {
+      "required": [
+        "cwd",
+        "entrypoint",
+        "gitBranch",
+        "isSidechain",
+        "message",
+        "parentUuid",
+        "sessionId",
+        "timestamp",
+        "type",
+        "userType",
+        "uuid",
+        "version"
+      ],
+      "optional": [
+        "agentId",
+        "isCompactSummary",
+        "isMeta",
+        "isVisibleInTranscriptOnly",
+        "mcpMeta",
+        "origin",
+        "permissionMode",
+        "promptId",
+        "promptSource",
+        "queueSkipAttachments",
+        "slug",
+        "sourceToolAssistantUUID",
+        "sourceToolUseID",
+        "toolDenialKind",
+        "toolEndsTurn",
+        "toolUseResult"
+      ]
+    }
+  },
+  "payloadTypes": null
+}

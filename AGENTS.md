@@ -81,11 +81,14 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 63 个文件 / 1147 个测试，含真实 tsc + vite build 的端到端链路
+pnpm test       # 69 个文件 / 1257 个测试（本机日志 probe 的 2 个默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 pnpm eval:spk010 -- --implementer <provider> --reviewer <provider> --dry-run
                 # SPK-010 A/B 实验执行器；真跑需两家异构 API key（环境变量），先 --dry-run 看计划
+pnpm probe:journals
+                # 对照本机 Claude/Codex 会话日志与已提交字段快照（ASM-027 验证器；只读、零出站）
+                # 两家升级后：REPOPILOT_PROBE_JOURNALS=update pnpm probe:journals 重生成快照
 
 ```
 

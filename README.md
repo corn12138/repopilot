@@ -95,7 +95,7 @@ pnpm dev
 可以直接拿它当第一个任务目标。
 
 ```bash
-pnpm test        # 63 个文件 / 1147 个测试，含真实 tsc + vite build 的端到端链路
+pnpm test        # 69 个文件 / 1257 个测试（本机日志 probe 的 2 个默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
 ```
 

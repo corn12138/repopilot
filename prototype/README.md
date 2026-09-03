@@ -21,7 +21,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 63 个文件、1147 个测试，其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 69 个文件、1257 个测试（本机日志 probe 的 2 个默认跳过），其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
