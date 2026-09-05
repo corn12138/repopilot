@@ -81,14 +81,19 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 71 个文件 / 1277 个测试（本机日志 probe 的 2 个默认跳过），含真实 tsc + vite build 的端到端链路
+pnpm test       # 73 个文件 / 1302 个测试（本机日志 probe 的 3 个默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 pnpm eval:spk010 -- --implementer <provider> --reviewer <provider> --dry-run
                 # SPK-010 A/B 实验执行器；真跑需两家异构 API key（环境变量），先 --dry-run 看计划
 pnpm probe:journals
-                # 对照本机 Claude/Codex 会话日志与已提交字段快照（ASM-027 验证器；只读、零出站）
+                # 对照本机 Claude/Codex 会话日志与已提交字段快照（ASM-027 验证器；只读、零出站），
+                # 并对本仓库的真实会话做一次观察面板干跑（状态分布 / 漂移提示 / 耗时）
                 # 两家升级后：REPOPILOT_PROBE_JOURNALS=update pnpm probe:journals 重生成快照
+                # 干跑换项目：REPOPILOT_PROBE_PROJECT=/abs/path pnpm probe:journals
+REPOPILOT_SELFTEST_OBSERVE_PATH=/abs/project REPOPILOT_SELFTEST_CAPTURE_DIR=/tmp/shots pnpm selftest
+                # 观察面板的运行时取证：真实 IPC 负向路径 + 真实 DOM；两个变量都是 opt-in，
+                # 不设则只验桥与 IPC、不读任何真实会话、不落截图
 
 ```
 

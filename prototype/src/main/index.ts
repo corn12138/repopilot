@@ -32,6 +32,7 @@ import { probeRenderedStyles } from './renderProbe';
 import { DATA_ROOT_ENV, isIsolatedDataRoot, resolveDataRoot } from '@shared/dataRoot';
 import { CoreRequestBroker } from './coreChannel';
 import { registerObserverIpc } from './observer/observerIpc';
+import { runObserverSelftest } from './observer/observerSelftest';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -72,7 +73,7 @@ const broker = new CoreRequestBroker({
 });
 
 // 观察通道（用户能力面，Renderer ⇄ Main 直连，不经 Core）—— TD-DEC-022 (a)
-registerObserverIpc(() => mainWindow);
+const observer = registerObserverIpc(() => mainWindow);
 
 // ---------------------------------------------------------------------------
 // Core 监督
@@ -969,6 +970,19 @@ async function selfTest(): Promise<void> {
     for (const pass of probe.passes) console.log(`[selftest] PASS 渲染层 · ${pass}`);
     for (const failure of probe.failures) console.error(`[selftest] FAIL 渲染层 · ${failure}`);
     failures += probe.failures.length;
+
+    /*
+     * 观察面板取证：真实 IPC 的负向路径 + 真实 DOM。两个 opt-in 变量默认不设：
+     * REPOPILOT_SELFTEST_OBSERVE_PATH 才会读真实 HOME 里的会话；
+     * REPOPILOT_SELFTEST_CAPTURE_DIR 才会落截图。
+     */
+    const observerReport = await runObserverSelftest(mainWindow!.webContents, observer.service, {
+      observePath: process.env.REPOPILOT_SELFTEST_OBSERVE_PATH?.trim() || null,
+      captureDir: process.env.REPOPILOT_SELFTEST_CAPTURE_DIR?.trim() || null,
+    });
+    for (const pass of observerReport.passes) console.log(`[selftest] PASS 观察面板 · ${pass}`);
+    for (const failure of observerReport.failures) console.error(`[selftest] FAIL 观察面板 · ${failure}`);
+    failures += observerReport.failures.length;
   } else {
     console.error('[selftest] FAIL renderer 未能完成加载');
     failures += 1;

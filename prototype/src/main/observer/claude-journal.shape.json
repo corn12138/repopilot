@@ -1,18 +1,45 @@
 {
   "vendor": "CLAUDE_JOURNAL",
-  "capturedAt": "2026-09-02T11:51:35.532Z",
-  "files": 40,
-  "records": 46777,
+  "capturedAt": "2026-09-05T01:08:43.809Z",
+  "files": 200,
+  "records": 113503,
   "unparseableLines": 0,
-  "blankLines": 39,
+  "blankLines": 199,
   "truncatedLines": 5815,
   "droppedForTypeCap": 0,
   "types": {
+    "agent-setting": {
+      "required": [
+        "agentSetting",
+        "sessionId",
+        "type"
+      ],
+      "optional": []
+    },
     "ai-title": {
       "required": [
         "aiTitle",
         "sessionId",
         "type"
+      ],
+      "optional": []
+    },
+    "artifact-autoreact-ledger": {
+      "required": [
+        "accountUuid",
+        "artifacts",
+        "sessionId",
+        "type",
+        "v"
+      ],
+      "optional": []
+    },
+    "artifact-comment-monitor": {
+      "required": [
+        "artifacts",
+        "sessionId",
+        "type",
+        "v"
       ],
       "optional": []
     },
@@ -33,6 +60,7 @@
       ],
       "optional": [
         "agentId",
+        "apiBlockIndex",
         "apiErrorStatus",
         "attributionAgent",
         "attributionMcpServer",
@@ -43,9 +71,12 @@
         "error",
         "errorDetails",
         "isApiErrorMessage",
+        "quotaLimits",
         "requestId",
+        "sessionKind",
         "session_id",
-        "slug"
+        "slug",
+        "truncatedAfterOutput"
       ]
     },
     "atis-latch": {
@@ -73,6 +104,9 @@
       ],
       "optional": [
         "agentId",
+        "rendered",
+        "sessionKind",
+        "session_id",
         "slug"
       ]
     },
@@ -80,9 +114,19 @@
       "required": [
         "bridgeSessionId",
         "lastSequenceNum",
-        "ownerAccountUuid",
-        "ownerOrganizationUuid",
         "sessionId",
+        "type"
+      ],
+      "optional": [
+        "ownerAccountUuid",
+        "ownerOrganizationUuid"
+      ]
+    },
+    "continued-in": {
+      "required": [
+        "continuedInSessionId",
+        "sessionId",
+        "timestamp",
         "type"
       ],
       "optional": []
@@ -112,6 +156,25 @@
       ],
       "optional": []
     },
+    "failed": {
+      "required": [
+        "agentId",
+        "key",
+        "type"
+      ],
+      "optional": []
+    },
+    "file-history-delta": {
+      "required": [
+        "backup",
+        "messageId",
+        "snapshotMessageId",
+        "timestamp",
+        "trackingPath",
+        "type"
+      ],
+      "optional": []
+    },
     "file-history-snapshot": {
       "required": [
         "isSnapshotUpdate",
@@ -121,14 +184,27 @@
       ],
       "optional": []
     },
+    "frame-link": {
+      "required": [
+        "artifactCount",
+        "sessionId",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "frameUrl",
+        "path",
+        "title"
+      ]
+    },
     "last-prompt": {
       "required": [
-        "leafUuid",
         "sessionId",
         "type"
       ],
       "optional": [
-        "lastPrompt"
+        "lastPrompt",
+        "leafUuid"
       ]
     },
     "mode": {
@@ -230,6 +306,8 @@
         "retryAttempt",
         "retryInMs",
         "scope",
+        "sessionKind",
+        "session_id",
         "slug",
         "source",
         "stopReason",
@@ -254,6 +332,10 @@
       ],
       "optional": [
         "agentId",
+        "classifierMetaLines",
+        "imagePasteIds",
+        "interruptedByShutdown",
+        "interruptedMessageId",
         "isCompactSummary",
         "isMeta",
         "isVisibleInTranscriptOnly",
@@ -263,12 +345,16 @@
         "promptId",
         "promptSource",
         "queueSkipAttachments",
+        "sessionKind",
+        "session_id",
         "slug",
         "sourceToolAssistantUUID",
         "sourceToolUseID",
         "toolDenialKind",
         "toolEndsTurn",
-        "toolUseResult"
+        "toolUseResult",
+        "turnCompanion",
+        "userFeedback"
       ]
     }
   },

@@ -1,5 +1,5 @@
 import { closeSync, lstatSync, openSync, readSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join, normalize, relative } from 'node:path';
 import type {
   JournalVendor,
   ObserverProjection,
@@ -38,9 +38,16 @@ import codexBaselineRaw from './codex-rollout.shape.json';
 
 const MAX_SESSIONS_PER_VENDOR = 30;
 /** codex rollout 是全局池，按 session_meta.cwd 过滤前先有界扫描 */
-const MAX_CODEX_SCAN_FILES = 80;
-/** 读 rollout 头部识别 cwd 的字节上限（session_meta 恒为首行） */
-const CODEX_HEAD_PROBE_BYTES = 16_384;
+const MAX_CODEX_SCAN_FILES = 400;
+/**
+ * 读 rollout 首行识别 cwd 的分块与上限。session_meta 恒为首行，但它带着整段
+ * base_instructions —— 2026-09-05 实测 20 个最新 rollout 的首行 19–49KB（中位 46KB），
+ * 此前 16KB 的一次性探测让 400/400 个文件"首行读不出"。改为按块读到第一个换行为止。
+ */
+const CODEX_HEAD_CHUNK_BYTES = 65_536;
+const CODEX_HEAD_MAX_BYTES = 2_000_000;
+/** claude 会话目录只看顶层（深度 1）：subagents/ 子目录里是子代理记录，不是会话 */
+const CLAUDE_SESSION_MAX_DEPTH = 1;
 /** 单文件读取上限：超出只读尾部并如实报数 */
 const MAX_READ_BYTES = 4_000_000;
 const MAX_PROJECTION_LINES = 200;
@@ -51,7 +58,7 @@ const ACTIVE_WINDOW_MS = 20_000;
 
 export class ObserverError extends Error {
   constructor(
-    readonly code: 'NOT_GRANTED' | 'UNKNOWN_SESSION',
+    readonly code: 'NOT_GRANTED' | 'UNKNOWN_SESSION' | 'BAD_REQUEST',
     message: string,
   ) {
     super(message);
@@ -142,6 +149,58 @@ export function projectionLineOf(
   return { kind: `[${t}]`, text: '' };
 }
 
+/**
+ * 面板**消费键**契约 —— 运行时降级的唯一判据。
+ *
+ * 2026-09-05 的实测教训：用「基线必现键」当降级判据，三天后 claude 版本没变，
+ * 却因为一个罕见 type（bridge-session）上两个面板根本不读的键在新窗口里不再必现，
+ * 整个会话被判成「格式未知」。基线的 required 层是对样本的经验归纳，
+ * 一条反例分不清是「格式变了」还是「样本太小」—— 它适合做离线对照（probe），
+ * 不适合决定面板能不能读。
+ *
+ * 面板真正依赖的只有这些：`type` 是字符串；claude 的 user/assistant 有对象 `message`
+ * 且 `content` 是字符串或数组；codex 的 `payload` 若存在必须是对象，三种正文 type 的
+ * `content`/`message` 形状可读。违反其中任一条 = 真的读不了 = FORMAT_UNKNOWN。
+ * 其余基线出入只进 driftNotes 作为提示，不阻断展示。
+ */
+export function consumedContractViolations(
+  vendor: JournalVendor,
+  rec: Record<string, unknown>,
+): string[] {
+  const out: string[] = [];
+  if (typeof rec.type !== 'string') {
+    out.push('consumed:type 不是字符串');
+    return out;
+  }
+  const contentReadable = (c: unknown): boolean =>
+    c === undefined || typeof c === 'string' || Array.isArray(c);
+  if (vendor === 'CLAUDE_JOURNAL') {
+    if (rec.type === 'user' || rec.type === 'assistant') {
+      if (!isPlainRecord(rec.message)) out.push(`consumed:${rec.type}.message 不是对象`);
+      else if (!contentReadable(rec.message.content)) {
+        out.push(`consumed:${rec.type}.message.content 既不是字符串也不是数组`);
+      }
+    }
+    return out;
+  }
+  if (rec.payload !== undefined && !isPlainRecord(rec.payload)) {
+    out.push('consumed:payload 不是对象');
+    return out;
+  }
+  if (isPlainRecord(rec.payload) && typeof rec.payload.type === 'string') {
+    const pt = rec.payload.type;
+    if (pt === 'agent_message' || pt === 'message') {
+      if (!contentReadable(rec.payload.content)) out.push(`consumed:payload.${pt}.content 不可读`);
+    } else if (pt === 'user_message') {
+      const m = rec.payload.message;
+      if (m !== undefined && typeof m !== 'string' && !contentReadable(rec.payload.content)) {
+        out.push('consumed:payload.user_message 正文不可读');
+      }
+    }
+  }
+  return out;
+}
+
 /** 有界读取：超上限只保留尾部，丢掉第一个（可能不完整的）行，字节数如实上报 */
 function readTailLines(path: string): { lines: readonly string[]; headBytesSkipped: number } | null {
   let stat;
@@ -212,6 +271,14 @@ export class ObserverService {
     projectPath: string,
     display: string,
   ): { sessions: readonly ObserverSessionEntry[]; counts: ObserverSweepCounts } {
+    /*
+     * 只接受绝对路径。空串会让 munge 出空目录名 → join 回日志根 → 递归扫到**所有项目**
+     * 的会话，"按项目授权"就名存实亡；相对路径则让 codex 的 cwd 精确匹配永远不成立。
+     * 对话框不会给出这两种值，但这条边界不能靠"对话框不会"来守。
+     */
+    if (!isAbsolute(projectPath) || projectPath !== normalize(projectPath)) {
+      throw new ObserverError('BAD_REQUEST', `项目路径必须是规范化的绝对路径：${projectPath || '(空)'}`);
+    }
     this.disableInternal(false);
     this.grantedPath = projectPath;
     this.grantedDisplay = display;
@@ -280,13 +347,15 @@ export class ObserverService {
 
     const baseline = this.baselines[session.vendor];
     const breaking = new Set<string>();
+    const driftNotes = new Set<string>();
     let records = 0;
     let unparseable = 0;
     let blank = 0;
     const produced: { kind: string; text: string }[] = [];
 
     for (const rawLine of read.lines) {
-      const line = rawLine.trim();
+      // 首行可能带 UTF-8 BOM；\r 由 trim 吃掉（CRLF 日志同样可读）
+      const line = rawLine.replace(/^\uFEFF/, '').trim();
       if (line === '') {
         blank += 1;
         continue;
@@ -303,8 +372,12 @@ export class ObserverService {
         continue;
       }
       records += 1;
-      for (const v of recordShapeViolations(baseline, parsed)) {
+      // 降级只看消费契约；基线出入只作提示（见 consumedContractViolations 的注释）
+      for (const v of consumedContractViolations(session.vendor, parsed)) {
         if (breaking.size < MAX_BREAKING_REPORTED) breaking.add(v);
+      }
+      for (const v of recordShapeViolations(baseline, parsed)) {
+        if (driftNotes.size < MAX_BREAKING_REPORTED) driftNotes.add(v);
       }
       produced.push(projectionLineOf(session.vendor, parsed));
     }
@@ -330,6 +403,7 @@ export class ObserverService {
       vendor: session.vendor,
       status: formatUnknown ? 'FORMAT_UNKNOWN' : 'OK',
       breaking: [...breaking].sort(),
+      driftNotes: [...driftNotes].sort(),
       lines: shown,
       counts: {
         records,
@@ -352,7 +426,12 @@ export class ObserverService {
     if (projectPath === null) throw new ObserverError('NOT_GRANTED', '尚未授权观察任何项目');
 
     const next = new Map<string, SessionRecord>();
-    const entryOf = (vendor: JournalVendor, path: string): SessionRecord | null => {
+    /*
+     * sessionId = vendor + 相对扫描根的路径。只用 basename 会撞：claude 项目目录下
+     * 多个会话各有一份 journal.jsonl，同名即互相覆盖（2026-09-05 实测 30 命中只列出 29）。
+     * 相对路径不含宿主绝对路径，仍不泄露位置。
+     */
+    const entryOf = (vendor: JournalVendor, scanRoot: string, path: string): SessionRecord | null => {
       let stat;
       try {
         stat = lstatSync(path);
@@ -360,7 +439,7 @@ export class ObserverService {
         return null;
       }
       const base = basename(path);
-      const sessionId = `${vendor}:${base}`;
+      const sessionId = `${vendor}:${relative(scanRoot, path)}`;
       return {
         sessionId,
         vendor,
@@ -371,11 +450,14 @@ export class ObserverService {
       };
     };
 
-    // claude：项目专属目录，目录名由路径 munge 而来
+    // claude：项目专属目录，目录名由路径 munge 而来；只看顶层会话文件
     const claudeDir = join(this.claudeProjectsRoot, mungeClaudeProjectDir(projectPath));
-    const claudeSweep = discoverJournalFiles(claudeDir, { maxFiles: MAX_SESSIONS_PER_VENDOR });
+    const claudeSweep = discoverJournalFiles(claudeDir, {
+      maxFiles: MAX_SESSIONS_PER_VENDOR,
+      maxDepth: CLAUDE_SESSION_MAX_DEPTH,
+    });
     for (const f of claudeSweep.files) {
-      const e = entryOf('CLAUDE_JOURNAL', f);
+      const e = entryOf('CLAUDE_JOURNAL', claudeDir, f);
       if (e) next.set(e.sessionId, e);
     }
 
@@ -394,7 +476,7 @@ export class ObserverService {
         continue;
       }
       if (cwd !== projectPath) continue;
-      const e = entryOf('CODEX_ROLLOUT', f);
+      const e = entryOf('CODEX_ROLLOUT', this.codexSessionsRoot, f);
       if (e) {
         next.set(e.sessionId, e);
         codexMatched += 1;
@@ -413,6 +495,7 @@ export class ObserverService {
       counts: {
         claudeMatched: claudeSweep.files.length,
         claudeSkippedByCap: claudeSweep.skippedFiles,
+        claudeNestedSkipped: claudeSweep.skippedByDepth,
         codexScanned: codexSweep.files.length,
         codexMatched,
         codexSkippedByCap: codexSweep.skippedFiles,
@@ -422,15 +505,28 @@ export class ObserverService {
   }
 }
 
-/** 读 rollout 首行的 session_meta.payload.cwd；读不出/形状不符返回 null（计数不抛） */
+/** 读 rollout 首行的 session_meta.payload.cwd；读不出/形状不符/首行超上限返回 null（计数不抛） */
 export function readCodexSessionCwd(path: string): string | null {
   try {
     const fd = openSync(path, 'r');
     try {
-      const buf = Buffer.alloc(CODEX_HEAD_PROBE_BYTES);
-      const read = readSync(fd, buf, 0, CODEX_HEAD_PROBE_BYTES, 0);
-      const text = buf.subarray(0, read).toString('utf8');
-      const firstLine = text.split('\n', 1)[0] ?? '';
+      // 按块读到第一个换行为止：首行常有几十 KB，一次性小缓冲会把 JSON 截成半截
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let newlineAt = -1;
+      while (newlineAt < 0 && total < CODEX_HEAD_MAX_BYTES) {
+        const buf = Buffer.alloc(CODEX_HEAD_CHUNK_BYTES);
+        const read = readSync(fd, buf, 0, CODEX_HEAD_CHUNK_BYTES, total);
+        if (read <= 0) break;
+        const chunk = buf.subarray(0, read);
+        const idx = chunk.indexOf(0x0a);
+        if (idx >= 0) newlineAt = total + idx;
+        chunks.push(chunk);
+        total += read;
+      }
+      const head = Buffer.concat(chunks, total);
+      if (newlineAt < 0 && total >= CODEX_HEAD_MAX_BYTES) return null; // 首行超上限：不猜
+      const firstLine = head.subarray(0, newlineAt >= 0 ? newlineAt : total).toString('utf8');
       const parsed: unknown = JSON.parse(firstLine);
       if (!isPlainRecord(parsed) || parsed.type !== 'session_meta') return null;
       const payload = parsed.payload;

@@ -130,19 +130,27 @@ function isPlainRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** 从若干文件的原始行聚合出字段快照。不做任何 IO —— IO 归 discover/read 系列 */
+/**
+ * 从若干文件的原始行聚合出字段快照。不做任何 IO —— IO 归 discover/read 系列。
+ *
+ * 入参是 **Iterable**（数组或生成器）而不是数组的数组：2026-09-05 把基线扫描从 40 个
+ * 文件扩到 200 个时，先把全部文件读进内存再归纳直接撞了 heap OOM。惰性迭代让内存里
+ * 任何时刻只有一个文件的行 —— 调用方用生成器逐个读，归纳完即丢。
+ */
 export function captureShape(
   vendor: JournalVendor,
-  fileLines: readonly (readonly string[])[],
+  fileLines: Iterable<readonly string[]>,
 ): JournalShapeSnapshot {
   const top = newLevelAcc();
   const payload = newLevelAcc();
+  let files = 0;
   let records = 0;
   let unparseableLines = 0;
   let blankLines = 0;
   let truncatedLines = 0;
 
   for (const allLines of fileLines) {
+    files += 1;
     const lines = allLines.slice(0, MAX_LINES_PER_FILE);
     truncatedLines += allLines.length - lines.length;
     for (const rawLine of lines) {
@@ -181,7 +189,7 @@ export function captureShape(
   return {
     vendor,
     capturedAt: new Date().toISOString(),
-    files: fileLines.length,
+    files,
     records,
     unparseableLines,
     blankLines,
@@ -367,6 +375,8 @@ export interface JournalSweep {
   readonly totalMatched: number;
   /** totalMatched − files.length：被 maxFiles 上限跳过的数量 */
   readonly skippedFiles: number;
+  /** 超过 maxDepth 的 .jsonl 文件数（例如 claude 会话目录下的 subagents/ 子代理记录） */
+  readonly skippedByDepth: number;
   readonly unreadableDirs: number;
   readonly symlinksSkipped: number;
 }
@@ -374,15 +384,26 @@ export interface JournalSweep {
 /**
  * 有界扫描一个日志根目录：递归收 `.jsonl`（可加名字过滤），按 mtime 降序取前
  * maxFiles 个。symlink 一律跳过（与 listTree 同一取舍），读不动的目录计数不抛。
+ *
+ * maxDepth（默认无限）：root 直属文件深度为 1。2026-09-05 实测 claude 的项目目录里
+ * 166 个 .jsonl 只有 16 个是顶层会话，其余是 `<会话>/subagents/agent-*.jsonl` 与多份
+ * 同名 `journal.jsonl` —— 不限深度会让"最新 N 个"被子代理文件挤占，还会撞同名。
+ * 深层文件不是被忽略，是被**计数**（skippedByDepth）。
  */
 export function discoverJournalFiles(
   root: string,
-  opts: { readonly maxFiles: number; readonly fileNameFilter?: (name: string) => boolean },
+  opts: {
+    readonly maxFiles: number;
+    readonly fileNameFilter?: (name: string) => boolean;
+    readonly maxDepth?: number;
+  },
 ): JournalSweep {
   const matched: { path: string; mtimeMs: number }[] = [];
+  const maxDepth = opts.maxDepth ?? Number.POSITIVE_INFINITY;
   let unreadableDirs = 0;
   let symlinksSkipped = 0;
-  const walk = (dir: string): void => {
+  let skippedByDepth = 0;
+  const walk = (dir: string, depth: number): void => {
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -397,11 +418,15 @@ export function discoverJournalFiles(
         continue;
       }
       if (entry.isDirectory()) {
-        walk(full);
+        walk(full, depth + 1);
         continue;
       }
       if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
       if (opts.fileNameFilter && !opts.fileNameFilter(entry.name)) continue;
+      if (depth > maxDepth) {
+        skippedByDepth += 1;
+        continue;
+      }
       try {
         matched.push({ path: full, mtimeMs: lstatSync(full).mtimeMs });
       } catch {
@@ -409,13 +434,14 @@ export function discoverJournalFiles(
       }
     }
   };
-  walk(root);
+  walk(root, 1);
   matched.sort((a, b) => b.mtimeMs - a.mtimeMs);
   const files = matched.slice(0, Math.max(0, opts.maxFiles)).map((m) => m.path);
   return {
     files,
     totalMatched: matched.length,
     skippedFiles: matched.length - files.length,
+    skippedByDepth,
     unreadableDirs,
     symlinksSkipped,
   };

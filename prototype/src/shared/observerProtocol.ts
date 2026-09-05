@@ -47,6 +47,8 @@ export interface ObserverSessionEntry {
 export interface ObserverSweepCounts {
   readonly claudeMatched: number;
   readonly claudeSkippedByCap: number;
+  /** 项目目录下更深层的 .jsonl（subagents/ 子代理记录、各会话的 journal.jsonl）—— 不列为会话，但报数 */
+  readonly claudeNestedSkipped: number;
   readonly codexScanned: number;
   readonly codexMatched: number;
   readonly codexSkippedByCap: number;
@@ -70,12 +72,16 @@ export interface ObserverProjection {
   readonly sessionId: string;
   readonly vendor: JournalVendor;
   /**
-   * FORMAT_UNKNOWN = 记录违反了已提交字段快照基线的必现键（ASM-027 的降级语义）：
-   * 此时 lines 为空 —— 错读比不读更糟，只报计数与违规键名。
+   * FORMAT_UNKNOWN = 记录违反了**面板消费键契约**（type/message/content/payload 的形状），
+   * 即面板真的读不了：此时 lines 为空 —— 错读比不读更糟，只报计数与违规明细。
+   * 与已提交字段快照基线的出入**不**触发降级（2026-09-05 实测：基线 required 层会因
+   * 样本过拟合误报），只进 driftNotes 作提示。
    */
   readonly status: 'OK' | 'FORMAT_UNKNOWN';
-  /** 违规明细（键名级，最多 8 条），只在 FORMAT_UNKNOWN 时非空 */
+  /** 消费契约违规明细（最多 8 条），只在 FORMAT_UNKNOWN 时非空 */
   readonly breaking: readonly string[];
+  /** 与字段快照基线的出入（`top:type.key` / `payload:type.key`，最多 8 条）；仅提示 */
+  readonly driftNotes: readonly string[];
   readonly lines: readonly ObserverProjectionLine[];
   readonly counts: {
     readonly records: number;

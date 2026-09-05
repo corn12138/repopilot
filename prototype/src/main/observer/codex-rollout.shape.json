@@ -1,11 +1,11 @@
 {
   "vendor": "CODEX_ROLLOUT",
-  "capturedAt": "2026-09-02T11:51:38.743Z",
-  "files": 39,
-  "records": 18052,
+  "capturedAt": "2026-09-05T01:08:51.402Z",
+  "files": 198,
+  "records": 115433,
   "unparseableLines": 0,
-  "blankLines": 39,
-  "truncatedLines": 0,
+  "blankLines": 197,
+  "truncatedLines": 3455,
   "droppedForTypeCap": 0,
   "types": {
     "compacted": {
@@ -45,10 +45,21 @@
         "type"
       ],
       "optional": [
+        "metadata",
         "ordinal"
       ]
     },
     "session_meta": {
+      "required": [
+        "payload",
+        "timestamp",
+        "type"
+      ],
+      "optional": [
+        "ordinal"
+      ]
+    },
+    "token_usage_record": {
       "required": [
         "payload",
         "timestamp",
@@ -97,6 +108,7 @@
         "cwd",
         "dynamic_tools",
         "effort",
+        "file_system_sandbox_policy",
         "first_window_id",
         "forked_from_id",
         "full",
@@ -107,6 +119,7 @@
         "message",
         "model",
         "model_provider",
+        "multi_agent_mode",
         "multi_agent_version",
         "originator",
         "parent_thread_id",
@@ -115,17 +128,23 @@
         "previous_window_id",
         "realtime_active",
         "replacement_history",
+        "response_id",
+        "root_turn_id",
         "sandbox_policy",
         "session_id",
         "source",
         "state",
         "subagent_history_start_ordinal",
         "summary",
+        "thread_id",
         "thread_source",
+        "thread_token_usage",
         "timestamp",
         "timezone",
         "trigger_turn",
         "turn_id",
+        "turn_token_usage",
+        "usage",
         "window_id",
         "window_number",
         "workspace_roots"
@@ -149,6 +168,15 @@
     "agent_reasoning": {
       "required": [
         "text",
+        "type"
+      ],
+      "optional": []
+    },
+    "compaction": {
+      "required": [
+        "encrypted_content",
+        "id",
+        "internal_chat_message_metadata_passthrough",
         "type"
       ],
       "optional": []
@@ -283,11 +311,13 @@
         "duration_ms",
         "last_agent_message",
         "started_at",
-        "time_to_first_token_ms",
         "turn_id",
         "type"
       ],
-      "optional": []
+      "optional": [
+        "error",
+        "time_to_first_token_ms"
+      ]
     },
     "task_started": {
       "required": [
@@ -304,7 +334,9 @@
         "thread_settings",
         "type"
       ],
-      "optional": []
+      "optional": [
+        "thread_id"
+      ]
     },
     "token_count": {
       "required": [
@@ -352,7 +384,6 @@
     "user_message": {
       "required": [
         "audio",
-        "client_id",
         "images",
         "local_audio",
         "local_images",
@@ -360,7 +391,9 @@
         "text_elements",
         "type"
       ],
-      "optional": []
+      "optional": [
+        "client_id"
+      ]
     },
     "web_search_end": {
       "required": [

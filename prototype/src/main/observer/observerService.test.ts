@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -86,10 +86,11 @@ describe('授权与会话发现', () => {
     writeCodexRollout('rollout-broken.jsonl', null);
 
     const { sessions, counts } = service.enable(PROJECT, '~/demo-project');
+    // sessionId = vendor + 相对扫描根的路径：claude 相对项目目录，codex 相对 sessions 根
     expect(sessions.map((s) => s.sessionId).sort()).toEqual([
       'CLAUDE_JOURNAL:aaa.jsonl',
       'CLAUDE_JOURNAL:bbb.jsonl',
-      'CODEX_ROLLOUT:rollout-match.jsonl',
+      'CODEX_ROLLOUT:2026/09/02/rollout-match.jsonl',
     ]);
     expect(counts.claudeMatched).toBe(2);
     expect(counts.codexScanned).toBe(3);
@@ -142,18 +143,58 @@ describe('监视与投影', () => {
     expect(all.length).toBe(2);
   });
 
-  it('违反基线必现键 → FORMAT_UNKNOWN：正文清空、违规键名可见、计数保留', () => {
-    // 已提交基线认识 claude 的 user 且必现键不止 type —— 光杆 user 必然违规
+  it('违反消费契约（user 无 message 对象）→ FORMAT_UNKNOWN：正文清空、违规明细可见、计数保留', () => {
     writeClaudeSession('bad.jsonl', [j({ type: 'user' })], 1_000);
     service.enable(PROJECT, PROJECT);
     service.watch('CLAUDE_JOURNAL:bad.jsonl');
     const ev = events.find((e) => e.kind === 'observer.projection');
     const proj = ev?.kind === 'observer.projection' ? ev.projection : null;
     expect(proj?.status).toBe('FORMAT_UNKNOWN');
-    expect(proj?.breaking.length).toBeGreaterThan(0);
-    expect(proj?.breaking.every((b) => b.startsWith('top:user.'))).toBe(true);
+    expect(proj?.breaking).toEqual(['consumed:user.message 不是对象']);
     expect(proj?.lines).toEqual([]);
     expect(proj?.counts.records).toBe(1);
+  });
+
+  it('只与基线有出入、消费键完好 → 状态 OK、正文照常、出入进 driftNotes（2026-09-05 误报的修正）', () => {
+    // 基线认识 assistant 且必现键远不止这两个；面板只需要 type + message.content
+    writeClaudeSession('drift.jsonl', [j({ type: 'assistant', message: { content: 'hi' } })], 1_000);
+    service.enable(PROJECT, PROJECT);
+    service.watch('CLAUDE_JOURNAL:drift.jsonl');
+    const ev = events.find((e) => e.kind === 'observer.projection');
+    const proj = ev?.kind === 'observer.projection' ? ev.projection : null;
+    expect(proj?.status).toBe('OK');
+    expect(proj?.breaking).toEqual([]);
+    expect(proj?.lines).toEqual([{ seq: 0, kind: 'assistant', text: 'hi', collapsed: 1 }]);
+    expect(proj?.driftNotes.length).toBeGreaterThan(0);
+    expect(proj?.driftNotes.every((d) => d.startsWith('top:assistant.'))).toBe(true);
+  });
+
+  it('消费契约的另两类违规：codex payload 非对象；claude content 既非字符串也非数组', () => {
+    writeClaudeSession('c1.jsonl', [j({ type: 'assistant', message: { content: 42 } })], 1_000);
+    writeCodexRollout('rollout-c2.jsonl', PROJECT, [j({ type: 'response_item', payload: 'nope' })]);
+    service.enable(PROJECT, PROJECT);
+    service.watch('CLAUDE_JOURNAL:c1.jsonl');
+    let ev = events.findLast((e) => e.kind === 'observer.projection');
+    expect(ev?.kind === 'observer.projection' && ev.projection.breaking).toEqual([
+      'consumed:assistant.message.content 既不是字符串也不是数组',
+    ]);
+    service.watch('CODEX_ROLLOUT:2026/09/02/rollout-c2.jsonl');
+    ev = events.findLast((e) => e.kind === 'observer.projection');
+    expect(ev?.kind === 'observer.projection' && ev.projection.breaking).toEqual(['consumed:payload 不是对象']);
+  });
+
+  it('claude 只列顶层会话：subagents/ 与各会话的 journal.jsonl 不进列表但计数；同名不再互相覆盖', () => {
+    const dir = claudeDirOf(PROJECT);
+    mkdirSync(join(dir, 'sess-a', 'subagents'), { recursive: true });
+    mkdirSync(join(dir, 'sess-b'), { recursive: true });
+    writeFileSync(join(dir, 'sess-a.jsonl'), `${j({ type: 'spec' })}\n`);
+    writeFileSync(join(dir, 'sess-a', 'subagents', 'agent-1.jsonl'), `${j({ type: 'spec' })}\n`);
+    writeFileSync(join(dir, 'sess-a', 'journal.jsonl'), `${j({ type: 'spec' })}\n`);
+    writeFileSync(join(dir, 'sess-b', 'journal.jsonl'), `${j({ type: 'spec' })}\n`);
+    const { sessions, counts } = service.enable(PROJECT, PROJECT);
+    expect(sessions.map((s) => s.sessionId)).toEqual(['CLAUDE_JOURNAL:sess-a.jsonl']);
+    expect(counts.claudeMatched).toBe(1);
+    expect(counts.claudeNestedSkipped).toBe(3);
   });
 
   it('坏行/空行计数如实，且不影响其余记录的投影', () => {
@@ -200,6 +241,89 @@ describe('撤销即清除', () => {
     service.pollOnce();
     expect(events).toEqual([]);
     expect(() => service.listSessions()).toThrow(ObserverError);
+  });
+});
+
+describe('边界与对抗输入', () => {
+  it('enable 只收规范化绝对路径：空串 / 相对路径 / 含 .. 的路径一律 BAD_REQUEST（否则空串会扫遍所有项目）', () => {
+    for (const bad of ['', 'relative/dir', '/a/../b', '/a/./b']) {
+      expect(() => service.enable(bad, bad)).toThrow(/规范化的绝对路径/);
+    }
+    expect(service.status().granted).toBeNull();
+  });
+
+  it('sessionId 里的路径穿越只会撞 UNKNOWN_SESSION —— 会话只能来自 listSessions 的映射', () => {
+    writeClaudeSession('ok.jsonl', [j({ type: 'spec' })], 1_000);
+    service.enable(PROJECT, PROJECT);
+    for (const evil of ['CLAUDE_JOURNAL:../../../etc/passwd', 'CODEX_ROLLOUT:/etc/passwd', 'ok.jsonl']) {
+      expect(() => service.watch(evil)).toThrow(/未知会话/);
+    }
+  });
+
+  it('CRLF 行尾与首行 BOM 都能读；符号链接的会话文件不进列表', () => {
+    const dir = claudeDirOf(PROJECT);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'crlf.jsonl'), `\uFEFF${j({ type: 'spec' })}\r\n${j({ type: 'spec' })}\r\n`);
+    writeFileSync(join(dir, 'real.jsonl'), `${j({ type: 'spec' })}\n`);
+    symlinkSync(join(dir, 'real.jsonl'), join(dir, 'link.jsonl'));
+    const { sessions } = service.enable(PROJECT, PROJECT);
+    expect(sessions.map((s) => s.label).sort()).toEqual(['crlf', 'real']);
+
+    service.watch('CLAUDE_JOURNAL:crlf.jsonl');
+    const ev = events.findLast((e) => e.kind === 'observer.projection');
+    const proj = ev?.kind === 'observer.projection' ? ev.projection : null;
+    expect(proj?.counts.records).toBe(2);
+    expect(proj?.counts.unparseableLines).toBe(0);
+  });
+
+  it('被监视的文件消失：pollOnce 静默、不抛、不推；文件被截短：重读并如实报新计数', () => {
+    const p = writeClaudeSession('rot.jsonl', [j({ type: 'a' }), j({ type: 'b' }), j({ type: 'c' })], 1_000);
+    service.enable(PROJECT, PROJECT);
+    service.watch('CLAUDE_JOURNAL:rot.jsonl');
+    expect(events.filter((e) => e.kind === 'observer.projection').length).toBe(1);
+
+    writeFileSync(p, `${j({ type: 'a' })}\n`); // 截短（如日志轮转）
+    utimesSync(p, 2_000, 2_000);
+    service.pollOnce();
+    const shrunk = events.findLast((e) => e.kind === 'observer.projection');
+    expect(shrunk?.kind === 'observer.projection' && shrunk.projection.counts.records).toBe(1);
+
+    rmSync(p);
+    const before = events.length;
+    expect(() => service.pollOnce()).not.toThrow();
+    expect(events.length).toBe(before);
+  });
+
+  it('超过 4MB 的文件只读尾部：报跳过字节数，丢掉第一个残行后无坏行', () => {
+    const line = j({ type: 'spec', pad: 'x'.repeat(90) });
+    const count = Math.ceil(4_500_000 / (line.length + 1));
+    writeClaudeSession('huge.jsonl', Array.from({ length: count }, () => line), 1_000);
+    service.enable(PROJECT, PROJECT);
+    service.watch('CLAUDE_JOURNAL:huge.jsonl');
+    const ev = events.findLast((e) => e.kind === 'observer.projection');
+    const proj = ev?.kind === 'observer.projection' ? ev.projection : null;
+    expect(proj?.counts.headBytesSkipped).toBeGreaterThan(0);
+    expect(proj?.counts.unparseableLines).toBe(0);
+    expect(proj?.counts.records).toBeGreaterThan(1000);
+    expect(proj?.lines.length).toBe(1); // 全是同类标签行 → 折叠成一行
+  });
+
+  it('codex 首行几十 KB（真实 rollout 带整段 base_instructions）必须读得出；超 2MB 上限才判读不出', () => {
+    const dir = join(codexRoot, '2026', '09', '05');
+    mkdirSync(dir, { recursive: true });
+    // 真实首行 19–49KB：16KB 一次性探测曾把 400/400 个文件判成读不出
+    writeFileSync(
+      join(dir, 'rollout-fat.jsonl'),
+      `${j({ type: 'session_meta', payload: { base_instructions: 'x'.repeat(48_000), cwd: PROJECT } })}\n`,
+    );
+    writeFileSync(
+      join(dir, 'rollout-absurd.jsonl'),
+      `${j({ type: 'session_meta', payload: { base_instructions: 'x'.repeat(2_100_000), cwd: PROJECT } })}\n`,
+    );
+    const { sessions, counts } = service.enable(PROJECT, PROJECT);
+    expect(sessions.map((s) => s.sessionId)).toEqual(['CODEX_ROLLOUT:2026/09/05/rollout-fat.jsonl']);
+    expect(counts.codexMatched).toBe(1);
+    expect(counts.codexUnreadable).toBe(1);
   });
 });
 

@@ -33,6 +33,7 @@ const SESSION = {
 const COUNTS = {
   claudeMatched: 1,
   claudeSkippedByCap: 0,
+  claudeNestedSkipped: 0,
   codexScanned: 3,
   codexMatched: 0,
   codexSkippedByCap: 0,
@@ -45,6 +46,7 @@ function projection(over: Partial<ObserverProjection> = {}): ObserverProjection 
     vendor: 'CLAUDE_JOURNAL',
     status: 'OK',
     breaking: [],
+    driftNotes: [],
     lines: [{ seq: 0, kind: 'assistant', text: '你好，这是镜像正文', collapsed: 1 }],
     counts: { records: 3, shownLines: 1, omittedLines: 0, unparseableLines: 0, blankLines: 1, headBytesSkipped: 0 },
     fileUpdatedAt: new Date().toISOString(),
@@ -124,11 +126,17 @@ describe('观察面板', () => {
 
     push({
       kind: 'observer.projection',
-      projection: projection({ status: 'FORMAT_UNKNOWN', breaking: ['top:user.uuid'], lines: [] }),
+      projection: projection({
+        status: 'FORMAT_UNKNOWN',
+        breaking: ['consumed:user.message 不是对象'],
+        lines: [],
+      }),
     });
     expect(await screen.findByText(/格式未知/)).toBeTruthy();
-    expect(screen.getByText(/top:user\.uuid/)).toBeTruthy();
-    expect(screen.getByText(/probe:journals/)).toBeTruthy();
+    expect(screen.getByText(/消费键契约/)).toBeTruthy();
+    expect(screen.getByText(/consumed:user\.message 不是对象/)).toBeTruthy();
+    // 消费契约违规不是基线问题 —— 这里不该引导用户去重建基线
+    expect(screen.queryByText(/probe:journals/)).toBeNull();
     expect(screen.queryByText(/你好，这是镜像正文/)).toBeNull();
   });
 
@@ -152,6 +160,41 @@ describe('观察面板', () => {
     expect(await screen.findByText('选择项目目录并启用观察')).toBeTruthy();
     expect(screen.queryByText(/你好，这是镜像正文/)).toBeNull();
     expect(screen.queryByText(/Claude · abc/)).toBeNull();
+  });
+
+  it('授权来自 Main 侧推送（非本视图发起）时也会去拉会话列表 —— selftest 截图抓到的空档', async () => {
+    observerCallMock.mockImplementation(async (method: string) => {
+      if (method === 'observer.status') return { granted: null, watching: null };
+      if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
+      if (method === 'observer.unwatch') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<ObserverView />);
+    await screen.findByText('选择项目目录并启用观察');
+
+    push({ kind: 'observer.state', state: { granted: '~/pushed', watching: null } });
+    expect(await screen.findByText('~/pushed')).toBeTruthy();
+    expect(await screen.findByText(/Claude · abc/)).toBeTruthy();
+    expect(observerCallMock).toHaveBeenCalledWith('observer.listSessions', {});
+  });
+
+  it('基线出入只提示不阻断：正文照常渲染，附一行出入说明与重建命令', async () => {
+    observerCallMock.mockImplementation(async (method: string) => {
+      if (method === 'observer.status') return { granted: '~/demo', watching: null };
+      if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
+      if (method === 'observer.unwatch') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<ObserverView />);
+    await screen.findByText('~/demo');
+    push({
+      kind: 'observer.projection',
+      projection: projection({ driftNotes: ['top:bridge-session.ownerAccountUuid'] }),
+    });
+    expect(await screen.findByText(/你好，这是镜像正文/)).toBeTruthy();
+    expect(screen.getByText(/字段基线有 1 处出入（面板依赖键完好，仍可读）/)).toBeTruthy();
+    expect(screen.getByText(/bridge-session\.ownerAccountUuid/)).toBeTruthy();
+    expect(screen.queryByText(/格式未知/)).toBeNull();
   });
 
   it('listSessions 失败：错误横幅可见，不假装列表为空', async () => {

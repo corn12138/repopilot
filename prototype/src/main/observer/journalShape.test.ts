@@ -211,6 +211,11 @@ describe('discoverJournalFiles：有界扫描', () => {
     const missing = discoverJournalFiles(join(dir, 'no-such-dir'), { maxFiles: 5 });
     expect(missing.files).toEqual([]);
     expect(missing.unreadableDirs).toBe(1);
+
+    // maxDepth=1 只收 root 直属文件；更深的不是被忽略而是被计数
+    const shallow = discoverJournalFiles(dir, { maxFiles: 10, maxDepth: 1 });
+    expect(shallow.files.map((f) => f.split('/').pop())).toEqual(['old.jsonl']);
+    expect(shallow.skippedByDepth).toBe(2);
   });
 
   it('fileNameFilter 生效（codex 只认 rollout-*）', () => {

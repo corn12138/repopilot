@@ -58,6 +58,13 @@ export function ObserverView() {
         setSessions([]);
         setCounts(null);
         setProjection(null);
+      } else {
+        /*
+         * 授权可能不是本视图发起的（selftest 直接在服务层授权；将来任何 Main 侧的授权入口
+         * 都一样）：state 推送只说"已授权"，会话列表得自己去拉。2026-09-05 的 selftest
+         * 截图抓到的就是这个空档 —— 视图显示已授权，列表却是空的。
+         */
+        void refreshSessions();
       }
     });
     void observerCall('observer.status', {})
@@ -155,7 +162,8 @@ export function ObserverView() {
             {counts && (
               <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
                 claude 命中 {counts.claudeMatched}
-                {counts.claudeSkippedByCap > 0 ? `（上限跳过 ${counts.claudeSkippedByCap}）` : ''} · codex
+                {counts.claudeSkippedByCap > 0 ? `（上限跳过 ${counts.claudeSkippedByCap}）` : ''}
+                {counts.claudeNestedSkipped > 0 ? `（子代理/子文件 ${counts.claudeNestedSkipped} 个未列）` : ''} · codex
                 扫描 {counts.codexScanned} 命中 {counts.codexMatched}
                 {counts.codexSkippedByCap > 0 ? `（上限跳过 ${counts.codexSkippedByCap}）` : ''}
                 {counts.codexUnreadable > 0 ? ` · 首行读不出 ${counts.codexUnreadable}` : ''}
@@ -166,7 +174,14 @@ export function ObserverView() {
                 该目录下没有发现本机代理会话日志。
               </div>
             ) : (
-              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 2 }}>
+              /*
+               * 列表限高可滚：真实项目一列 28 个会话时，镜像卡会被推到首屏之外
+               * （2026-09-05 selftest 截图 04 抓到的）。列表是入口，镜像才是主体。
+               */
+              <div
+                style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 280, overflow: 'auto' }}
+                aria-label="可观察的会话列表"
+              >
                 {sessions.map((s) => (
                   <button
                     key={s.sessionId}
@@ -201,9 +216,8 @@ export function ObserverView() {
             <Banner tone="err">
               <strong>格式未知 —— 已停止解读正文。</strong>
               <div style={{ fontSize: 12, marginTop: 4 }}>
-                记录违反了已提交的字段快照基线（宁可不读，不可错读）。违规键：
-                {projection.breaking.join('、')}。两家升级后请重跑
-                <code> REPOPILOT_PROBE_JOURNALS=update pnpm probe:journals </code>重建基线。
+                记录不满足面板的消费键契约（宁可不读，不可错读）：{projection.breaking.join('、')}。
+                这通常意味着该工具的日志格式已变，需要更新面板的解析器。
               </div>
             </Banner>
           ) : (
@@ -215,6 +229,13 @@ export function ObserverView() {
                 )
                 .join('\n')}
             </pre>
+          )}
+          {projection.driftNotes.length > 0 && (
+            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
+              字段基线有 {projection.driftNotes.length} 处出入（面板依赖键完好，仍可读）：
+              {projection.driftNotes.join('、')}。可用
+              <code> REPOPILOT_PROBE_JOURNALS=update pnpm probe:journals </code>重建基线。
+            </div>
           )}
           <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
             记录 {projection.counts.records} · 显示 {projection.counts.shownLines} 行

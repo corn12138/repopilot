@@ -18,7 +18,7 @@ import { ObserverError, ObserverService } from './observerService';
  *
  * 轮询定时器只在真的有会话被监视时存在：面板关闭 / 未授权时零 IO。
  */
-export function registerObserverIpc(getWindow: () => BrowserWindow | null): void {
+export function registerObserverIpc(getWindow: () => BrowserWindow | null): { service: ObserverService } {
   const service = new ObserverService({
     claudeProjectsRoot: join(homedir(), '.claude', 'projects'),
     codexSessionsRoot: join(homedir(), '.codex', 'sessions'),
@@ -110,4 +110,8 @@ export function registerObserverIpc(getWindow: () => BrowserWindow | null): void
       }
     },
   );
+
+  // 只给自检用：让 selftest 能在不经对话框的前提下驱动真实服务（opt-in、只读）。
+  // 生产路径的授权仍只有 observer.enable 的原生对话框一条。
+  return { service };
 }
