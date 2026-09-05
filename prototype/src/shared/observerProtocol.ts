@@ -97,10 +97,17 @@ export interface ObserverProjection {
   readonly active: boolean;
 }
 
+/**
+ * 同屏镜像上限。双镜像是"甲乙对照"的最小形态；也是 IO 上限 —— 每个镜像一份轮询。
+ * 放在 shared：Renderer 要用它写"最多同屏 N 个"的文案，Main 用它做槛。
+ */
+export const OBSERVER_MAX_MIRRORS = 2;
+
 export interface ObserverStateSnapshot {
   /** 已授权项目的展示路径（home 缩写为 ~）；未授权为 null */
   readonly granted: string | null;
-  readonly watching: string | null;
+  /** 正在监视的会话，**有序**（先选的在前 = 左槽）；满槛再选会顶掉最早的一个 */
+  readonly watching: readonly string[];
 }
 
 // ---- 请求 / 响应 ----
@@ -119,8 +126,10 @@ export interface ObserverRequestMap {
     payload: Record<string, never>;
     response: { sessions: readonly ObserverSessionEntry[]; counts: ObserverSweepCounts };
   };
+  /** 加入一个镜像槽；已满则顶掉最早的；状态推送随后到达（含新的有序 watching） */
   'observer.watch': { payload: { sessionId: string }; response: { ok: true } };
-  'observer.unwatch': { payload: Record<string, never>; response: { ok: true } };
+  /** 不带 sessionId = 全部停止（关面板时用）；带 = 只关那一个镜像 */
+  'observer.unwatch': { payload: { sessionId?: string }; response: { ok: true } };
 }
 
 export type ObserverMethod = keyof ObserverRequestMap;

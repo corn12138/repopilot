@@ -81,7 +81,7 @@ function installBridges(): { observerRequest: ReturnType<typeof vi.fn> } {
   } satisfies Partial<RepoPilotBridge> as RepoPilotBridge;
 
   const observerRequest = vi.fn(async (method: string) => {
-    if (method === 'observer.status') return { ok: true, data: { granted: null, watching: null } };
+    if (method === 'observer.status') return { ok: true, data: { granted: null, watching: [] } };
     if (method === 'observer.unwatch') return { ok: true, data: { ok: true } };
     return { ok: false, error: { code: 'BAD_REQUEST', message: `unexpected ${method}`, detail: null } };
   });

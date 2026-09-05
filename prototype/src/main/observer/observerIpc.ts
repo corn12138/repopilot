@@ -30,7 +30,7 @@ export function registerObserverIpc(getWindow: () => BrowserWindow | null): { se
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   const syncPollTimer = (): void => {
-    const watching = service.status().watching !== null;
+    const watching = service.status().watching.length > 0;
     if (watching && pollTimer === null) {
       pollTimer = setInterval(() => service.pollOnce(), 1500);
     } else if (!watching && pollTimer !== null) {
@@ -89,7 +89,7 @@ export function registerObserverIpc(getWindow: () => BrowserWindow | null): { se
             syncPollTimer();
             return { ok: true, data: { ok: true } };
           case 'observer.unwatch':
-            service.unwatch();
+            service.unwatch(req.payload.sessionId);
             syncPollTimer();
             return { ok: true, data: { ok: true } };
         }

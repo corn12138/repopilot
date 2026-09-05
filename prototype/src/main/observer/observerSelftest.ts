@@ -126,26 +126,47 @@ export async function runObserverSelftest(
       await capture(webContents, opts.captureDir, '03-observer-granted.png', passes);
 
       if (listed.sessions.length > 0) {
-        const picked = await js<boolean>(
-          `(() => { const b = [...document.querySelectorAll('button')].find(x => /^(CLAUDE_JOURNAL|CODEX_ROLLOUT):/.test(x.title || '')); if (!b) return false; b.click(); return true; })()`,
-        );
-        if (!picked) failures.push('已授权态下找不到任何会话按钮');
+        // 各家点一个：有两家就是"甲乙同屏对照"，只有一家就单镜像
+        const picked = await js<number>(`(() => {
+          const buttons = [...document.querySelectorAll('button')];
+          let n = 0;
+          for (const vendor of ['CLAUDE_JOURNAL', 'CODEX_ROLLOUT']) {
+            const b = buttons.find(x => (x.title || '').startsWith(vendor + ':'));
+            if (b) { b.click(); n += 1; }
+          }
+          return n;
+        })()`);
+        if (picked === 0) failures.push('已授权态下找不到任何会话按钮');
         const projected = await waitForDom(
           webContents,
-          `document.body.innerText.includes('会话镜像 ·') && /记录 \\d+/.test(document.body.innerText)`,
-          6000,
+          `document.querySelectorAll('pre.output').length >= ${Math.max(1, picked)}`,
+          8000,
         );
         if (projected) {
-          const summary = await js<string>(
-            `(() => { const m = document.body.innerText.match(/记录 \\d+[^\\n]*/); return m ? m[0] : ''; })()`,
+          const summaries = await js<string[]>(
+            `[...document.body.innerText.matchAll(/记录 \\d+[^\\n]*/g)].map(m => m[0])`,
           );
-          passes.push(`点选会话后投影到达并渲染：${summary}`);
-          // 截图要拍到断言所指的东西：把镜像卡滚进视口，别让"文字过了、画面没有"再发生
-          await js<void>(`(() => { const pre = document.querySelector('pre.output'); if (pre) pre.scrollIntoView({ block: 'center' }); })()`);
+          passes.push(`点选 ${picked} 个会话后投影到达并渲染（${summaries.length} 个镜像）：${summaries.join(' ｜ ')}`);
+          // 截图要拍到断言所指的东西：把镜像区滚进视口，别让"文字过了、画面没有"再发生
+          await js<void>(`(() => { const grid = document.querySelector('[aria-label="会话镜像"]'); if (grid) grid.scrollIntoView({ block: 'start' }); })()`);
         } else {
-          failures.push('点选会话后 6s 内没有渲染出投影');
+          failures.push(`点选 ${picked} 个会话后 8s 内没有渲染出全部投影`);
         }
         await capture(webContents, opts.captureDir, '04-observer-projection.png', passes);
+
+        // 关掉一个镜像：只影响那一格，另一格与列表都在
+        const closed = await js<boolean>(
+          `(() => { const b = [...document.querySelectorAll('button')].find(x => (x.textContent || '').trim() === '关闭镜像'); if (!b) return false; b.click(); return true; })()`,
+        );
+        if (closed) {
+          const shrunk = await waitForDom(
+            webContents,
+            `document.querySelectorAll('pre.output').length === ${Math.max(0, picked - 1)}`,
+            3000,
+          );
+          if (shrunk) passes.push('关闭单个镜像后只少了那一格（状态推送驱动，Renderer 不自己猜）');
+          else failures.push('关闭单个镜像后 3s 内镜像数没有相应减少');
+        }
       }
 
       service.disable();

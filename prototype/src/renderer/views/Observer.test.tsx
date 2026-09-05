@@ -63,7 +63,7 @@ beforeEach(() => {
   pushHandlers = [];
   observerCallMock.mockReset();
   observerCallMock.mockImplementation(async (method: string) => {
-    if (method === 'observer.status') return { granted: null, watching: null };
+    if (method === 'observer.status') return { granted: null, watching: [] };
     if (method === 'observer.unwatch') return { ok: true };
     throw new Error(`unexpected ${method}`);
   });
@@ -74,7 +74,7 @@ afterEach(cleanup);
 describe('观察面板', () => {
   it('未授权：显示启用入口与信任边界文案；授权取消时不建立任何状态', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
-      if (method === 'observer.status') return { granted: null, watching: null };
+      if (method === 'observer.status') return { granted: null, watching: [] };
       if (method === 'observer.enable') return { granted: null };
       if (method === 'observer.unwatch') return { ok: true };
       throw new Error(`unexpected ${method}`);
@@ -92,7 +92,7 @@ describe('观察面板', () => {
 
   it('授权成功：显示展示路径、扫描账目与会话列表；点会话发起 watch；投影推送后渲染正文与计数', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
-      if (method === 'observer.status') return { granted: null, watching: null };
+      if (method === 'observer.status') return { granted: null, watching: [] };
       if (method === 'observer.enable')
         return { granted: '~/demo', sessions: [SESSION], counts: COUNTS };
       if (method === 'observer.watch') return { ok: true };
@@ -116,7 +116,7 @@ describe('观察面板', () => {
 
   it('FORMAT_UNKNOWN：停止渲染正文，给出违规键名与重建基线命令', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
-      if (method === 'observer.status') return { granted: '~/demo', watching: null };
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
       if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
       if (method === 'observer.unwatch') return { ok: true };
       throw new Error(`unexpected ${method}`);
@@ -142,7 +142,7 @@ describe('观察面板', () => {
 
   it('撤销：state.granted=null 推送后，列表与投影一并清空，回到启用入口', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
-      if (method === 'observer.status') return { granted: '~/demo', watching: null };
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
       if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
       if (method === 'observer.disable') return { ok: true };
       if (method === 'observer.unwatch') return { ok: true };
@@ -155,7 +155,7 @@ describe('观察面板', () => {
 
     fireEvent.click(screen.getByText('关闭观察'));
     await waitFor(() => expect(observerCallMock).toHaveBeenCalledWith('observer.disable', {}));
-    push({ kind: 'observer.state', state: { granted: null, watching: null } });
+    push({ kind: 'observer.state', state: { granted: null, watching: [] } });
 
     expect(await screen.findByText('选择项目目录并启用观察')).toBeTruthy();
     expect(screen.queryByText(/你好，这是镜像正文/)).toBeNull();
@@ -164,7 +164,7 @@ describe('观察面板', () => {
 
   it('授权来自 Main 侧推送（非本视图发起）时也会去拉会话列表 —— selftest 截图抓到的空档', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
-      if (method === 'observer.status') return { granted: null, watching: null };
+      if (method === 'observer.status') return { granted: null, watching: [] };
       if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
       if (method === 'observer.unwatch') return { ok: true };
       throw new Error(`unexpected ${method}`);
@@ -172,7 +172,7 @@ describe('观察面板', () => {
     render(<ObserverView />);
     await screen.findByText('选择项目目录并启用观察');
 
-    push({ kind: 'observer.state', state: { granted: '~/pushed', watching: null } });
+    push({ kind: 'observer.state', state: { granted: '~/pushed', watching: [] } });
     expect(await screen.findByText('~/pushed')).toBeTruthy();
     expect(await screen.findByText(/Claude · abc/)).toBeTruthy();
     expect(observerCallMock).toHaveBeenCalledWith('observer.listSessions', {});
@@ -180,7 +180,7 @@ describe('观察面板', () => {
 
   it('基线出入只提示不阻断：正文照常渲染，附一行出入说明与重建命令', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
-      if (method === 'observer.status') return { granted: '~/demo', watching: null };
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
       if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
       if (method === 'observer.unwatch') return { ok: true };
       throw new Error(`unexpected ${method}`);
@@ -197,9 +197,49 @@ describe('观察面板', () => {
     expect(screen.queryByText(/格式未知/)).toBeNull();
   });
 
+  it('双镜像：两个会话并排各一张镜像卡（槽位序来自 Main 推送）；关闭一个只发那一个的 unwatch', async () => {
+    const second = { ...SESSION, sessionId: 'CODEX_ROLLOUT:2026/09/05/rollout-x.jsonl', vendor: 'CODEX_ROLLOUT' as const, label: 'rollout-x' };
+    observerCallMock.mockImplementation(async (method: string) => {
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
+      if (method === 'observer.listSessions') return { sessions: [SESSION, second], counts: COUNTS };
+      if (method === 'observer.watch') return { ok: true };
+      if (method === 'observer.unwatch') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<ObserverView />);
+    await screen.findByText('~/demo');
+
+    fireEvent.click(screen.getByText(/Claude · abc/));
+    fireEvent.click(screen.getByText(/Codex · rollout-x/));
+    push({ kind: 'observer.state', state: { granted: '~/demo', watching: [SESSION.sessionId, second.sessionId] } });
+    push({ kind: 'observer.projection', projection: projection() });
+    push({
+      kind: 'observer.projection',
+      projection: projection({
+        sessionId: second.sessionId,
+        vendor: 'CODEX_ROLLOUT',
+        lines: [{ seq: 0, kind: 'assistant', text: '这是 codex 那一格', collapsed: 1 }],
+      }),
+    });
+    expect(await screen.findByText(/你好，这是镜像正文/)).toBeTruthy();
+    expect(screen.getByText(/这是 codex 那一格/)).toBeTruthy();
+    expect(screen.getAllByText('关闭镜像')).toHaveLength(2);
+    expect(screen.getAllByText(/镜像中/)).toHaveLength(2);
+
+    fireEvent.click(screen.getAllByText('关闭镜像')[0]!);
+    await waitFor(() =>
+      expect(observerCallMock).toHaveBeenCalledWith('observer.unwatch', { sessionId: SESSION.sessionId }),
+    );
+    // 槛位以 Main 为准：推送新的 watching 后，被关掉那格连投影一起消失
+    push({ kind: 'observer.state', state: { granted: '~/demo', watching: [second.sessionId] } });
+    await waitFor(() => expect(screen.queryByText(/你好，这是镜像正文/)).toBeNull());
+    expect(screen.getByText(/这是 codex 那一格/)).toBeTruthy();
+    expect(screen.getAllByText('关闭镜像')).toHaveLength(1);
+  });
+
   it('listSessions 失败：错误横幅可见，不假装列表为空', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
-      if (method === 'observer.status') return { granted: '~/demo', watching: null };
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
       if (method === 'observer.listSessions') throw new Error('磁盘读取失败');
       if (method === 'observer.unwatch') return { ok: true };
       throw new Error(`unexpected ${method}`);

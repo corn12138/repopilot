@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type {
-  ObserverProjection,
-  ObserverSessionEntry,
-  ObserverSweepCounts,
+import {
+  OBSERVER_MAX_MIRRORS,
+  type ObserverProjection,
+  type ObserverSessionEntry,
+  type ObserverSweepCounts,
 } from '@shared/observerProtocol';
 import { observerCall, observerSubscribe } from '../observerBridge';
 import { Banner, Card, relativeTime } from '../components/common';
@@ -14,6 +15,11 @@ import { Banner, Card, relativeTime } from '../components/common';
  * 列会话、渲染 Main 推来的 volatile 投影。四条信任边界（DEC-020）里它负责说人话：
  * 登录态属用户、只读、零出站、可随时关闭。所有计数如实展示 —— 省略要报数。
  *
+ * 双镜像（2026-09-05）：最多 OBSERVER_MAX_MIRRORS 个会话并排镜像，这是"甲乙对照"的最小形态。
+ * 并排是**视图内部排版**：观察视图本身是主栏里的全屏视图（与设置/证据同级），不新增 grid 列、
+ * 不动三栏任何宽度 —— N12「布局恒定」不受影响（交互评审 v0.2 §5.2 补注）。
+ * 槽位序由 Main 的 observer.state 推送决定（先选在左），Renderer 不自己维护第二份真值。
+ *
  * 这里的一切都不进 Run/Approval/Verification：徽标只是导航，正文只是镜像，
  * 改动要进主线仍走正常任务流程（PRD-WKB-003 采纳桥是另一条未开工的路）。
  */
@@ -21,8 +27,8 @@ export function ObserverView() {
   const [granted, setGranted] = useState<string | null>(null);
   const [sessions, setSessions] = useState<readonly ObserverSessionEntry[]>([]);
   const [counts, setCounts] = useState<ObserverSweepCounts | null>(null);
-  const [watching, setWatching] = useState<string | null>(null);
-  const [projection, setProjection] = useState<ObserverProjection | null>(null);
+  const [watching, setWatching] = useState<readonly string[]>([]);
+  const [projections, setProjections] = useState<Readonly<Record<string, ObserverProjection>>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const activeRef = useRef(true);
@@ -48,16 +54,22 @@ export function ObserverView() {
     const unsubscribe = observerSubscribe((event) => {
       if (!activeRef.current) return;
       if (event.kind === 'observer.projection') {
-        setProjection(event.projection);
+        const id = event.projection.sessionId;
+        setProjections((prev) => ({ ...prev, [id]: event.projection }));
+        // Main 推来投影 = 它在镜像中；状态推送通常先到，这里只是补位，不改槽位序
+        setWatching((prev) => (prev.includes(id) ? prev : [...prev, id]));
         return;
       }
       setGranted(event.state.granted);
       setWatching(event.state.watching);
+      // 被顶掉/被关闭的镜像，其投影一并丢弃 —— 槽位以 Main 为准，不留残影
+      setProjections((prev) =>
+        Object.fromEntries(Object.entries(prev).filter(([id]) => event.state.watching.includes(id))),
+      );
       if (event.state.granted === null) {
-        // 撤销即清除：Main 清缓存，这里清投影 —— 两边都不留残影
+        // 撤销即清除：Main 清缓存，这里清列表 —— 两边都不留残影
         setSessions([]);
         setCounts(null);
-        setProjection(null);
       } else {
         /*
          * 授权可能不是本视图发起的（selftest 直接在服务层授权；将来任何 Main 侧的授权入口
@@ -78,7 +90,7 @@ export function ObserverView() {
     return () => {
       activeRef.current = false;
       unsubscribe();
-      // 关闭面板就停止监视：没人看的镜像不该继续产生 IO
+      // 关闭面板就停止全部监视：没人看的镜像不该继续产生 IO
       void observerCall('observer.unwatch', {}).catch(() => {});
     };
   }, [refreshSessions, report]);
@@ -108,11 +120,19 @@ export function ObserverView() {
     }
   };
 
+  /** 加入镜像槽。槽位序与顶替由 Main 决定并经 state 推送回来 */
   const watch = async (sessionId: string) => {
     setError(null);
     try {
       await observerCall('observer.watch', { sessionId });
-      if (activeRef.current) setWatching(sessionId);
+    } catch (err) {
+      report(err);
+    }
+  };
+
+  const unwatchOne = async (sessionId: string) => {
+    try {
+      await observerCall('observer.unwatch', { sessionId });
     } catch (err) {
       report(err);
     }
@@ -120,6 +140,8 @@ export function ObserverView() {
 
   const vendorLabel = (v: ObserverSessionEntry['vendor']) =>
     v === 'CLAUDE_JOURNAL' ? 'Claude' : 'Codex';
+  const labelOf = (sessionId: string) =>
+    sessions.find((s) => s.sessionId === sessionId)?.label ?? sessionId.replace(/^[A-Z_]+:/, '');
 
   return (
     <>
@@ -169,6 +191,9 @@ export function ObserverView() {
                 {counts.codexUnreadable > 0 ? ` · 首行读不出 ${counts.codexUnreadable}` : ''}
               </div>
             )}
+            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+              点会话加入镜像，最多同屏 {OBSERVER_MAX_MIRRORS} 个；满了会替换最早的一个。
+            </div>
             {sessions.length === 0 ? (
               <div className="empty" style={{ marginTop: 8 }}>
                 该目录下没有发现本机代理会话日志。
@@ -182,70 +207,99 @@ export function ObserverView() {
                 style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 280, overflow: 'auto' }}
                 aria-label="可观察的会话列表"
               >
-                {sessions.map((s) => (
-                  <button
-                    key={s.sessionId}
-                    className={`list-item ${watching === s.sessionId ? 'active' : ''}`}
-                    onClick={() => void watch(s.sessionId)}
-                    title={s.sessionId}
-                  >
-                    <div className="name">
-                      {vendorLabel(s.vendor)} · {s.label}
-                    </div>
-                    <div className="meta">
-                      {relativeTime(s.updatedAt)} · {(s.sizeBytes / 1024).toFixed(0)}KB
-                    </div>
-                  </button>
-                ))}
+                {sessions.map((s) => {
+                  const mirrored = watching.includes(s.sessionId);
+                  return (
+                    <button
+                      key={s.sessionId}
+                      className={`list-item ${mirrored ? 'active' : ''}`}
+                      onClick={() => void watch(s.sessionId)}
+                      title={s.sessionId}
+                      aria-pressed={mirrored}
+                    >
+                      <div className="name">
+                        {vendorLabel(s.vendor)} · {s.label}
+                        {mirrored ? '　镜像中' : ''}
+                      </div>
+                      <div className="meta">
+                        {relativeTime(s.updatedAt)} · {(s.sizeBytes / 1024).toFixed(0)}KB
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>
         )}
       </Card>
 
-      {projection && (
-        <Card
-          title={`会话镜像 · ${vendorLabel(projection.vendor)}`}
-          hint={
-            projection.active
-              ? '活跃（启发式，仅导航提示）'
-              : `最后更新 ${relativeTime(projection.fileUpdatedAt)}`
-          }
+      {watching.length > 0 && (
+        <div
+          aria-label="会话镜像"
+          style={{
+            display: 'grid',
+            gridTemplateColumns: watching.length > 1 ? 'repeat(2, minmax(0, 1fr))' : 'minmax(0, 1fr)',
+            gap: 12,
+            alignItems: 'start',
+          }}
         >
-          {projection.status === 'FORMAT_UNKNOWN' ? (
-            <Banner tone="err">
-              <strong>格式未知 —— 已停止解读正文。</strong>
-              <div style={{ fontSize: 12, marginTop: 4 }}>
-                记录不满足面板的消费键契约（宁可不读，不可错读）：{projection.breaking.join('、')}。
-                这通常意味着该工具的日志格式已变，需要更新面板的解析器。
-              </div>
-            </Banner>
-          ) : (
-            <pre className="output" style={{ maxHeight: 420, overflow: 'auto', whiteSpace: 'pre-wrap' }}>
-              {projection.lines
-                .map(
-                  (l) =>
-                    `${l.kind}${l.collapsed > 1 ? ` ×${l.collapsed}` : ''}${l.text ? `：${l.text}` : ''}`,
-                )
-                .join('\n')}
-            </pre>
-          )}
-          {projection.driftNotes.length > 0 && (
-            <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
-              字段基线有 {projection.driftNotes.length} 处出入（面板依赖键完好，仍可读）：
-              {projection.driftNotes.join('、')}。可用
-              <code> REPOPILOT_PROBE_JOURNALS=update pnpm probe:journals </code>重建基线。
-            </div>
-          )}
-          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
-            记录 {projection.counts.records} · 显示 {projection.counts.shownLines} 行
-            {projection.counts.omittedLines > 0 ? `（更早的 ${projection.counts.omittedLines} 行未显示）` : ''}
-            {projection.counts.unparseableLines > 0 ? ` · 坏行 ${projection.counts.unparseableLines}` : ''}
-            {projection.counts.headBytesSkipped > 0
-              ? ` · 文件过大，跳过头部 ${projection.counts.headBytesSkipped} 字节`
-              : ''}
-          </div>
-        </Card>
+          {watching.map((sessionId) => {
+            const projection = projections[sessionId];
+            const vendor = projection?.vendor ?? sessions.find((s) => s.sessionId === sessionId)?.vendor;
+            return (
+              <Card
+                key={sessionId}
+                title={`会话镜像 · ${vendor ? vendorLabel(vendor) : ''} ${labelOf(sessionId).slice(0, 12)}`}
+                hint={
+                  projection
+                    ? projection.active
+                      ? '活跃（启发式，仅导航提示）'
+                      : `最后更新 ${relativeTime(projection.fileUpdatedAt)}`
+                    : '读取中…'
+                }
+                right={<button onClick={() => void unwatchOne(sessionId)}>关闭镜像</button>}
+              >
+                {!projection ? (
+                  <div className="empty">正在读取该会话的日志…</div>
+                ) : projection.status === 'FORMAT_UNKNOWN' ? (
+                  <Banner tone="err">
+                    <strong>格式未知 —— 已停止解读正文。</strong>
+                    <div style={{ fontSize: 12, marginTop: 4 }}>
+                      记录不满足面板的消费键契约（宁可不读，不可错读）：{projection.breaking.join('、')}。
+                      这通常意味着该工具的日志格式已变，需要更新面板的解析器。
+                    </div>
+                  </Banner>
+                ) : (
+                  <pre className="output" style={{ maxHeight: 420, overflow: 'auto', whiteSpace: 'pre-wrap' }}>
+                    {projection.lines
+                      .map(
+                        (l) =>
+                          `${l.kind}${l.collapsed > 1 ? ` ×${l.collapsed}` : ''}${l.text ? `：${l.text}` : ''}`,
+                      )
+                      .join('\n')}
+                  </pre>
+                )}
+                {projection && projection.driftNotes.length > 0 && (
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
+                    字段基线有 {projection.driftNotes.length} 处出入（面板依赖键完好，仍可读）：
+                    {projection.driftNotes.join('、')}。可用
+                    <code> REPOPILOT_PROBE_JOURNALS=update pnpm probe:journals </code>重建基线。
+                  </div>
+                )}
+                {projection && (
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
+                    记录 {projection.counts.records} · 显示 {projection.counts.shownLines} 行
+                    {projection.counts.omittedLines > 0 ? `（更早的 ${projection.counts.omittedLines} 行未显示）` : ''}
+                    {projection.counts.unparseableLines > 0 ? ` · 坏行 ${projection.counts.unparseableLines}` : ''}
+                    {projection.counts.headBytesSkipped > 0
+                      ? ` · 文件过大，跳过头部 ${projection.counts.headBytesSkipped} 字节`
+                      : ''}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
       )}
     </>
   );

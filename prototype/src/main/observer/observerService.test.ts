@@ -75,7 +75,7 @@ describe('授权与会话发现', () => {
   it('未授权时 listSessions/watch 一律 NOT_GRANTED —— 不是空列表，是拒绝', () => {
     expect(() => service.listSessions()).toThrow(ObserverError);
     expect(() => service.watch('CLAUDE_JOURNAL:x.jsonl')).toThrow(/尚未授权/);
-    expect(service.status()).toEqual({ granted: null, watching: null });
+    expect(service.status()).toEqual({ granted: null, watching: [] });
   });
 
   it('enable 后按项目发现两家会话：claude 走 munge 目录、codex 按首行 cwd 过滤；条目不带宿主路径', () => {
@@ -234,13 +234,91 @@ describe('撤销即清除', () => {
     events = [];
 
     service.disable();
-    expect(service.status()).toEqual({ granted: null, watching: null });
-    expect(events).toEqual([{ kind: 'observer.state', state: { granted: null, watching: null } }]);
+    expect(service.status()).toEqual({ granted: null, watching: [] });
+    expect(events).toEqual([{ kind: 'observer.state', state: { granted: null, watching: [] } }]);
 
     events = [];
     service.pollOnce();
     expect(events).toEqual([]);
     expect(() => service.listSessions()).toThrow(ObserverError);
+  });
+});
+
+describe('多镜像槽（OBSERVER_MAX_MIRRORS = 2）', () => {
+  it('两个会话各出投影；第三个顶掉最早的；状态推送带有序 watching；重复 watch 幂等', () => {
+    writeClaudeSession('a.jsonl', [j({ type: 'a' })], 1_000);
+    writeClaudeSession('b.jsonl', [j({ type: 'b' })], 2_000);
+    writeClaudeSession('c.jsonl', [j({ type: 'c' })], 3_000);
+    service.enable(PROJECT, PROJECT);
+    events = [];
+
+    service.watch('CLAUDE_JOURNAL:a.jsonl');
+    service.watch('CLAUDE_JOURNAL:b.jsonl');
+    expect(service.status().watching).toEqual(['CLAUDE_JOURNAL:a.jsonl', 'CLAUDE_JOURNAL:b.jsonl']);
+    const projected = () =>
+      events
+        .filter((e) => e.kind === 'observer.projection')
+        .map((e) => (e.kind === 'observer.projection' ? e.projection.sessionId : ''));
+    expect(projected()).toEqual(['CLAUDE_JOURNAL:a.jsonl', 'CLAUDE_JOURNAL:b.jsonl']);
+
+    // 状态推送先于投影：Renderer 先知道槽位序
+    expect(events.slice(0, 2).map((e) => e.kind)).toEqual(['observer.state', 'observer.projection']);
+
+    service.watch('CLAUDE_JOURNAL:b.jsonl'); // 幂等：不重推
+    expect(projected().length).toBe(2);
+
+    service.watch('CLAUDE_JOURNAL:c.jsonl'); // 满槛：a 被顶掉
+    expect(service.status().watching).toEqual(['CLAUDE_JOURNAL:b.jsonl', 'CLAUDE_JOURNAL:c.jsonl']);
+    const lastState = events.findLast((e) => e.kind === 'observer.state');
+    expect(lastState?.kind === 'observer.state' && lastState.state.watching).toEqual([
+      'CLAUDE_JOURNAL:b.jsonl',
+      'CLAUDE_JOURNAL:c.jsonl',
+    ]);
+
+    // pollOnce 只服务在槛的两个：改 a 不推，改 c 推
+    const dir = claudeDirOf(PROJECT);
+    writeFileSync(join(dir, 'a.jsonl'), `${j({ type: 'a2' })}\n`);
+    utimesSync(join(dir, 'a.jsonl'), 5_000, 5_000);
+    writeFileSync(join(dir, 'c.jsonl'), `${j({ type: 'c2' })}\n`);
+    utimesSync(join(dir, 'c.jsonl'), 5_000, 5_000);
+    const before = projected().length;
+    service.pollOnce();
+    expect(projected().slice(before)).toEqual(['CLAUDE_JOURNAL:c.jsonl']);
+  });
+
+  it('unwatch 指定一个只关那一个并推状态；不带参数全部停止；对不在槛的 id 静默', () => {
+    writeClaudeSession('a.jsonl', [j({ type: 'a' })], 1_000);
+    writeClaudeSession('b.jsonl', [j({ type: 'b' })], 2_000);
+    service.enable(PROJECT, PROJECT);
+    service.watch('CLAUDE_JOURNAL:a.jsonl');
+    service.watch('CLAUDE_JOURNAL:b.jsonl');
+    events = [];
+
+    service.unwatch('CLAUDE_JOURNAL:ghost.jsonl');
+    expect(events).toEqual([]);
+    service.unwatch('CLAUDE_JOURNAL:a.jsonl');
+    expect(service.status().watching).toEqual(['CLAUDE_JOURNAL:b.jsonl']);
+    expect(events).toEqual([
+      { kind: 'observer.state', state: { granted: PROJECT, watching: ['CLAUDE_JOURNAL:b.jsonl'] } },
+    ]);
+    service.unwatch();
+    expect(service.status().watching).toEqual([]);
+    events = [];
+    service.unwatch(); // 已空：不再推
+    expect(events).toEqual([]);
+  });
+
+  it('会话换届：被删掉的会话从镜像槛移除并推状态', () => {
+    const p = writeClaudeSession('gone.jsonl', [j({ type: 'a' })], 1_000);
+    writeClaudeSession('stay.jsonl', [j({ type: 'b' })], 2_000);
+    service.enable(PROJECT, PROJECT);
+    service.watch('CLAUDE_JOURNAL:gone.jsonl');
+    service.watch('CLAUDE_JOURNAL:stay.jsonl');
+    rmSync(p);
+    events = [];
+    service.listSessions();
+    expect(service.status().watching).toEqual(['CLAUDE_JOURNAL:stay.jsonl']);
+    expect(events.some((e) => e.kind === 'observer.state' && e.state.watching.length === 1)).toBe(true);
   });
 });
 

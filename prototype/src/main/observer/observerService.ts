@@ -9,6 +9,7 @@ import type {
   ObserverStateSnapshot,
   ObserverSweepCounts,
 } from '@shared/observerProtocol';
+import { OBSERVER_MAX_MIRRORS } from '@shared/observerProtocol';
 import {
   discoverJournalFiles,
   parseSnapshot,
@@ -30,8 +31,10 @@ import codexBaselineRaw from './codex-rollout.shape.json';
  *   - 零出站：投影只经 emit 回调（→ Renderer 渲染）；不进模型上下文、遥测、证据。
  *   - 可撤销：`disable()` 同步清掉授权、监视、缓存，并推送空状态。
  *
- * 降级语义（ASM-027）：任一记录违反已提交字段快照基线的必现键 → 整个会话
- * FORMAT_UNKNOWN，正文清空只留计数与违规键名 —— 错读比不读更糟。
+ * 降级语义：任一记录违反**面板消费键契约**（见 consumedContractViolations）→ 整个会话
+ * FORMAT_UNKNOWN，正文清空只留计数与违规明细 —— 错读比不读更糟。与字段快照基线的出入
+ * 只进 driftNotes 提示（ASM-027 的基线归纳不配当运行时判据，2026-09-05 实测）。
+ * 镜像槽最多 OBSERVER_MAX_MIRRORS 个（Map 插入序 = 槽位序），满了顶掉最早的。
  * 授权与监视都只活在内存里：应用重启即消失，重新观察需要重新授权。
  * 这不是偷懒 —— 授权持久化的粒度/保留是 Q-027 未决问题，未决就不落盘。
  */
@@ -243,7 +246,8 @@ export class ObserverService {
   private grantedPath: string | null = null;
   private grantedDisplay: string | null = null;
   private sessions = new Map<string, SessionRecord>();
-  private watch_: WatchState | null = null;
+  /** 镜像槽：插入序即槽位序（先选的在左） */
+  private watches = new Map<string, WatchState>();
 
   constructor(opts: {
     claudeProjectsRoot: string;
@@ -263,7 +267,7 @@ export class ObserverService {
   }
 
   status(): ObserverStateSnapshot {
-    return { granted: this.grantedDisplay, watching: this.watch_?.sessionId ?? null };
+    return { granted: this.grantedDisplay, watching: [...this.watches.keys()] };
   }
 
   /** projectPath 只能来自 Main 的原生目录选择对话框（见文件头）。重复授权 = 换项目 */
@@ -296,7 +300,7 @@ export class ObserverService {
     this.grantedPath = null;
     this.grantedDisplay = null;
     this.sessions = new Map();
-    this.watch_ = null;
+    this.watches = new Map();
     if (emitState) this.emit({ kind: 'observer.state', state: this.status() });
   }
 
@@ -314,18 +318,37 @@ export class ObserverService {
     if (!this.sessions.has(sessionId)) {
       throw new ObserverError('UNKNOWN_SESSION', `未知会话：${sessionId}（先 listSessions）`);
     }
-    this.watch_ = { sessionId, lastSize: -1, lastMtimeMs: -1 };
-    this.pollOnce();
+    if (this.watches.has(sessionId)) return; // 已在镜像中：幂等，不重读不重推
+    // 满槛顶掉最早的（Map 插入序 = 槽位序）
+    while (this.watches.size >= OBSERVER_MAX_MIRRORS) {
+      const oldest = this.watches.keys().next().value;
+      if (oldest === undefined) break;
+      this.watches.delete(oldest);
+    }
+    const state: WatchState = { sessionId, lastSize: -1, lastMtimeMs: -1 };
+    this.watches.set(sessionId, state);
+    // 先推状态（槽位序），再推投影 —— Renderer 先知道往哪个槽放
+    this.emit({ kind: 'observer.state', state: this.status() });
+    this.pollOne(state);
   }
 
-  unwatch(): void {
-    this.watch_ = null;
+  /** 不带 sessionId = 全部停止（关面板时用）；带 = 只停那一个镜像 */
+  unwatch(sessionId?: string): void {
+    if (sessionId === undefined) {
+      if (this.watches.size === 0) return;
+      this.watches = new Map();
+    } else if (!this.watches.delete(sessionId)) {
+      return;
+    }
+    this.emit({ kind: 'observer.state', state: this.status() });
   }
 
-  /** 由外层定时器（或测试）驱动。文件没变就不读不推 */
+  /** 由外层定时器（或测试）驱动。每个镜像各自判"文件没变就不读不推" */
   pollOnce(): void {
-    const w = this.watch_;
-    if (!w) return;
+    for (const w of this.watches.values()) this.pollOne(w);
+  }
+
+  private pollOne(w: WatchState): void {
     const session = this.sessions.get(w.sessionId);
     if (!session) return;
     let stat;
@@ -483,9 +506,16 @@ export class ObserverService {
       }
     }
 
-    // 换届后旧 watch 若仍指向存在的会话则保留游标语义（id 不变即同一文件）
-    if (this.watch_ && !next.has(this.watch_.sessionId)) this.watch_ = null;
+    // 会话换届：不再存在的会话从镜像槽移除（id 不变即同一文件，游标保留）
+    let pruned = false;
+    for (const id of [...this.watches.keys()]) {
+      if (!next.has(id)) {
+        this.watches.delete(id);
+        pruned = true;
+      }
+    }
     this.sessions = next;
+    if (pruned) this.emit({ kind: 'observer.state', state: this.status() });
 
     const sessions = [...next.values()]
       .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))
