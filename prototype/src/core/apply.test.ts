@@ -133,6 +133,48 @@ describe('整仓补丁应用', () => {
     expect(git(['status', '--porcelain'])).toBe(' M src/greet.ts\n');
   });
 
+  it('补丁改的是 SQL 行注释（`-- 注释`）时，仍然能干净应用到宿主', () => {
+    /*
+     * patch.test.ts 钉的是 diff 文本本身；这里钉的是**用户可见的结果** —— 补丁到底能不能 apply。
+     *
+     * 被删/改的内容行 `-- 旧注释` 在 diff 里渲染成 `--- 旧注释`，与文件头同形。
+     * normalizeHeaders 修复前会把它改写成 `--- a/db/schema.sql`，补丁就此损坏，
+     * 这条会在 CHECK 阶段失败 —— 而该失败经 `authority.ts:3236` 映射成 reason
+     * `APPLY_CONFLICT`，"冲突"指向目标仓库分叉，实际坏掉的是平台自己生成的 diff。
+     */
+    mkdirSync(join(host, 'db'), { recursive: true });
+    writeFileSync(join(host, 'db/schema.sql'), '-- 旧注释\nSELECT 1;\n', 'utf8');
+    git(['add', '-A']);
+    git(['-c', 'user.email=t@e.com', '-c', 'user.name=t', 'commit', '-q', '-m', 'add sql']);
+
+    const snapshot = importSnapshot('p', host);
+    const runId = newId('run');
+    workspace = MaterializedWorkspace.create(runId, snapshot.snapshotId);
+    const { receipt } = workspace.issueReceipt('db/schema.sql', 'FULL_BLOB');
+    const mutated = applyMutationPlan(workspace, {
+      planId: 'p1',
+      runId,
+      inputGeneration: workspace.activeGeneration,
+      operations: [
+        {
+          kind: 'REPLACE_EXACT_TEXT_SPAN',
+          path: 'db/schema.sql',
+          receiptId: receipt.receiptId,
+          oldText: '-- 旧注释',
+          newText: '-- 新注释',
+        },
+      ],
+    });
+    expect(mutated.ok).toBe(true);
+
+    const patch = sealPatch(workspace, runId, newId('att'), snapshot.baseSha, null, null, []);
+    const applied = applyPatchWithGit(host, '', patch.unifiedDiff, patchFile, ['db/schema.sql']);
+
+    // 这一句是本条测试的全部意义：修复前它是 { ok: false, stage: 'CHECK' }
+    expect(applied.ok).toBe(true);
+    expect(readFileSync(join(host, 'db/schema.sql'), 'utf8')).toBe('-- 新注释\nSELECT 1;\n');
+  });
+
   it('目标文件已被改动 → --check 拒绝，且宿主一个字节没变', () => {
     const patch = makePatch();
 

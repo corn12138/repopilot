@@ -182,14 +182,46 @@ function gitDiffNoIndex(before: string, after: string, label: string): string {
   }
 }
 
+/**
+ * 统一 diff 里「这一行是不是 hunk 边界」。
+ *
+ * `@@` 开启一个 hunk，`diff --git` 关掉上一个。判据只有这一份，
+ * `normalizeHeaders` 与 `countPrefix` 共用 —— 它们必须对"什么算 hunk 内"有
+ * **同一个**答案，而它们曾经没有：`countPrefix` 已经按 hunk 内外区分，
+ * `normalizeHeaders` 还在无条件逐行改写，于是一条被删掉的 SQL/Lua/Haskell 注释
+ * （内容 `-- 旧注释`，在 diff 里渲染成 `--- 旧注释`）被当成文件头改写成
+ * `--- a/<path>`。后果不只是补丁损坏：宿主写回时 `git apply --check` 失败，
+ * 被报成 `APPLY_CONFLICT`「目标文件已漂移」—— 而目标根本没有漂移。
+ *
+ * 收成一处之后，下次改其中一个函数，另一个不会悄悄漂掉。
+ */
+function hunkEdgeOf(line: string): 'OPEN' | 'CLOSE' | null {
+  if (line.startsWith('@@')) return 'OPEN';
+  if (line.startsWith('diff --git ')) return 'CLOSE';
+  return null;
+}
+
 /** 把 diff 头里的宿主绝对路径换成仓库相对路径 —— 绝对路径不进入任何投影 */
 function normalizeHeaders(diff: string, rel: string): string {
+  let inHunk = false;
   return diff
     .split('\n')
     .map((line) => {
+      const edge = hunkEdgeOf(line);
+      if (edge === 'OPEN') inHunk = true;
+      else if (edge === 'CLOSE') inHunk = false;
+
       if (line.startsWith('diff --git ')) return `diff --git a/${rel} b/${rel}`;
-      if (line.startsWith('--- ')) return line.includes('/dev/null') ? '--- /dev/null' : `--- a/${rel}`;
-      if (line.startsWith('+++ ')) return line.includes('/dev/null') ? '+++ /dev/null' : `+++ b/${rel}`;
+      /*
+       * 只在 hunk **外**改写文件头。hunk 内的 `--- x` / `+++ x` 是内容行：
+       * 被删掉的 `-- 注释` 与被加上的 `++ i`，改写成文件头就把用户的代码换掉了。
+       */
+      if (!inHunk && line.startsWith('--- ')) {
+        return line.includes('/dev/null') ? '--- /dev/null' : `--- a/${rel}`;
+      }
+      if (!inHunk && line.startsWith('+++ ')) {
+        return line.includes('/dev/null') ? '+++ /dev/null' : `+++ b/${rel}`;
+      }
       return line;
     })
     .join('\n');
@@ -201,18 +233,18 @@ function normalizeHeaders(diff: string, rel: string): string {
  * 只在 `@@` hunk 内计数，不用 `'+++'`/`'---'` 的形状去猜文件头 ——
  * 顶格的内容行会误命中：`-- 注释` 变成 `--- 注释`、`++i;` 变成 `+++i;`，
  * 于是一增一删的改动会被报成 0/0。SQL 注释、YAML 分隔符、C 风格自增都会触发。
+ *
+ * 边界判据与 `normalizeHeaders` 共用 `hunkEdgeOf` —— 这两个函数必须同口径，
+ * 见那里的说明（它们曾经不同口径，代价是补丁被改坏）。
  */
 function countPrefix(diff: string, prefix: '+' | '-'): number {
   let n = 0;
   let inHunk = false;
   for (const line of diff.split('\n')) {
-    if (line.startsWith('@@')) {
-      inHunk = true;
-      continue;
-    }
-    if (line.startsWith('diff --git ')) {
-      inHunk = false;
-      continue;
+    const edge = hunkEdgeOf(line);
+    if (edge) {
+      inHunk = edge === 'OPEN';
+      continue; // 边界行本身不是内容，不计数
     }
     if (inHunk && line.startsWith(prefix)) n += 1;
   }

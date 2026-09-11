@@ -279,6 +279,56 @@ describe('行数统计', () => {
     expect(entry.removedLines).toBe(1);
     expect(entry.addedLines).toBe(1);
   });
+
+  it('被删掉的 SQL 行注释不会被当成文件头改写掉', () => {
+    /*
+     * 与上一条是**同一个输入类的另一半**，而这一半曾经是真的坏了。
+     *
+     * 上一条的夹具是 `--- 旧分隔线`（三个短横）：diff 渲染成 `---- 旧分隔线`（四个），
+     * 恰好擦过 normalizeHeaders 的 `startsWith('--- ')` 谓词，所以它测不出问题。
+     * 现实里 SQL / Lua / Haskell 的行注释是**两个**短横加空格（`-- 注释`），
+     * 删掉它时 diff 渲染成**三个**短横加空格（`--- 注释`）—— 正好命中，
+     * 于是这条内容行被改写成 `--- a/db/schema.sql`。
+     *
+     * 后果不只是补丁损坏：宿主写回时 `git apply --check` 找不到待删的那一行，
+     * 失败经 `authority.ts:3236` 映射成 reason `APPLY_CONFLICT` —— "冲突"这个词
+     * 指向目标仓库分叉，而真正坏掉的是平台自己生成的 diff。detail 文本本身是诚实的
+     * （「git 认为这个补丁无法干净应用」+ git 原始 stderr），误导发生在 reason 代码这一层。
+     *
+     * 断言用「`--- a/<path>` 只出现一次」而不是 headerLines 的长度：
+     * headerLines 的正则 `^(--- )` 本身分不清文件头与内容行，
+     * 修好之后那条**完好**的内容行同样会被它捞进来。
+     */
+    const { ws, runId, baseSha } = open({ 'db/schema.sql': '-- 旧注释\nSELECT 1;\n' });
+    mutate(ws, runId, [
+      {
+        kind: 'REPLACE_EXACT_TEXT_SPAN',
+        path: 'db/schema.sql',
+        oldText: '-- 旧注释',
+        newText: '-- 新注释',
+      },
+    ]);
+
+    const patch = sealPatch(ws, runId, newId('att'), baseSha, null, null, []);
+    const lines = patch.unifiedDiff.split('\n');
+
+    // 文件头仍然被归一化，且**只有一份** —— 被改写的内容行会造出第二个一模一样的头
+    expect(lines.filter((l) => l === '--- a/db/schema.sql')).toHaveLength(1);
+    expect(lines.filter((l) => l === '+++ b/db/schema.sql')).toHaveLength(1);
+    expect(lines[0]).toBe('diff --git a/db/schema.sql b/db/schema.sql');
+
+    // 内容行逐字节保住：这才是补丁能被 apply 的前提
+    expect(lines).toContain('--- 旧注释');
+    expect(lines).toContain('+-- 新注释');
+
+    // 绝对路径仍然一个都不进投影（这条不因修复而放松）
+    expect(patch.unifiedDiff).not.toContain(hosts[0]!);
+    expect(patch.unifiedDiff).not.toContain(tmpdir());
+
+    // 行数统计与真实 diff 一致
+    expect(patch.files[0]!.removedLines).toBe(1);
+    expect(patch.files[0]!.addedLines).toBe(1);
+  });
 });
 
 describe('生成文件的可见性', () => {
