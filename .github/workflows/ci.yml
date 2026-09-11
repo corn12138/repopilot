@@ -1,0 +1,82 @@
+# 最小 CI 闸门（RISK-07 的处置）。
+#
+# 为什么是这三条：它们是「不跑就会静默漂移」的三件事 ——
+#   1. 类型与编译契约（typecheck 两个 project）；
+#   2. 1332 个测试与 10 条不变式的机器守护；
+#   3. devlog 文件与索引的一一对应（08-27 重审发现过 19 篇未入索引 + 撞号，
+#      而校验器是唯一能看见「两边对不上」的东西）。
+#
+# 为什么是 macOS runner：产品本身 macOS-only（ADR 015/017），且 connector.test.ts
+# 等用例对 /Applications、.app bundle 有真实探测，在 Linux 上会失真 ——
+# 一条在错误平台上绿的 CI 比没有 CI 更糟，它会以权威口吻说反话。
+#
+# 刻意**不**进 CI 的：
+#   - pnpm selftest：需要 Electron 运行时与真实窗口，标为本地/发布前手动项；
+#   - probe:journals / probe:desktop：opt-in 且读真实 HOME，单测纪律禁止；
+#   - eval:spk010：需要两家异构 provider 的真实 key 与单独授权。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  devlog-index:
+    # 零依赖：校验器是纯 node 脚本，不需要 install
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: devlog 文件与索引一一对应、编号不撞车
+        run: node scripts/check-devlog.mjs
+
+  typecheck:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: install（跳过 Electron 二进制：typecheck/test 都不需要它）
+        working-directory: prototype
+        run: pnpm install --frozen-lockfile
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: pnpm typecheck
+        working-directory: prototype
+
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: install（跳过 Electron 二进制）
+        working-directory: prototype
+        run: pnpm install --frozen-lockfile
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      # 端到端链路需要 fixture 的真实依赖（README 里同一条命令）
+      - name: fixture 依赖
+        working-directory: prototype/fixtures/vite-react-broken
+        run: npm install
+      - run: pnpm test
+        working-directory: prototype
