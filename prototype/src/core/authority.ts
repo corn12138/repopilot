@@ -1719,6 +1719,36 @@ export class RunAuthority {
           break;
       }
     } catch (err) {
+      /*
+       * 事件日志写不下去 → **跳过状态快照落盘，直接定终态**。
+       *
+       * 这个检查必须排在所有分支之前，有两个理由：
+       *   1. 日志写不成时再走 `persist`，state.json 的 eventHighWatermark 会**超前**于
+       *      日志；重启后 rehydrateRuns 只检查"事件是否比状态新"这一个方向，
+       *      日志更短反而判 `INTACT` —— 把"丢了事件"说成"证据完好"；
+       *   2. `sealSalvagePatch` 自己也会 emit（`:2862` 与它 catch 里的 `:2869`）。
+       *      日志锁定时第一处抛 EventLogUnavailable、被它自己的 catch 接住、
+       *      catch 里再 emit 又抛一次 —— 异常就此逃出本 catch 块，而 execute 是
+       *      `void` 调用的，那会变成 unhandled rejection，Run 拿不到终态也跑不到清理。
+       *
+       * 注意这**不是**不变式 3 的问题：sealPatch 对工作区是只读的
+       * （changedVsBaseline + `git diff --no-index`），失败路径从来没有写过用户的副本。
+       * 被破坏的是证据完整性与收口的可达性。
+       */
+      const journalFailure = record.events.writeFailure();
+      if (journalFailure) {
+        // 丢掉的是「触发锁定的那一条」+「此后被拒绝的每一条」—— 省略要报数（不变式 8）
+        const lost = 1 + record.events.refusedAppendCount();
+        this.setStatus(
+          record,
+          'FAILED',
+          `事件日志写入失败（${journalFailure.reason}）：已停止落盘 —— ` +
+            `未生成抢救补丁、状态快照未更新；共 ${lost} 条事件未能记录。` +
+            `重启后该 Run 会按上一份完好的快照恢复`,
+          'RUNTIME_ERROR',
+        );
+        return;
+      }
       // 异常路径同样先抢救现场再定终态；PlanningFailed 时规划是只读的、
       // 工作区必然零改动，helper 会自然空转，无需特判
       if (err instanceof AgentCancelled || record.abort.signal.aborted) {
@@ -1744,7 +1774,17 @@ export class RunAuthority {
       deadline.clear();
       record.deadline = null;
       this.cleanupPendingApprovals(record);
-      if (isTerminal(record.view.status) && record.view.status !== 'AWAITING_PATCH_REVIEW') {
+      /*
+       * 日志锁定时这条 emit 会抛 —— 而在 finally 里抛出会覆盖 catch 块的正常返回、
+       * 逃出 execute（它是 `void` 调用的）变成 unhandled rejection。
+       * 清理动作本身只动内存与推送（deadline.clear / cleanupPendingApprovals），照常执行；
+       * 少记一条 CLEANUP_SUMMARY 已经由 setStatus 的 statusReason 报过数了。
+       */
+      if (
+        !record.events.writeFailure() &&
+        isTerminal(record.view.status) &&
+        record.view.status !== 'AWAITING_PATCH_REVIEW'
+      ) {
         this.emit(record, 'CLEANUP_SUMMARY', '已释放模型流、子进程与审批等待', {
           workspaceRetained: record.view.status === 'SUCCEEDED',
         });
@@ -3721,13 +3761,27 @@ export class RunAuthority {
       workspaceGeneration: record.workspace?.activeGeneration ?? record.view.workspaceGeneration,
       updatedAt: nowIso(),
     };
-    this.emit(record, 'STATUS_CHANGED', `${previous} → ${status}${reason ? `（${reason}）` : ''}`, {
-      from: previous,
-      to: status,
-      reason,
-      failureClass,
-    });
-    this.persist(record); // 事件已 append，此刻状态快照才允许追上
+    /*
+     * 事件日志已经写不下去时：**不落盘、不发事件，只更新内存并推送。**
+     *
+     * 上面两条不变式检查仍然已经跑过了 —— 日志死了不等于终态门禁可以放松，
+     * SUCCEEDED 照样要求 verification + acceptance 同时绑定。
+     *
+     * 跳过 persist 的理由是它会造出一个会说假话的一致性检查：persist 把
+     * `eventHighWatermark: events.lastSeq()` 写进 state.json，而 rehydrate 只检查
+     * "事件是否比状态新"这一个方向（见 rehydrateRuns）。日志写失败时快照水位会
+     * **超前**于日志，那个单向检查于是判 `INTACT` —— 把丢事件说成完好。
+     * 宁可不写快照：重启后该 Run 会按旧快照恢复并如实落成 INTERRUPTED。
+     */
+    if (!record.events.writeFailure()) {
+      this.emit(record, 'STATUS_CHANGED', `${previous} → ${status}${reason ? `（${reason}）` : ''}`, {
+        from: previous,
+        to: status,
+        reason,
+        failureClass,
+      });
+      this.persist(record); // 事件已 append，此刻状态快照才允许追上
+    }
     this.push({ type: 'run.updated', run: record.view });
 
     // Run 刚终态，它的工作区通常是最大的一块 —— 过了宽限期就该回收
