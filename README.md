@@ -25,6 +25,7 @@
 | edit 找不到就模糊匹配 | 命中 0 次或多次 → 整笔失败，绝不猜 |
 | write 隐式覆盖 / 创建 | `CREATE_FILE` 撞到已有文件直接拒绝 |
 | 模型说「构建通过了」 | 只认真实退出码，且必须先跑基线做对比 |
+| 输出被切断也照它说的做 | 截断 / 结束原因未知的响应里，工具**一个都不派发** —— 半截输出不是完整意图 |
 | 一个布尔值表示成功 | 判别联合：`EXIT_ZERO / EXIT_NONZERO / SIGNAL / TIMEOUT / CANCELLED / SPAWN_ERROR` |
 | 直接在你仓库里改 | 改动只发生在隔离副本，宿主仓库全程只读 |
 | 接受即成功 | 有验证 → `SUCCEEDED`；没验证 → `ACCEPTED_UNVERIFIED` |
@@ -95,7 +96,7 @@ pnpm dev
 可以直接拿它当第一个任务目标。
 
 ```bash
-pnpm test        # 73 个文件 / 1306 个测试（本机日志 probe 的 3 个默认跳过），含真实 tsc + vite build 的端到端链路
+pnpm test        # 74 个文件 / 1329 个测试（本机日志 probe 的 3 个默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
 ```
 
@@ -112,6 +113,10 @@ pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
 - 补丁应用：目标文件已漂移 → `git apply --check` 拒绝，宿主逐字节不变
 - 补丁写回宿主仓库要求**已被接受** + digest 匹配，门禁在 Core 不在界面
 - 规划阶段与交叉审核阶段的只读由**平台强制**：模型点名写工具会被 `PHASE_READONLY` 拒绝
+- 响应完整性由**平台强制**：输出撞长度上限（`MAX_TOKENS`）或结束原因未知（`OTHER`）时，
+  该轮工具一个都不派发 —— 规划期的 `submit_plan`、审核期的 `submit_review` 同样不算数
+  （两者是内联解析、绕过工具分发的，门禁设在提取边界才拦得住）；截断轮的全部 `tool_use`
+  仍被如实回填成「未执行」，两家 wire 保持合法。截断的审核落 `INCONCLUSIVE`，不折成通过
 - 子进程 env 走白名单：仓库脚本拿不到 `ANTHROPIC_API_KEY` 之类的凭据
 - macOS 上 `Package.json` 这类大小写变体不能绕过受保护路径
 - **修复全程宿主仓库 `git status` 干净**
@@ -193,7 +198,7 @@ confidence / file / range / evidence / blocking）。审核方由平台强制只
 
 ## 开发记录
 
-[`docs/devlog/`](docs/devlog/) 按天记录设计取舍和踩过的坑，目前 **61 篇**，
+[`docs/devlog/`](docs/devlog/) 按天记录设计取舍和踩过的坑，目前 **76 篇**，
 完整索引见 [devlog/README.md](docs/devlog/README.md)。几篇有代表性的：
 
 | 篇 | 主题 |

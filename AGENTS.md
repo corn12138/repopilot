@@ -54,6 +54,16 @@
    （Core 重算比对），每次模型调用由 `ModelGateway.preflight` 校验 consent 覆盖该冻结路由；
    高置信度凭据在命令输出层脱敏（`dlp.ts`）、含凭据的文件 `fs_read` 拒读、网关与外部 CLI prompt
    最后一道拦截。P0 没有"仍然发送"。
+10. **模型没说完的话不是它的意图。** 输出撞长度上限（`MAX_TOKENS`）或结束原因未知（`OTHER`）的
+    响应，该轮工具一个都不派发；规划期的 `submit_plan`、审核期的 `submit_review` 同样不算数 ——
+    两者内联解析、**绕过 `dispatchTool`**，所以门禁只能设在提取边界（`agent.ts` 的
+    `findIncompleteResponse`），判据只有一份（`model/types.ts` 的 `stopReasonAllowsToolExecution`）。
+    拦的是执行、不是记录：截断轮的 `tool_use` 仍要如实回填成「未执行」，否则就是孤儿，
+    两家 wire 此后**每一次**请求都 400。**两条 wire 必须对称** —— 改任何一家的 finish/stop reason
+    归一化都要同时看另一家：`openai-compatible.ts` 的 `mapStop` 里 `length` 必须先于内容推断短路，
+    否则截断被报成 `TOOL_USE`，这道门禁在整条 OpenAI wire 上失效。该缺陷真实存在过，成因是
+    某次修 vendor bug（发了 tool_calls 却写 `finish_reason:'stop'`）时顺手过度 —— 也就是说
+    它不是被恶意绕过的，是在做正确的适配工作时被无意拆掉的。
 
 ## 工程诚实规则
 
@@ -81,7 +91,7 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 73 个文件 / 1306 个测试（本机日志 probe 的 3 个默认跳过），含真实 tsc + vite build 的端到端链路
+pnpm test       # 74 个文件 / 1329 个测试（本机日志 probe 的 3 个默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 pnpm eval:spk010 -- --implementer <provider> --reviewer <provider> --dry-run
