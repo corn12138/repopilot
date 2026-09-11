@@ -111,6 +111,42 @@ describe('Anthropic 流式', () => {
     expect(res.cacheReadTokens).toBe(90);
   });
 
+  it('缺 message_delta 帧 → stopReason 落 OTHER，即使 tool_use 已完整拼出', async () => {
+    /*
+     * 已识别的盲区，刻意钉住而不是"修掉"。
+     *
+     * Anthropic 的 stop_reason 只在 message_delta 帧里给。流若在它之前就结束
+     * （连接被中间层掐断、或某家兼容端根本不发这一帧），adapter 手上是 undefined，
+     * mapStop 落到 default → OTHER。
+     *
+     * 而 OTHER 会被 agent.ts 的响应完整性门禁拦下 —— 未知不是默认成功，这是有意的
+     * fail-closed。代价是：若真有一家 provider 在**完整**响应上也不发 message_delta，
+     * 那条 Run 会带着"结束原因未知"停下，看起来像平台过度保守。届时第一现场就是这里，
+     * 修法是给那一家加一条**有契约测试钉住**的归一化规则，而不是放宽通用层的判据。
+     *
+     * 12 家 provider 本机一把 key 都没有，这条路径无法实证，只能先把行为钉死。
+     */
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        sseResponse([
+          'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"fs_read"}}\n\n',
+          'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"src/a.ts\\"}"}}\n\n',
+          // 刻意不给 message_delta：没有 message_stop 也算，重点是 stop_reason 无从得知
+        ]),
+      ),
+    );
+
+    const { listener } = collect();
+    const res = await anthropicAdapter.stream(REQUEST, CTX, listener);
+
+    expect(res.stopReason).toBe('OTHER');
+    // 内容照旧解析出来：门禁拦的是执行，不是记录
+    expect(res.content).toEqual([
+      { type: 'tool_use', id: 'tu_1', name: 'fs_read', input: { path: 'src/a.ts' } },
+    ]);
+  });
+
   it('工具参数跨帧拼接后再解析 —— 半截 JSON 不能被当成畸形参数', async () => {
     vi.stubGlobal(
       'fetch',

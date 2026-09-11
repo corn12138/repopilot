@@ -1,3 +1,4 @@
+import type { StopReason } from '@shared/domain';
 import {
   type AdapterCallContext,
   type ContentBlock,
@@ -5,7 +6,6 @@ import {
   type ModelAdapter,
   type ModelRequest,
   type ModelResponse,
-  type StopReason,
   type StreamListener,
 } from './types';
 import { causeCode, httpErrorKind, parseRetryAfterMs, sendStateForNetworkError, summarizeError } from './http';

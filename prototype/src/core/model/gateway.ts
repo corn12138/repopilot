@@ -380,6 +380,9 @@ export class ModelGateway {
         errorKind: null,
         sendAttempt: 1,
         sendState: 'RESPONDED',
+        // 探针的 maxOutputTokens 是 16，所以这里经常如实报 MAX_TOKENS —— 探针只看连通性，
+        // 不据此派发任何工具，截断与否不影响它的结论。
+        stopReason: response.stopReason,
       });
       return {
         ok: true,
@@ -501,6 +504,7 @@ export class ModelGateway {
           errorKind: null,
           sendAttempt: att,
           sendState: 'RESPONDED',
+          stopReason: response.stopReason,
         };
         return { invocationId, response, manifest };
       } catch (err) {

@@ -1107,6 +1107,18 @@ export interface ModelInvocationRef {
  */
 export type ModelSendState = 'NOT_SENT' | 'SENT_OUTCOME_UNKNOWN' | 'RESPONDED';
 
+/**
+ * 模型这一轮为什么停下来 —— 由各家 adapter 从供应商原生 finish/stop reason 归一化而来。
+ *
+ * 住在 shared 而不是 `core/model` 是因为它一旦落进出站账本就是**记账词汇**，与上面的
+ * `ModelSendState`、`ModelInvocationPurpose` 同类；shared 不能反向依赖 core。
+ *
+ * `OTHER` 是两家 mapper 的 default 分支（Anthropic 的 refusal / pause_turn、OpenAI 的
+ * content_filter、流意外结束都落这里）。它**不是默认成功** —— 见
+ * `stopReasonAllowsToolExecution`：只有 END_TURN / TOOL_USE 允许据此执行工具。
+ */
+export type StopReason = 'TOOL_USE' | 'END_TURN' | 'MAX_TOKENS' | 'OTHER';
+
 /** 每次实际或被阻断的出站都有一条；不含 raw secret 与请求正文 */
 export interface ModelEgressManifest {
   readonly invocationId: string;
@@ -1139,6 +1151,15 @@ export interface ModelEgressManifest {
   /** 第几次发送尝试（1-based）。有界同 route 重试的每次尝试各留一条 manifest，不覆盖 */
   readonly sendAttempt?: number;
   readonly sendState?: ModelSendState | null;
+  /**
+   * 模型这一轮的结束原因。**只有拿到响应的 manifest 才填** —— 被阻断的、失败的、
+   * 退避途中取消的那些根本没有响应可报，留空才是诚实的。
+   *
+   * 字段缺失读作"当时未记录"（它晚于历史记录出现），不解释成 END_TURN，也不解释成截断。
+   * 单列它的理由：没有这个字段，一次被截断的调用和一次干净的 END_TURN 在 egress.jsonl 里
+   * 长得一模一样，跨 Run 证据聚合就数不出截断发生过。
+   */
+  readonly stopReason?: StopReason | null;
 }
 
 // ---------------------------------------------------------------------------

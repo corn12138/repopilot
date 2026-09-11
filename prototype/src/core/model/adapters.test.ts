@@ -232,6 +232,30 @@ describe('anthropicAdapter: 响应解析', () => {
     expect((await anthropicAdapter.call(req, ctx())).stopReason).toBe('OTHER');
   });
 
+  it('max_tokens 且带完整 tool_use 块：仍判 MAX_TOKENS，内容照旧解析', async () => {
+    /*
+     * 与 OpenAI 侧那条 `finish_reason=length` 测试互为镜像 —— 同一个物理事件
+     * （输出被切断，但切断前已经吐出一个完整可解析的 tool call）在两条 wire 上
+     * 必须得到同一个停止原因，否则只看 stopReason 的门禁只在一家生效。
+     *
+     * Anthropic 这边本来就没有"内容推断"短路，所以这条钉的是**别把它加过来**：
+     * 将来若有人为了"对齐 OpenAI 的 TOOL_USE 判定"而在 mapStop 里加上
+     * `content.some(tool_use)` 短路，截断就会在这一侧也被掩盖掉。
+     */
+    stubFetchJson({
+      content: [{ type: 'tool_use', id: 'tu_len', name: 'fs_read', input: { path: 'a.ts' } }],
+      stop_reason: 'max_tokens',
+    });
+    const r = await anthropicAdapter.call(req, ctx());
+    expect(r.stopReason).toBe('MAX_TOKENS');
+    expect(r.content).toContainEqual({
+      type: 'tool_use',
+      id: 'tu_len',
+      name: 'fs_read',
+      input: { path: 'a.ts' },
+    });
+  });
+
   it('body 里带 error 字段 → BAD_REQUEST', async () => {
     stubFetchJson({ error: { type: 'invalid', message: '模型名不对' } });
     await expect(anthropicAdapter.call(req, ctx())).rejects.toMatchObject({
@@ -535,6 +559,44 @@ describe('openAiWireAdapter: 响应解析', () => {
     });
     const r = await openAiWireAdapter.call(req, ctx());
     expect(r.stopReason).toBe('TOOL_USE');
+  });
+
+  it('finish_reason=length 时即使已解析出完整 tool_call 也判 MAX_TOKENS', async () => {
+    /*
+     * 与上一条是**同一个顺序规则的两半**，必须并排钉住：改了一边就会悄悄破坏另一边。
+     *
+     * 上一条守的是"漏报 stop"：有些兼容端真的发了 tool_calls 却写 finish_reason=stop，
+     * 所以内容推断那个短路必须保留。但同一个短路顺手把 length 也吃掉了 —— 截断的响应里
+     * 只要凑巧解析出一个完整 tool call，就被报成 TOOL_USE，截断从停止原因里彻底消失，
+     * 于是上层完整性门禁在 OpenAI 这条 wire 上是瞎的（Anthropic 侧如实报 MAX_TOKENS，
+     * 两家不对称）。两个方向的代价不等：漏报 stop 只是少派一次工具，漏报 length 会让
+     * 平台把半截输出当成模型的完整意图去执行。所以截断优先。
+     */
+    stubFetchJson({
+      choices: [
+        {
+          message: {
+            content: '我先看一眼',
+            tool_calls: [
+              { id: 'call_len', function: { name: 'fs_read', arguments: '{"path":"a.ts"}' } },
+            ],
+          },
+          finish_reason: 'length',
+        },
+      ],
+      usage: { prompt_tokens: 5, completion_tokens: 8000 },
+    });
+    const r = await openAiWireAdapter.call(req, ctx());
+    // 停止原因如实说"被截断"……
+    expect(r.stopReason).toBe('MAX_TOKENS');
+    // ……但 tool call 照样解析出来：门禁拦的是**执行**，不是**记录**，
+    // 抹掉内容会让上层无从回填 tool_result，反而制造孤儿（两家 wire 都 400）。
+    expect(r.content).toContainEqual({
+      type: 'tool_use',
+      id: 'call_len',
+      name: 'fs_read',
+      input: { path: 'a.ts' },
+    });
   });
 
   it('畸形 arguments 不 fallback 成 {}，而是原样上报 __malformed_arguments__', async () => {

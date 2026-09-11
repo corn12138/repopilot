@@ -19,8 +19,19 @@ import type {
 import { CROSS_REVIEW_LIMITS } from '@shared/domain';
 import { digestOf, newId, nowIso } from '@shared/ids';
 import { EgressBlocked, InvocationFailed, ModelGateway } from './model/gateway';
-import type { ContentBlock, ModelMessage, StreamSignal, ToolSchema } from './model/types';
-import { textOf, toolUsesOf } from './model/types';
+import type {
+  ContentBlock,
+  ModelMessage,
+  ModelResponse,
+  StreamSignal,
+  ToolSchema,
+} from './model/types';
+import {
+  stopReasonAllowsToolExecution,
+  stopReasonBlockLabel,
+  textOf,
+  toolUsesOf,
+} from './model/types';
 import type { MutationPolicy } from './mutation';
 import { PLANNING_TOOLS, TOOLS, TOOLS_BY_NAME, type ToolContext, type ToolDefinition } from './tools';
 import { summarizeShapes } from './repo';
@@ -401,18 +412,16 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
 
     // 未验证模式：改完就出补丁，没有重验也没有自修复
     if (!verificationEnabled) {
-      const truncated = ended.kind === 'BUDGET_EXHAUSTED';
+      const truncation = executionTruncationReason(ended);
       return {
         kind: 'PATCH_READY',
         detail:
           `产生了 ${workspace.changedFilesVsBaseline().length} 个文件变更（本次运行没有任何机器验证）。` +
-          (truncated ? ` ⚠ 执行被预算截断：${ended.reason}，改动很可能是半成品。` : ''),
+          (truncation ? ` ⚠ 执行没跑完（${truncation}），改动很可能是半成品。` : ''),
         baseline: null,
         finalVerification: null,
         unverifiedItems: [
-          ...(truncated
-            ? [`⚠ 执行未跑完就被预算截断（${ended.reason}）—— 改动可能只做了一半`]
-            : []),
+          ...(truncation ? [`⚠ 执行未跑完（${truncation}）—— 改动可能只做了一半`] : []),
           ...buildUnverifiedItems(task, profile, null),
         ],
       };
@@ -487,14 +496,14 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
   const comparison = compareVerification(baseline!, finalVerification);
   // 拿成 const 才能让 TS 收窄；lastEnd 是 let，不能跨语句窄化
   const end = lastEnd;
-  const truncationReason = end?.kind === 'BUDGET_EXHAUSTED' ? end.reason : null;
+  const truncationReason = executionTruncationReason(end);
   const unverified = composeUnverifiedItems(task, profile, comparison, truncationReason);
 
   return {
     kind: 'PATCH_READY',
     detail:
       `验证通过（修复 ${comparison.fixed.join(', ') || '无'}），共 ${workspace.changedFilesVsBaseline().length} 个文件变更。` +
-      (truncationReason ? ' ⚠ 但执行过程曾被预算截断。' : ''),
+      (truncationReason ? ' ⚠ 但执行过程没跑完就停了。' : ''),
     baseline,
     finalVerification,
     unverifiedItems: unverified,
@@ -568,6 +577,31 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
     turnsRun += 1;
     // 规划期模型的思考同样进时间线：之前这一段被原样吞掉，用户只看得见最后那份计划
     if (sayIfAny(host, 'PLANNING', response.content)) spokenTurns += 1;
+
+    /*
+     * 截断的响应里就算凑巧解析出一份完整、合法的 submit_plan，也不能进审批 ——
+     * 那是模型没说完的话，不是它的完整意图。submit_plan 是下面内联解析的，
+     * **绕过 dispatchTool**，所以门禁只能设在这里，设在工具分发里拦不住它。
+     */
+    const incomplete = findIncompleteResponse(response);
+    if (incomplete) {
+      host.emit(
+        'MODEL_INVOCATION',
+        `规划轮响应不完整：${incomplete} —— ${uses.length} 个工具调用一律未执行，本轮不接受计划`,
+        { purpose: 'PLANNING', stopReason: response.stopReason, unexecutedToolCalls: uses.length },
+      );
+      conversation.push({ role: 'assistant', content: response.content });
+      pushUser(conversation, [
+        ...unexecutedToolResults(uses, incomplete),
+        {
+          type: 'text',
+          text:
+            `上一轮输出不完整，平台没有据此执行任何工具调用，也没有接受其中的计划。` +
+            `请缩短篇幅后重新提交。${planTurnsLeftNotice(turn, maxPlanTurns)}`,
+        },
+      ]);
+      continue;
+    }
 
     if (uses.length === 0) {
       // 没有调用 submit_plan 就想结束 —— 明确要求它提交结构化计划
@@ -890,6 +924,41 @@ function pushUser(conversation: ModelMessage[], blocks: readonly ContentBlock[])
   conversation.push({ role: 'user', content: [...blocks] });
 }
 
+/**
+ * 这次模型响应是否完整到可以据此行动。返回 null 表示可以，否则返回可直接展示的原因。
+ *
+ * 判据只有一份（`stopReasonAllowsToolExecution`），三条路径共用 —— 规划、执行、交叉审核
+ * 提取工具的边界各不相同，但"半截输出不代表模型的完整意图"是同一条规则。写成三处就会漂。
+ *
+ * 这道门禁拦的是**执行**，不是**记录**：响应照样进历史、正文照样进时间线，
+ * 只是不据它派发工具。
+ */
+function findIncompleteResponse(response: ModelResponse): string | null {
+  return stopReasonAllowsToolExecution(response.stopReason)
+    ? null
+    : stopReasonBlockLabel(response.stopReason);
+}
+
+/**
+ * 把这批工具调用如实回填成"未执行"。
+ *
+ * 响应不完整时**不能**把 tool_use 从历史里抹掉了事：assistant 消息已经 push 进
+ * conversation，每一个 toolUseId 都必须有对应的 tool_result，否则两家 wire 都以 400
+ * 拒绝**此后每一次**请求，而不只是产生它的那一次（见 findOrphanToolUse）。
+ * 所以"拦住执行"和"保住 wire 合法"必须同时做到。
+ */
+function unexecutedToolResults(
+  uses: ReturnType<typeof toolUsesOf>,
+  reason: string,
+): ContentBlock[] {
+  return uses.map((use) => ({
+    type: 'tool_result',
+    toolUseId: use.id,
+    content: `该工具调用未执行：${reason}。`,
+    isError: true,
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // 交叉审核（只读的第二个模型；PRD-XAGENT-003）
 // ---------------------------------------------------------------------------
@@ -1010,6 +1079,41 @@ export async function runReviewPass(
     const uses = toolUsesOf(response.content);
     // 审核方说的话也归审核方：它是"第二意见"的正文，不该只剩一份结构化 findings
     sayIfAny(host, 'CROSS_REVIEW', response.content);
+
+    /*
+     * 截断的审核结论不是审核结论。submit_review 也是下面内联解析、绕过 dispatchTool 的，
+     * 所以门禁同样只能设在这里。不接受 submitted 就意味着：用满轮次后落到本函数末尾
+     * 既有的 INCONCLUSIVE 分支 —— 正是"没给出结论 ≠ 通过"那条规则，不另造一个终态。
+     */
+    const incomplete = findIncompleteResponse(response);
+    if (incomplete) {
+      /*
+       * 用 MODEL_INVOCATION 而不是 CROSS_REVIEW_ROUND：后者在 Transcript 的 MERGED_KINDS 里
+       * （由 CrossReviewPanel 代表），而那个面板读的是结构化 crossReview 记录、不读事件 ——
+       * 这条事实会被合并掉，用户在时间线上根本看不见。省略要报数（不变式 8）。
+       */
+      host.emit(
+        'MODEL_INVOCATION',
+        `第 ${input.round} 轮审核响应不完整：${incomplete} —— ${uses.length} 个工具调用一律未执行，本轮不接受结论`,
+        {
+          purpose: 'CROSS_REVIEW',
+          round: input.round,
+          stopReason: response.stopReason,
+          unexecutedToolCalls: uses.length,
+        },
+      );
+      conversation.push({ role: 'assistant', content: response.content });
+      pushUser(conversation, [
+        ...unexecutedToolResults(uses, incomplete),
+        {
+          type: 'text',
+          text:
+            '上一轮输出不完整，平台没有据此执行任何工具调用，也没有接受其中的审核结论。' +
+            '请缩短篇幅后重新调用 submit_review 提交结论。',
+        },
+      ]);
+      continue;
+    }
 
     if (uses.length === 0) {
       // 只回了文本没提交结论 —— 要求它用 submit_review
@@ -1219,7 +1323,9 @@ export async function runRemediationPass(
   const ended = await executionTurns(deps, conversation);
   return {
     mutated: deps.workspace.activeGeneration !== before,
-    truncationReason: ended.kind === 'BUDGET_EXHAUSTED' ? ended.reason : null,
+    // 整改轮被截断也要如实带出去：它经 hooks.reseal 进重新封存的补丁未验证清单。
+    // 漏掉的后果是新补丁看起来比实际更干净 —— 而那只是少写了一行。
+    truncationReason: executionTruncationReason(ended),
   };
 }
 
@@ -1499,11 +1605,34 @@ function mapReviewFailure(err: unknown, host: AgentHost, signal: AbortSignal): C
 /**
  * 执行阶段的一轮循环。
  *
- * 返回值必须区分"模型自己说完了"和"预算把它掐断了" —— 之前两者用同一个 return，
- * 上游看到的都是"executionTurns 结束了"，于是被预算截断的执行会被当成正常完工，
- * 补丁照发、文案照写"已完成"。
+ * 返回值必须区分"模型自己说完了"、"预算把它掐断了"和"模型输出被截断了" —— 之前前两者
+ * 用同一个 return，上游看到的都是"executionTurns 结束了"，于是被预算截断的执行会被当成
+ * 正常完工，补丁照发、文案照写"已完成"。输出截断是同一个形状的坑：模型的话没说完，
+ * 但循环确实返回了。
  */
-type ExecutionEnd = { kind: 'MODEL_ENDED_TURN' } | { kind: 'BUDGET_EXHAUSTED'; reason: string };
+type ExecutionEnd =
+  | { kind: 'MODEL_ENDED_TURN' }
+  | { kind: 'BUDGET_EXHAUSTED'; reason: string }
+  | { kind: 'RESPONSE_TRUNCATED'; reason: string };
+
+/**
+ * 这一轮执行是不是**没跑完**。预算掐断与输出截断都算，两者都不能当正常完工。
+ *
+ * 判据收成一处：未验证模式分支、PATCH_READY 收尾、交叉审核整改路径三个消费点共用。
+ * 分开写就会漂 —— 而漂的后果是同一个 Run 在补丁详情里说"被截断"、在未验证清单里不说。
+ *
+ * 返回值自带成因类别，因为上层文案统一说"没跑完"、不猜成因：
+ * - 预算那一路的 reason 来自 `budgetExceeded()`，只说"模型轮次达上限 2"，
+ *   不点明这是预算问题，所以这里补前缀；
+ * - 输出截断那一路的 reason 由 `stopReasonBlockLabel` 产出，本身已点明成因，
+ *   再叠前缀就成了"模型输出被截断：模型输出达到长度上限被截断"。
+ */
+function executionTruncationReason(end: ExecutionEnd | null): string | null {
+  if (!end) return null;
+  if (end.kind === 'BUDGET_EXHAUSTED') return `预算耗尽：${end.reason}`;
+  if (end.kind === 'RESPONSE_TRUNCATED') return end.reason;
+  return null;
+}
 
 /**
  * 模型正文的长度上限。
@@ -1562,6 +1691,24 @@ async function executionTurns(
      * 而它恰好是整条时间线里信息密度最高的东西。
      */
     sayIfAny(host, 'EXECUTION', response.content);
+
+    /*
+     * 响应不完整就到此为止：这一轮的工具一个都不派发。
+     *
+     * 必须判在提取 uses 之后、派发之前 —— 判在 dispatchTool 里不够（规划与审核的
+     * 结构化提交绕过它），而且纯文本的截断响应根本没有工具可拦，却同样不能报成
+     * "模型说完了"：那会让上游把半截执行当正常完工。
+     */
+    const incomplete = findIncompleteResponse(response);
+    if (incomplete) {
+      host.emit(
+        'MODEL_INVOCATION',
+        `执行轮响应不完整：${incomplete} —— 本轮 ${uses.length} 个工具调用一律未执行`,
+        { purpose: 'EXECUTION', stopReason: response.stopReason, unexecutedToolCalls: uses.length },
+      );
+      if (uses.length > 0) pushUser(conversation, unexecutedToolResults(uses, incomplete));
+      return { kind: 'RESPONSE_TRUNCATED', reason: incomplete };
+    }
 
     if (uses.length === 0) return { kind: 'MODEL_ENDED_TURN' };
 
@@ -2054,7 +2201,7 @@ export function composeUnverifiedItems(
   truncationReason: string | null,
 ): string[] {
   return [
-    ...(truncationReason ? [`⚠ 执行曾被预算截断（${truncationReason}）`] : []),
+    ...(truncationReason ? [`⚠ 执行没跑完就停了（${truncationReason}）`] : []),
     ...(comparison && comparison.notRerun.length > 0
       ? [`以下基线失败的命令本次未重跑，状态未知：${comparison.notRerun.join(', ')}`]
       : []),

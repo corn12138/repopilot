@@ -341,6 +341,28 @@ function endTurn(text: string): ModelResponse {
   };
 }
 
+/**
+ * 输出撞到长度上限被切断的响应。
+ *
+ * content 照常给 —— 这正是危险所在：真实的截断响应里，前面那些 tool_use 块往往
+ * **完整且可解析**（被切掉的是后面还没写出来的部分）。所以"参数 JSON 合法"
+ * 完全不能当作"模型说完了"的证据。
+ */
+function truncated(...content: ContentBlock[]): ModelResponse {
+  return { content, stopReason: 'MAX_TOKENS', inputTokens: 10, outputTokens: 8000 };
+}
+
+/**
+ * 结束原因未知或矛盾的响应 —— 两家 mapper 的 default 分支。
+ *
+ * 实际会接到 Anthropic 的 refusal / pause_turn、OpenAI 的 content_filter，
+ * 以及流意外结束（Anthropic 的流若缺 message_delta 帧，stopReason 是 undefined → OTHER）。
+ * 未知**不是**默认成功。
+ */
+function unknownStop(...content: ContentBlock[]): ModelResponse {
+  return { content, stopReason: 'OTHER', inputTokens: 10, outputTokens: 5 };
+}
+
 const VALID_PLAN = {
   summary: '把 CartSummary 里被当成 number 用的 DiscountResult 解构出来',
   steps: [
@@ -1515,5 +1537,159 @@ describe('最后一轮的收窄是平台闸门，不只是"少给几个 schema"'
     // 被拒的那次不算"看过"——它什么都没读到
     const note = host.events.find((e) => e.kind === 'NOTE' && e.summary.startsWith('规划没有收口'));
     expect(note!.payload.planningDigest).toMatchObject({ toolCalls: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 响应完整性：半截输出不代表模型的完整意图
+// ---------------------------------------------------------------------------
+
+describe('响应不完整就不能据此执行工具', () => {
+  /**
+   * 这一组守的是：模型输出撞到长度上限（或结束原因未知）时，它这一轮给出的工具调用
+   * **一个都不能派发** —— 哪怕参数 JSON 完整可解析。
+   *
+   * 缺陷曾经真实存在：`ModelResponse.stopReason` 由两家 adapter 写入，却没有任何生产代码
+   * 读取它，`MAX_TOKENS` 是个死字段。于是截断响应里凑巧解析出的第一个 tool call 会被当成
+   * 模型的完整意图去执行 —— 而模型可能还要再调三个工具，那些还没写出来。
+   *
+   * 拦的是**执行**，不是**记录**：响应照样进历史、正文照样进时间线，tool_use 也照样被
+   * 如实回填成"未执行"（不回填就是孤儿，两家 wire 此后每一次请求都 400）。
+   */
+
+  const toolUseBlock = (id: string, name: string, input: unknown): ContentBlock => ({
+    type: 'tool_use',
+    id,
+    name,
+    input,
+  });
+
+  const allBlocks = (messages: readonly ModelMessage[]) =>
+    messages.flatMap((m) => m.content);
+
+  const truncationEvents = () =>
+    host.events.filter((e) => e.payload.unexecutedToolCalls !== undefined);
+
+  it('执行阶段截断响应里的写工具，参数完整可解析也不执行', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) =>
+      n === 1
+        ? toolUse('submit_plan', VALID_PLAN)
+        : truncated(
+            toolUseBlock('tu_plant', 'workspace_mutate', {
+              operations: [
+                { kind: 'CREATE_FILE', path: 'src/planted.ts', newText: 'export const evil = 1;\n' },
+              ],
+            }),
+          ),
+    );
+
+    const result = await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    // 写路径完全没被触发 —— 比断言"结果是失败"强，后者在"执行了但报告为假"时也成立
+    expect(workspace.stageCalls).toBe(0);
+    expect(host.toolCalls.map((t) => t.toolName)).not.toContain('workspace_mutate');
+    expect(host.kinds()).not.toContain('MUTATION_APPLIED');
+
+    // 而且不能把半截执行报成正常完工：补丁详情与未验证清单都要说出来
+    expect(result.kind).toBe('PATCH_READY');
+    expect(result.detail).toContain('执行没跑完');
+    expect(result.unverifiedItems.join('\n')).toContain('长度上限');
+
+    // 省略要报数（不变式 8）：被拦下几个，事件里就得写几个
+    expect(truncationEvents()).toHaveLength(1);
+    expect(truncationEvents()[0]!.payload).toMatchObject({
+      stopReason: 'MAX_TOKENS',
+      unexecutedToolCalls: 1,
+    });
+  });
+
+  it('纯文本的截断响应不报成"模型结束了回合"', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) =>
+      n === 1
+        ? toolUse('submit_plan', VALID_PLAN)
+        : truncated({ type: 'text', text: '我改了一半，接下来还要' }),
+    );
+
+    const result = await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    // 没有工具可拦，但"话说完了"是假话 —— 上游会据此把半成品当完工
+    expect(result.detail).toContain('执行没跑完');
+    expect(result.unverifiedItems.join('\n')).toContain('长度上限');
+    expect(truncationEvents()[0]!.payload).toMatchObject({ unexecutedToolCalls: 0 });
+  });
+
+  it('结束原因未知（OTHER）同样不执行 —— 未知不是默认成功', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) =>
+      n === 1
+        ? toolUse('submit_plan', VALID_PLAN)
+        : unknownStop(toolUseBlock('tu_read', 'fs_read', { path: 'hello.txt' })),
+    );
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    expect(host.toolCalls.map((t) => t.toolName)).not.toContain('fs_read');
+    expect(truncationEvents()[0]!.payload).toMatchObject({ stopReason: 'OTHER' });
+    expect(truncationEvents()[0]!.summary).toContain('未知或矛盾');
+  });
+
+  it('规划阶段截断响应里的 submit_plan 不进审批', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) => {
+      // 第 1 轮：截断，但里面的 submit_plan 参数完整、schema 合法 —— 最危险的那种
+      if (n === 1) return truncated(toolUseBlock('tu_plan_trunc', 'submit_plan', VALID_PLAN));
+      if (n === 2) return toolUse('submit_plan', VALID_PLAN);
+      return endTurn('改完了');
+    });
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    // 只有第 2 轮那份完整的进了审批；截断那份一次都没走到用户面前
+    expect(host.planApprovals).toBe(1);
+
+    // 模型被告知了真实原因，而不是被含糊地要求"重新提交"
+    const secondCall = gateway.calls[1]!;
+    expect(allBlocks(secondCall.messages).some((b) => b.type === 'text' && b.text.includes('缩短篇幅'))).toBe(
+      true,
+    );
+  });
+
+  it('截断轮的全部 tool_use 都被如实回填 —— 历史复用后两家 wire 仍然合法', async () => {
+    workspace.changed = ['src/a.ts'];
+    const gateway = new ScriptedModel((n) => {
+      // 截断轮里有两个工具调用：真实场景就是"第一个写完了、第二个还没写出来"
+      if (n === 1) {
+        return truncated(
+          toolUseBlock('tu_read_trunc', 'fs_read', { path: 'src/a.ts' }),
+          toolUseBlock('tu_plan_trunc', 'submit_plan', VALID_PLAN),
+        );
+      }
+      if (n === 2) return toolUse('submit_plan', VALID_PLAN);
+      return endTurn('改完了');
+    });
+
+    await run(gateway, makeTask({ verificationCommandIds: [] }));
+
+    // 前提：确实发生了跨阶段历史复用，否则下面的断言什么都没验证
+    const exec = gateway.calls.filter((c) => c.purpose === 'EXECUTION');
+    expect(exec.length).toBeGreaterThan(0);
+
+    // 两个 id 都要有 tool_result，少一个就是孤儿（此后每一次请求都 400）
+    expect(findOrphanToolUse(exec[0]!.messages)).toBeNull();
+    expect(findWireViolation(exec[0]!.messages)).toBeNull();
+
+    // 回填必须如实说"未执行"，不能伪造成成功，也不能含糊成"执行被中断"
+    const results = allBlocks(exec[0]!.messages).filter(
+      (b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result',
+    );
+    for (const id of ['tu_read_trunc', 'tu_plan_trunc']) {
+      const filled = results.find((r) => r.toolUseId === id);
+      expect(filled, `${id} 没有被回填`).toBeDefined();
+      expect(filled!.isError).toBe(true);
+      expect(filled!.content).toContain('未执行');
+      expect(filled!.content).toContain('长度上限');
+    }
   });
 });

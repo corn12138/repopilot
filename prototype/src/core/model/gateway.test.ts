@@ -216,6 +216,8 @@ describe('invoke: 有界同 route 重试 + 单次尝试超时', () => {
     expect(out.response.inputTokens).toBe(3);
     expect(out.manifest.sendAttempt).toBe(2);
     expect(out.manifest.sendState).toBe('RESPONDED');
+    // 拿到响应才有结束原因可记
+    expect(out.manifest.stopReason).toBe('END_TURN');
 
     const mid = readEgress().filter((m) => m.runId === 'run-retry');
     expect(mid).toHaveLength(1);
@@ -223,8 +225,42 @@ describe('invoke: 有界同 route 重试 + 单次尝试超时', () => {
     expect(mid[0]!.sent).toBe(false); // 连接都没建立，不能记成已出站
     expect(mid[0]!.sendState).toBe('NOT_SENT');
     expect(mid[0]!.errorKind).toBe('NETWORK');
+    // 没有响应就没有结束原因 —— 留空，补成任何值都是编造
+    expect(mid[0]!.stopReason).toBeUndefined();
     // 中间尝试与最终结果共享同一 invocationId —— 是同一次调用的多次发送
     expect(mid[0]!.invocationId).toBe(out.invocationId);
+  });
+
+  /*
+   * 截断也要如实落账。
+   *
+   * 放在这个 describe 里是因为 makeInput / scriptFetch 装置在此（与"消息序列合法性"
+   * 那组住在 budget 测试里同一个道理）—— 主题上它属于出站账本，不属于重试。
+   *
+   * 落点要说准：Run 内的调用清单**不进**全局 egress.jsonl，而是随 MODEL_INVOCATION
+   * 事件的 payload 进该 Run 自己的事件流（见 gateway.ts 对 appendEgress 的说明）；
+   * 全局那份只收无 Run 归属的连通性测试与中间失败尝试。所以这里断言的是返回给
+   * 调用方的 manifest —— 它就是随后被写进 Run 事件流的那一份。
+   *
+   * 没有这个字段，一次被截断的调用和一次干净的 END_TURN 在事件流里长得一模一样，
+   * 事后无从统计截断率 —— 而截断率是判断"该不该调 maxOutputTokens、该不该收窄任务"
+   * 的唯一依据。
+   */
+  it('finish_reason=length → manifest 记 MAX_TOKENS，不美化成 END_TURN', async () => {
+    const lengthBody = JSON.stringify({
+      choices: [{ message: { content: '我改了一半，接下来' }, finish_reason: 'length' }],
+      usage: { prompt_tokens: 3, completion_tokens: 16 },
+    });
+    scriptFetch([
+      new Response(lengthBody, { status: 200, headers: { 'content-type': 'application/json' } }),
+    ]);
+    const gw = new ModelGateway(FAST);
+    const out = await gw.invoke(makeInput(gw));
+
+    expect(out.manifest.sendState).toBe('RESPONDED');
+    expect(out.manifest.stopReason).toBe('MAX_TOKENS');
+    // 响应正文照旧返回：门禁拦的是执行，不是记录
+    expect(out.response.stopReason).toBe('MAX_TOKENS');
   });
 
   it('5xx 连续失败：用满 maxSendAttempts 后抛出，最终 manifest 记第 3 次', async () => {

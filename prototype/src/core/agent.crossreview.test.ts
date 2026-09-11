@@ -155,6 +155,17 @@ function toolUse(name: string, input: unknown): ModelResponse {
   };
 }
 
+/**
+ * 输出撞到长度上限被切断的响应。
+ *
+ * content 照常带一个**完整可解析**的 tool_use —— 真实的截断响应就是这样：被切掉的是
+ * 后面还没写出来的部分，前面那个调用往往完全合法。所以"参数 JSON 能解析、schema 能过"
+ * 完全不能当作"审核方把话说完了"的证据。
+ */
+function truncatedToolUse(name: string, input: unknown): ModelResponse {
+  return { ...toolUse(name, input), stopReason: 'MAX_TOKENS', outputTokens: 8000 };
+}
+
 /** 按脚本回应的审核方替身；同时用 findWireViolation 守住消息序列合法性（孤儿 tool_use + role 交替）*/
 class ScriptedReviewer implements ModelInvoker {
   turn = 0;
@@ -957,5 +968,78 @@ describe('runRemediationPass', () => {
     expect(r.truncationReason).not.toBeNull();
     expect(duo.execTurn).toBe(0);
     expect(duo.reviewTurn).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 审核响应不完整：没说完的话不是结论
+// ---------------------------------------------------------------------------
+
+describe('审核响应被截断：结论不算结论', () => {
+  /**
+   * 截断的 submit_review 里可能带着一份完整、schema 合法的 `verdict:'PASS'` ——
+   * 那是审核方**没说完**的话，不是它的结论。接受它等于让"输出被切断"变成"审核通过"，
+   * 而 PASS 直接影响用户对补丁的信任，是本产品最不该说谎的那个位置。
+   *
+   * 落点是既有的 INCONCLUSIVE（用满 8 轮未提交结论），不另造终态 ——
+   * 正是本文件上面那条"没给出结论 ≠ 通过"的规则。
+   *
+   * 回填的合法性由替身自动守着：ScriptedReviewer / ScriptedDuo 每次调用都先跑
+   * findWireViolation，截断轮的 tool_use 若没被如实回填，第 2 轮就会直接抛
+   * "非法消息序列"，而不是 quietly 通过。
+   */
+  it('每一轮都截断 → 用满 8 轮 → INCONCLUSIVE + 空发现，PASS 不生效', async () => {
+    const host = new ReviewHost();
+    const reviewer = new ScriptedReviewer(() =>
+      truncatedToolUse('submit_review', { verdict: 'PASS', findings: [] }),
+    );
+
+    const round = await runReviewPass(makeDeps(reviewer, host), {
+      reviewerResolution: RESOLUTION,
+      patch: PATCH,
+      finalVerification: VERIFICATION,
+      round: 1,
+    });
+
+    expect(round.verdict).toBe('INCONCLUSIVE');
+    expect(round.findings).toEqual([]);
+    // 用满轮次，而不是第 1 轮就把那份截断的 PASS 当结论收下
+    expect(reviewer.turn).toBe(8);
+  });
+
+  it('截断的 PASS 不会让循环判成 REVIEWER_PASSED', async () => {
+    const host = new ReviewHost();
+    const duo = new ScriptedDuo(() =>
+      truncatedToolUse('submit_review', { verdict: 'PASS', findings: [] }),
+    );
+    const { hooks, calls } = makeHooks();
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
+
+    expect(out.stopReason).toBe('REVIEWER_INCONCLUSIVE');
+    // 没有结论就没有可整改的东西，也绝不能进整改
+    expect(out.remediations).toBe(0);
+    expect(calls).toEqual({ reverify: 0, reseal: 0, adopt: 0, restore: 0 });
+  });
+
+  it('先截断、后完整提交：算数的是完整那一份', async () => {
+    const host = new ReviewHost();
+    const duo = new ScriptedDuo((turn) =>
+      turn === 1
+        ? // 截断轮里那份 PASS 若被收下，循环第 1 轮就会以 REVIEWER_PASSED 收场
+          truncatedToolUse('submit_review', { verdict: 'PASS', findings: [] })
+        : submitReview('PASS', []),
+    );
+    const { hooks } = makeHooks();
+    const deps = makeDeps(duo, host, IMPLEMENTER);
+
+    const out = await runCrossReviewCycle(deps, cycleInput(deps), hooks);
+
+    // 前提：确实又调了一次审核方 —— 否则"完整那份算数"无从谈起
+    expect(duo.reviewTurn).toBe(2);
+    expect(out.stopReason).toBe('REVIEWER_PASSED');
+    expect(out.rounds).toHaveLength(1);
+    expect(out.rounds[0]!.verdict).toBe('PASS');
   });
 });

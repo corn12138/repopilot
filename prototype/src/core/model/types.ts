@@ -1,4 +1,4 @@
-import type { ProviderId } from '@shared/domain';
+import type { ProviderId, StopReason } from '@shared/domain';
 
 /** 供应商中立的内容块。适配器负责翻译成各家线上格式。 */
 export type ContentBlock =
@@ -30,8 +30,6 @@ export interface ModelRequest {
   readonly temperature: number;
 }
 
-export type StopReason = 'TOOL_USE' | 'END_TURN' | 'MAX_TOKENS' | 'OTHER';
-
 export interface ModelResponse {
   readonly content: readonly ContentBlock[];
   readonly stopReason: StopReason;
@@ -62,6 +60,37 @@ export interface ModelResponse {
   readonly cacheReadTokens?: number | null;
   /** 为写入缓存而付费的输入 token（Anthropic `cache_creation_input_tokens`）；null = 未回报 */
   readonly cacheWriteTokens?: number | null;
+}
+
+/**
+ * 这个结束原因是否允许平台**据此执行工具**。
+ *
+ * 只有 `END_TURN` 与 `TOOL_USE` 允许。`MAX_TOKENS` 是输出撞到长度上限被切断 ——
+ * 模型的话没说完，此刻它给出的工具调用不代表它的完整意图（一个多工具批次里第一个
+ * 调用可能完整可解析，但后面那些还没写出来）。`OTHER` 是两家 mapper 的 default 分支，
+ * 实际会接到 Anthropic 的 refusal / pause_turn、OpenAI 的 content_filter，以及流意外
+ * 结束（Anthropic 的流若缺 message_delta 帧，stopReason 是 undefined → OTHER）。
+ * **未知不是默认成功** —— 与合同 CONTRACT-MODEL-INVOCATION-EGRESS-001 §3.1
+ * 「`SEALED_PARTIAL` 不得执行 ToolCall、不得冒充 canonical」同向。
+ *
+ * 注意这道判据只管"能不能执行"，不管"响应里有没有工具"：纯文本的截断响应没有副作用
+ * 风险，但把它报成"模型结束了回合"同样是假话，调用方要分开处理。
+ */
+export function stopReasonAllowsToolExecution(stopReason: StopReason): boolean {
+  return stopReason === 'END_TURN' || stopReason === 'TOOL_USE';
+}
+
+/**
+ * 不可执行时给人看的原因 —— 进事件文案与 tool_result 回填。
+ *
+ * 两种成因要分清，因为用户的下一步动作不同：撞长度上限是任务/预算的事，
+ * 未知结束原因是 provider 归一化的事。
+ */
+export function stopReasonBlockLabel(stopReason: StopReason): string {
+  if (stopReason === 'MAX_TOKENS') {
+    return '模型输出达到长度上限被截断，它的意图没有说完';
+  }
+  return '模型返回了未知或矛盾的结束原因（既不是正常收尾，也不是请求工具）';
 }
 
 export type ModelCallErrorKind =
