@@ -92,6 +92,8 @@ export function registerObserverIpc(getWindow: () => BrowserWindow | null): { se
             service.unwatch(req.payload.sessionId);
             syncPollTimer();
             return { ok: true, data: { ok: true } };
+          case 'observer.prepareHandoff':
+            return { ok: true, data: { artifact: service.prepareHandoff(req.payload.sessionId) } };
         }
         return { ok: false, error: { code: 'BAD_REQUEST', message: '未知方法', detail: null } };
       } catch (err) {

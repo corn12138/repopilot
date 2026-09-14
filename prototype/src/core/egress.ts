@@ -35,6 +35,8 @@ export interface DisclosureInput {
    */
   readonly reviewerParity: VendorParity | null;
   readonly author: { connector: ExternalConnectorProfile } | null;
+  /** 非空时，交接正文会进入每个实际接收任务上下文的目的地。 */
+  readonly handoffDigest: string | null;
 }
 
 const IMPLEMENTER_CLASSES: readonly EgressDataClass[] = [
@@ -53,6 +55,8 @@ const AUTHOR_CLI_CLASSES: readonly EgressDataClass[] = [
 
 export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
   const destinations: EgressDestination[] = [];
+  const classes = (base: readonly EgressDataClass[]): readonly EgressDataClass[] =>
+    input.handoffDigest ? [...base, 'OBSERVED_SESSION_HANDOFF'] : base;
   const impl = input.implementer;
   destinations.push({
     role: 'IMPLEMENTER',
@@ -64,7 +68,9 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
     modelId: impl.resolution.modelId,
     resolutionDigest: impl.resolution.digest,
     // 外部作者在场时，实现方模型只做规划（与整改简报无关），但仍可能看到命令输出/审核发现
-    dataClasses: input.author ? ['TASK_TEXT', 'REPOSITORY_SNAPSHOT_EXCERPTS', 'COMMAND_OUTPUT'] : IMPLEMENTER_CLASSES,
+    dataClasses: classes(
+      input.author ? ['TASK_TEXT', 'REPOSITORY_SNAPSHOT_EXCERPTS', 'COMMAND_OUTPUT'] : IMPLEMENTER_CLASSES,
+    ),
   });
   if (input.reviewer) {
     if (input.reviewer.kind === 'MODEL_API') {
@@ -78,7 +84,7 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
         isRelay: r.profile.isRelay || r.profile.kind === 'RELAY',
         modelId: r.resolution.modelId,
         resolutionDigest: r.resolution.digest,
-        dataClasses: REVIEWER_CLASSES,
+        dataClasses: classes(REVIEWER_CLASSES),
       });
     } else {
       const c = input.reviewer.connector;
@@ -92,7 +98,7 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
         modelId: null,
         // 本机 CLI 没有网络 route，但有身份：路径 + 版本。见下方 consentedResolutionDigests
         resolutionDigest: c.identityDigest,
-        dataClasses: REVIEWER_CLASSES,
+        dataClasses: classes(REVIEWER_CLASSES),
       });
     }
   }
@@ -107,16 +113,17 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
       isRelay: false,
       modelId: null,
       resolutionDigest: c.identityDigest,
-      dataClasses: AUTHOR_CLI_CLASSES,
+      dataClasses: classes(AUTHOR_CLI_CLASSES),
     });
   }
   const body = {
-    disclosureVersion: 2 as const,
+    disclosureVersion: 3 as const,
     snapshotId: input.snapshotId,
     snapshotFileCount: input.snapshotFileCount,
     destinations,
     // TD §9.14：非异构（含无法判定）必须显式披露 —— 判定属于用户点头的对象，digest 覆盖它
     crossReviewParity: input.reviewer ? input.reviewerParity : null,
+    handoffDigest: input.handoffDigest,
     policy: { retention: 'UNKNOWN' as const, training: 'UNKNOWN' as const, region: 'UNKNOWN' as const },
   };
   return { ...body, digest: digestOf(body) };

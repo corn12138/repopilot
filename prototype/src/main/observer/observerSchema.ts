@@ -24,6 +24,12 @@ export const observerEnvelopeSchema = z.discriminatedUnion('method', [
       payload: z.object({ sessionId: z.string().min(1).max(300).optional() }).strict(),
     })
     .strict(),
+  z
+    .object({
+      method: z.literal('observer.prepareHandoff'),
+      payload: z.object({ sessionId: z.string().min(1).max(300) }).strict(),
+    })
+    .strict(),
 ]);
 
 export type ObserverEnvelope = z.infer<typeof observerEnvelopeSchema>;

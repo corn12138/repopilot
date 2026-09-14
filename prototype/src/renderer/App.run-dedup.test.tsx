@@ -111,7 +111,7 @@ const importOutcome: ImportOutcome = {
 };
 
 const disclosure = {
-  disclosureVersion: 2,
+  disclosureVersion: 3,
   snapshotId: snapshot.snapshotId,
   snapshotFileCount: 3,
   destinations: [
@@ -128,6 +128,7 @@ const disclosure = {
     },
   ],
   crossReviewParity: null,
+  handoffDigest: null,
   policy: { retention: 'UNKNOWN', training: 'UNKNOWN', region: 'UNKNOWN' },
   digest: 'sha256:disclosure-1',
 };

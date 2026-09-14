@@ -7,6 +7,7 @@ import type {
   RunView,
 } from '@shared/domain';
 import type { DataEgressDisclosure } from '@shared/domain';
+import type { ObserverHandoffArtifact } from '@shared/observerProtocol';
 import type { ResponsePayload, ReviewerOption } from '@shared/protocol';
 
 type CommandClassification = ResponsePayload<'command.classify'>;
@@ -19,6 +20,7 @@ const DATA_CLASS_LABEL: Record<string, string> = {
   COMMAND_OUTPUT: '构建/测试命令输出',
   PATCH_DIFF: '补丁 diff',
   REVIEW_FINDINGS: '审核发现',
+  OBSERVED_SESSION_HANDOFF: '用户确认交接的本机会话内容',
   REPOSITORY_FULL_COPY_VIA_CLI: '整个仓库的一次性副本（CLI 可读取其中任何文件）',
 };
 
@@ -36,6 +38,7 @@ export function Composer({
   snapshot,
   profile,
   modelProfiles,
+  handoffDraft = null,
   activeRun,
   onCreated,
   onReimport,
@@ -47,6 +50,7 @@ export function Composer({
   snapshot: RepositorySnapshot;
   profile: RepositoryHarnessProfile;
   modelProfiles: ModelConnectionProfile[];
+  handoffDraft?: ObserverHandoffArtifact | null;
   /** 该项目下仍在进行中的 Run（若有）—— 用来提示，避免"以为没反应"而重复创建 */
   activeRun: RunView | null;
   onCreated: (run: RunView) => void;
@@ -59,7 +63,7 @@ export function Composer({
   const enabledModels = useMemo(() => modelProfiles.filter((m) => m.enabled), [modelProfiles]);
   const commandIds = useMemo(() => Object.keys(profile.commands), [profile]);
 
-  const [goal, setGoal] = useState('');
+  const [goal, setGoal] = useState(handoffDraft?.suggestedGoal ?? '');
   /**
    * 默认为空 = 整个仓库都可改（受保护路径除外）。
    * 以前默认 'src/**'：用户什么都没选，却被一条看不见的规则收窄了范围 ——
@@ -233,6 +237,7 @@ export function Composer({
           ...(reviewerModelForDisclosure ? { reviewerModelProfileId: reviewerModelForDisclosure } : {}),
           ...(reviewerCliForDisclosure ? { reviewerConnectorId: reviewerCliForDisclosure } : {}),
           ...(authorConnectorId ? { authorConnectorId } : {}),
+          ...(handoffDraft ? { handoffDigest: handoffDraft.digest } : {}),
         });
         if (cancelled) return;
         if (!res?.disclosure) {
@@ -251,7 +256,7 @@ export function Composer({
     return () => {
       cancelled = true;
     };
-  }, [snapshot.snapshotId, effectiveModelId, reviewerModelForDisclosure, reviewerCliForDisclosure, authorConnectorId]);
+  }, [snapshot.snapshotId, effectiveModelId, reviewerModelForDisclosure, reviewerCliForDisclosure, authorConnectorId, handoffDraft]);
   const consented = disclosure !== null && consentedDigest === disclosure.digest;
 
   /**
@@ -269,8 +274,9 @@ export function Composer({
       out.push({ label: '交叉审核', value: reviewerProfileId });
     }
     if (authorOption) out.push({ label: '作者', value: `${authorOption.label}（外部 CLI）` });
+    if (handoffDraft) out.push({ label: '会话交接', value: handoffDraft.digest.slice(0, 20) });
     return out;
-  }, [hasCustom, customCommand, allowedPaths, acceptance, reviewerProfileId, reviewerResolved, authorOption]);
+  }, [hasCustom, customCommand, allowedPaths, acceptance, reviewerProfileId, reviewerResolved, authorOption, handoffDraft]);
 
   /**
    * 逐条 glob 的命中数。
@@ -354,6 +360,9 @@ export function Composer({
             : { reviewerModelProfileId: reviewerProfileId }
           : {}),
         ...(authorConnectorId ? { authorConnectorId } : {}),
+        ...(handoffDraft
+          ? { handoffPayload: handoffDraft.payload, handoffDigest: handoffDraft.digest }
+          : {}),
         egressConsentDigest: disclosure!.digest,
       });
       setGoal('');
@@ -417,6 +426,15 @@ export function Composer({
             查看它
           </button>
           ，或在下面开一个新任务 —— 两者互不影响。
+        </div>
+      )}
+
+      {handoffDraft && (
+        <div className="composer-note" role="status">
+          已附加来自 {handoffDraft.vendor === 'CLAUDE_JOURNAL' ? 'Claude' : 'Codex'} 的冻结交接包
+          （{handoffDraft.source === 'DESKTOP_LOCAL_AGENT' ? 'Desktop' : handoffDraft.source === 'USER_CLI' ? 'CLI' : '来源待确认'}，
+          <code>{handoffDraft.digest.slice(0, 20)}…</code>）。重新导入已捕获对方写完后的仓库状态；
+          交接内容会在出站披露中单独列出，并由 Core 重算摘要。
         </div>
       )}
 

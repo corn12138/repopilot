@@ -86,7 +86,7 @@ function installBridges(): { observerRequest: ReturnType<typeof vi.fn> } {
     return { ok: false, error: { code: 'BAD_REQUEST', message: `unexpected ${method}`, detail: null } };
   });
   window.repopilotObserver = {
-    protocolVersion: 1,
+    protocolVersion: 2,
     request: observerRequest as unknown as ObserverBridge['request'],
     subscribe: () => () => {},
   };

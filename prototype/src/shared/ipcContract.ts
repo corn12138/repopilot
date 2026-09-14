@@ -136,6 +136,8 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
       reviewerModelProfileId: OPTIONAL_ID,
       reviewerConnectorId: OPTIONAL_ID,
       authorConnectorId: OPTIONAL_ID,
+      handoffPayload: { kind: 'string', optional: true, maxLength: 12_000 },
+      handoffDigest: { kind: 'string', optional: true, maxLength: 200 },
       // 合同层可选、Core 必填：缺了由 Core 以 CONSENT_REQUIRED 拒绝（带可读的修复建议），不在 IPC 层吞成"字段缺失"
       egressConsentDigest: { kind: 'string', optional: true, maxLength: 200 },
       // 批准 id 与命令一一对应，所以上限跟着 customCommands 的 maxItems 走
@@ -158,6 +160,7 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
       reviewerModelProfileId: OPTIONAL_ID,
       reviewerConnectorId: OPTIONAL_ID,
       authorConnectorId: OPTIONAL_ID,
+      handoffDigest: { kind: 'string', optional: true, maxLength: 200 },
     },
     timeoutMs: QUICK,
   },

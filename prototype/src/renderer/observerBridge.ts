@@ -10,7 +10,8 @@ import { RequestError } from './bridge';
 /**
  * 观察通道的 Renderer 侧封装。与 `bridge.ts` 平行但刻意独立：
  * 这条通道没有 Core 代次（观察状态活在 Main，Core 重启不影响它），
- * 也永远不该出现在任何 Run/Approval 流程里。
+ * 日志投影不进入 Run；人工交接只通过受限的 prepareHandoff 返回冻结 Artifact，
+ * 后续仍由 Core 的 task.create 合同与摘要校验接管。
  */
 declare global {
   interface Window {

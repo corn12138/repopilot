@@ -8,6 +8,7 @@ import type {
   RepositorySnapshot,
 } from '@shared/domain';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ObserverHandoffArtifact } from '@shared/observerProtocol';
 
 const callMock = vi.fn();
 vi.mock('../bridge', () => ({
@@ -112,21 +113,24 @@ const reviewers = [
 
 /** 披露由"目的地"决定 digest：加了作者/审核方就变 —— 与 Core 同形的最小替身 */
 function disclosureFor(payload: Record<string, unknown>) {
+  const withHandoff = (items: string[]) =>
+    payload.handoffDigest ? [...items, 'OBSERVED_SESSION_HANDOFF'] : items;
   const destinations = [
-    { role: 'IMPLEMENTER', channel: 'MODEL_API', label: 'DeepSeek · deepseek-chat', providerId: 'deepseek', origin: 'https://api.deepseek.com', isRelay: false, modelId: 'deepseek-chat', resolutionDigest: 'sha256:r1', dataClasses: ['TASK_TEXT', 'REPOSITORY_SNAPSHOT_EXCERPTS'] },
-    ...(payload.reviewerConnectorId ? [{ role: 'REVIEWER', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: ['PATCH_DIFF'] }] : []),
-    ...(payload.authorConnectorId ? [{ role: 'AUTHOR', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: ['REPOSITORY_FULL_COPY_VIA_CLI'] }] : []),
+    { role: 'IMPLEMENTER', channel: 'MODEL_API', label: 'DeepSeek · deepseek-chat', providerId: 'deepseek', origin: 'https://api.deepseek.com', isRelay: false, modelId: 'deepseek-chat', resolutionDigest: 'sha256:r1', dataClasses: withHandoff(['TASK_TEXT', 'REPOSITORY_SNAPSHOT_EXCERPTS']) },
+    ...(payload.reviewerConnectorId ? [{ role: 'REVIEWER', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: withHandoff(['PATCH_DIFF']) }] : []),
+    ...(payload.authorConnectorId ? [{ role: 'AUTHOR', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: withHandoff(['REPOSITORY_FULL_COPY_VIA_CLI']) }] : []),
   ];
   return {
-    disclosureVersion: 2,
+    disclosureVersion: 3,
     snapshotId: 'snapshot-1',
     snapshotFileCount: 12,
     destinations,
     crossReviewParity: payload.reviewerConnectorId
       ? { kind: 'HETEROGENEOUS', detail: '实现方 deepseek/deepseek-chat 属 DeepSeek，审核方 Codex 属 OpenAI' }
       : null,
+    handoffDigest: payload.handoffDigest ?? null,
     policy: { retention: 'UNKNOWN', training: 'UNKNOWN', region: 'UNKNOWN' },
-    digest: `sha256:disclosure-${destinations.map((d) => d.role).join('+')}`,
+    digest: `sha256:disclosure-${destinations.map((d) => d.role).join('+')}${payload.handoffDigest ? '-handoff' : ''}`,
   };
 }
 
@@ -136,13 +140,14 @@ async function consent() {
   await waitFor(() => expect((screen.getByRole('button', { name: '开始' }) as HTMLButtonElement).disabled).toBe(false));
 }
 
-function composer(onCreated = vi.fn()) {
+function composer(onCreated = vi.fn(), handoffDraft: ObserverHandoffArtifact | null = null) {
   return (
     <Composer
       project={project}
       snapshot={snapshot}
       profile={profile}
       modelProfiles={[model]}
+      handoffDraft={handoffDraft}
       activeRun={null}
       onCreated={onCreated}
       onReimport={vi.fn()}
@@ -263,6 +268,36 @@ describe('外部作者与外部 CLI 审核方：可达且传对字段', () => {
 });
 
 describe('出站披露与同意：不点头不能发；目的地一变同意作废', () => {
+  it('观察交接预填审核目标，单独列入披露，并把冻结正文与 digest 一起提交', async () => {
+    const handoff: ObserverHandoffArtifact = {
+      handoffId: 'handoff_1',
+      sessionId: 'CLAUDE_JOURNAL:one.jsonl',
+      projectDisplayPath: project.displayPath,
+      vendor: 'CLAUDE_JOURNAL',
+      source: 'DESKTOP_LOCAL_AGENT',
+      sourceEvidence: ['entrypoint=claude-desktop'],
+      completion: { state: 'READY_TO_HANDOFF', evidence: ['message.stop_reason=end_turn'] },
+      sourceUpdatedAt: '2026-09-14T00:00:00.000Z',
+      preparedAt: '2026-09-14T00:00:01.000Z',
+      payload: '来源：Claude Desktop\nassistant：已完成',
+      digest: 'sha256:handoff',
+      includedLines: 1,
+      omittedLines: 0,
+      suggestedGoal: '审核 Claude Desktop 的本地工作结果',
+    };
+    render(composer(vi.fn(), handoff));
+    expect((screen.getByPlaceholderText(/描述要修的问题/) as HTMLTextAreaElement).value).toBe(handoff.suggestedGoal);
+    expect(await screen.findByText(/用户确认交接的本机会话内容/)).toBeTruthy();
+    await consent();
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: '开始' })));
+    const create = callMock.mock.calls.find((c) => c[0] === 'task.create');
+    expect(create?.[1]).toMatchObject({
+      handoffPayload: handoff.payload,
+      handoffDigest: handoff.digest,
+      egressConsentDigest: 'sha256:disclosure-IMPLEMENTER-handoff',
+    });
+  });
+
   it('填了目标但没勾同意 → 开始按钮禁用；勾了才能发；载荷带 egressConsentDigest', async () => {
     render(composer());
     // 目标为空时：按钮旁的原因提示指向"写目标"，不是让用户自己猜

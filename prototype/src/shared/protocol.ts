@@ -52,7 +52,8 @@ import type {
  * 事件是 append-only 且禁止回填，所以**旧 Run 的日志里没有 ASSISTANT_MESSAGE**，
  * 它们的模型正文仍会以 NOTE 的形态显示成"平台"。这一层只对新 Run 生效。
  */
-export const PROTOCOL_VERSION = '0.6.0';
+/* 0.7.0：观察交接可选字段进入 task.create/egress.disclosure；披露升级为 v3。 */
+export const PROTOCOL_VERSION = '0.7.0';
 
 export type ImportOutcome =
   | {
@@ -196,6 +197,9 @@ export interface RequestMap {
        * 直接拒绝创建任务，不降级成内部模型去写（那等于换了作者）。
        */
       authorConnectorId?: string;
+      /** 观察面冻结的交接正文；两项必须同时出现，Core 会重算摘要。 */
+      handoffPayload?: string;
+      handoffDigest?: string;
       /**
        * 用户同意的 DataEgressDisclosure digest（PRD-DATA-001）。先用 `egress.disclosure`
        * 取披露、给用户看、用户确认后把 digest 带回；Core 重算比对，缺失/过期一律拒绝创建。
@@ -301,6 +305,7 @@ export interface RequestMap {
       reviewerModelProfileId?: string;
       reviewerConnectorId?: string;
       authorConnectorId?: string;
+      handoffDigest?: string;
     };
     res: { disclosure: DataEgressDisclosure };
   };

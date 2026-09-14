@@ -12,6 +12,7 @@ import type {
   SubPackageCandidate,
 } from '@shared/domain';
 import { TERMINAL_RUN_STATUSES } from '@shared/domain';
+import type { ObserverHandoffArtifact } from '@shared/observerProtocol';
 import { RequestError, call, setCoreEpoch, subscribe } from './bridge';
 import {
   Badge,
@@ -149,10 +150,12 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
   /**
-   * 观察面板（PRD-WKB-002 spike）：本机代理会话的只读镜像。授权在 Main（原生目录手势），
+   * 观察面板（PRD-WKB-002/003）：本机代理会话的只读镜像与人工交接。授权在 Main（原生目录手势），
    * 这里只有开关 —— 第三个全屏视图，与设置/证据同级互斥。
    */
   const [showObserver, setShowObserver] = useState(false);
+  /** 观察面的人为交接只在内存里等待；真正建 Run 后由 Core 绑定 digest 并收进任务证据。 */
+  const [handoffDraft, setHandoffDraft] = useState<ObserverHandoffArtifact | null>(null);
   /**
    * 打开设置页时要不要滚到某张卡。侧栏历史折叠里的"清理"入口跳的是数据保留卡
    * （交互评审 v0.2 N9：归档/删除走 retention，缺的是列表层的出口）；
@@ -700,7 +703,7 @@ export function App() {
         <div className="sidebar-head">
           <h1>RepoPilot</h1>
           {/* Core 状态的唯一主场是底部状态栏（v0.1 #9）—— 这里不再重复 */}
-          <div className="sub">prototype · disposable spike</div>
+          <div className="sub">prototype · product seed</div>
         </div>
 
         <div className="sidebar-tabs">
@@ -921,7 +924,16 @@ export function App() {
               style={{ border: 0, margin: 0, padding: 0, minInlineSize: 0 }}
             >
               {showObserver ? (
-                <ObserverView />
+                <ObserverView
+                  reviewProjectDisplayPath={importedProject ? selectedProject?.displayPath ?? null : null}
+                  onUseAsReviewTask={(artifact) => {
+                    if (!selectedProject || !importedProject || selectedProject.displayPath !== artifact.projectDisplayPath) return;
+                    setHandoffDraft(artifact);
+                    setShowObserver(false);
+                    setSelectedRunId(null);
+                    importProject(selectedProject, { subPath: importedProject?.snapshot.subPath });
+                  }}
+                />
               ) : showEvidence ? (
                 <EvidenceView onError={(message, detail) => setError({ message, detail })} />
               ) : showSettings ? (
@@ -1019,6 +1031,7 @@ export function App() {
               snapshot={importedProject.snapshot}
               profile={importedProject.profile}
               modelProfiles={modelProfiles}
+              handoffDraft={handoffDraft}
               activeRun={activeProjectRun}
               onCreated={(run) => {
                 /*
@@ -1041,6 +1054,7 @@ export function App() {
                 setRuns((prev) =>
                   prev.some((r) => r.runId === run.runId) ? prev : [run, ...prev],
                 );
+                setHandoffDraft(null);
                 setSelectedRunId(run.runId);
               }}
               onReimport={() => importProject(selectedProject)}

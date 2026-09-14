@@ -38,6 +38,7 @@ import type { PushEvent } from '@shared/protocol';
 import { RunAuthority } from './authority';
 import { PATHS } from './paths';
 import { chatCompletionResponse } from './model/chatSse.testkit';
+import { sha256 } from '@shared/ids';
 
 /**
  * 出站前的人机契约（Slice H：PRD-DATA-001 披露/同意 + PRD-DATA-003 最小 DLP）的权威层端到端。
@@ -183,6 +184,8 @@ class Harness {
     /** undefined = 正常取披露并同意；null = 故意不带；字符串 = 故意带一个指定的 digest */
     egressConsentDigest?: string | null;
     customCommands?: { label: string; argv: string[] }[];
+    handoffPayload?: string;
+    handoffDigest?: string;
   }): Promise<{ runId: string }> {
     const reg = await this.call<{ project: { projectId: string } }>('__project.register', { hostPath: input.hostPath });
     const imported = await this.call<{
@@ -197,6 +200,7 @@ class Harness {
       ...(input.authorConnectorId ? { authorConnectorId: input.authorConnectorId } : {}),
       ...(input.reviewerModelProfileId ? { reviewerModelProfileId: input.reviewerModelProfileId } : {}),
       ...(input.reviewerConnectorId ? { reviewerConnectorId: input.reviewerConnectorId } : {}),
+      ...(input.handoffDigest ? { handoffDigest: input.handoffDigest } : {}),
     });
     const consentDigest =
       input.egressConsentDigest === undefined ? disclosure.digest : input.egressConsentDigest;
@@ -215,6 +219,8 @@ class Harness {
       ...(input.authorConnectorId ? { authorConnectorId: input.authorConnectorId } : {}),
       ...(input.reviewerModelProfileId ? { reviewerModelProfileId: input.reviewerModelProfileId } : {}),
       ...(input.reviewerConnectorId ? { reviewerConnectorId: input.reviewerConnectorId } : {}),
+      ...(input.handoffPayload ? { handoffPayload: input.handoffPayload } : {}),
+      ...(input.handoffDigest ? { handoffDigest: input.handoffDigest } : {}),
     });
     return { runId: run.runId };
   }
@@ -321,6 +327,27 @@ describe('Slice H：出站前的人机契约', () => {
       }),
     ).rejects.toMatchObject({ payload: { message: expect.stringContaining('CONSENT_STALE') } });
     delete process.env.MOONSHOT_API_KEY;
+  });
+
+  it('观察交接进入独立披露类别；正文与 digest 不一致时在建 Run 前拒绝', async () => {
+    const hostPath = makeFixtureRepo();
+    const payload = '来源：Claude Desktop\n结束依据：message.stop_reason=end_turn\nassistant：已完成修复';
+    await expect(
+      harness.createRun({ hostPath, handoffPayload: payload, handoffDigest: sha256(`${payload} altered`) }),
+    ).rejects.toMatchObject({
+      payload: { code: 'CONFLICT', message: expect.stringContaining('HANDOFF_STALE') },
+    });
+    expect(fetch).not.toHaveBeenCalled();
+
+    harness.script(IMPL, [() => planCall()]);
+    const { runId } = await harness.createRun({ hostPath, handoffPayload: payload, handoffDigest: sha256(payload) });
+    await harness.waitForStatus(runId, ['AWAITING_PLAN_APPROVAL']);
+    const events = await harness.events(runId);
+    const created = events.find((event) => event.kind === 'RUN_CREATED');
+    expect(created?.payload.handoffDigest).toBe(sha256(payload));
+    expect(created?.payload.egressConsent).toMatchObject({
+      destinations: [expect.objectContaining({ dataClasses: expect.arrayContaining(['OBSERVED_SESSION_HANDOFF']) })],
+    });
   });
 
   it('同意后 RUN_CREATED 带 egressConsent（目的地/通道/中转/数据类别/政策 UNKNOWN），并有一条可读的 NOTE', async () => {

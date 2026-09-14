@@ -1159,6 +1159,8 @@ export class RunAuthority {
     reviewerConnectorId?: string;
     /** 可选：用本机外部 CLI 当作者（Codex 写 / Claude 审，或反过来）。与审核方必须异构 */
     authorConnectorId?: string;
+    handoffPayload?: string;
+    handoffDigest?: string;
     /**
      * 用户同意的 DataEgressDisclosure digest（PRD-DATA-001）。Core 用同一输入重算披露并比对：
      * 缺失 → CONSENT_REQUIRED；对不上（路由/审核方/作者/快照任一不同）→ CONSENT_STALE。
@@ -1195,6 +1197,25 @@ export class RunAuthority {
       );
     }
 
+    const hasHandoffPayload = typeof input.handoffPayload === 'string';
+    const hasHandoffDigest = typeof input.handoffDigest === 'string';
+    if (hasHandoffPayload !== hasHandoffDigest) {
+      throw platformError('BAD_REQUEST', 'HANDOFF_INCOMPLETE：交接正文与摘要必须同时提交');
+    }
+    if (hasHandoffPayload && sha256(input.handoffPayload!) !== input.handoffDigest) {
+      throw platformError(
+        'CONFLICT',
+        'HANDOFF_STALE：交接正文与冻结摘要不一致，已拒绝创建任务',
+        '请回到观察面板重新生成交接包；平台不会采用被修改或过期的交接内容。',
+      );
+    }
+    const effectiveGoal = hasHandoffPayload
+      ? `${input.goal}\n\n[本机会话交接 ${input.handoffDigest}]\n${input.handoffPayload}`
+      : input.goal;
+    if (effectiveGoal.length > 20_000) {
+      throw platformError('BAD_REQUEST', '任务描述与交接内容合计超过 20000 字符，请缩短任务描述');
+    }
+
     /*
      * 这里**不再有 profile 门禁**。任何导入进来的项目都可以创建任务。
      *
@@ -1208,6 +1229,7 @@ export class RunAuthority {
      */
     const taskTextHits = scanSegments([
       { text: input.goal, where: '任务描述' },
+      ...(hasHandoffPayload ? [{ text: input.handoffPayload!, where: '本机会话交接' }] : []),
       ...input.acceptance.map((a, i) => ({ text: a, where: `验收条件 ${i + 1}` })),
       ...(input.customCommands ?? []).map((c, i) => ({ text: `${c.label} ${c.argv.join(' ')}`, where: `自定义命令 ${i + 1}` })),
     ]);
@@ -1313,6 +1335,7 @@ export class RunAuthority {
             : { kind: 'EXTERNAL_CLI', connector: reviewer.connector },
       reviewerParity: reviewer?.parity ?? null,
       author: author ? { connector: author.connector } : null,
+      handoffDigest: input.handoffDigest ?? null,
     });
     if (!input.egressConsentDigest) {
       throw platformError(
@@ -1340,7 +1363,8 @@ export class RunAuthority {
       projectId: input.projectId,
       snapshotId: input.snapshotId,
       profileId: effectiveProfile.profileId,
-      goal: input.goal,
+      goal: effectiveGoal,
+      ...(input.handoffDigest ? { handoffDigest: input.handoffDigest } : {}),
       taskClass: input.taskClass,
       // 不再默认收窄到 src/**：用户信任的是整个项目
       allowedPaths: input.allowedPaths.length ? input.allowedPaths : ['**'],
@@ -1440,6 +1464,7 @@ export class RunAuthority {
       profileSupportStatus: effectiveProfile.supportStatus,
       verificationCommands: input.verificationCommandIds,
       userDefinedCommands: (input.customCommands ?? []).length,
+      handoffDigest: input.handoffDigest ?? null,
       // 逐条批准过的 R2 命令数：它改变了"这个 Run 允许跑什么"，必须在 RUN_CREATED 里
       approvedCommands: usedApprovals.size,
       // 用户同意了什么：披露 digest + 目的地清单（标签/通道/是否中转/数据类别）。不含 actor 身份
@@ -1785,9 +1810,25 @@ export class RunAuthority {
         isTerminal(record.view.status) &&
         record.view.status !== 'AWAITING_PATCH_REVIEW'
       ) {
-        this.emit(record, 'CLEANUP_SUMMARY', '已释放模型流、子进程与审批等待', {
-          workspaceRetained: record.view.status === 'SUCCEEDED',
-        });
+        /*
+         * 终态只证明本轮 loop 与审批等待已经结束。本路径不持有脱离进程组的派生进程句柄，
+         * 因此取消只能报告已发 SIGTERM，其他终态只能报告 UNKNOWN，不能推断进程已经退出。
+         */
+        const aborted = record.abort.signal.aborted;
+        this.emit(
+          record,
+          'CLEANUP_SUMMARY',
+          `审批等待已释放；模型流随本次 loop 结束释放；` +
+            (aborted
+              ? '子进程：取消时已向命令进程组发送 SIGTERM，但未确认终止'
+              : '子进程：状态未知（命令可能派生过脱离进程组的子进程，本路径不追踪）'),
+          {
+            workspaceRetained: record.view.status === 'SUCCEEDED',
+            reason: 'RUN_TERMINAL',
+            modelStream: 'RELEASED',
+            childProcesses: aborted ? 'SIGTERM_SENT_UNCONFIRMED' : 'UNKNOWN',
+          },
+        );
       }
     }
   }
@@ -1935,6 +1976,7 @@ export class RunAuthority {
     reviewerModelProfileId?: string;
     reviewerConnectorId?: string;
     authorConnectorId?: string;
+    handoffDigest?: string;
   }): DataEgressDisclosure {
     const snapshot = this.snapshots.get(input.snapshotId);
     if (!snapshot) throw platformError('NOT_FOUND', `快照不存在：${input.snapshotId}`);
@@ -1994,6 +2036,7 @@ export class RunAuthority {
       reviewer,
       reviewerParity,
       author,
+      handoffDigest: input.handoffDigest ?? null,
     });
   }
 

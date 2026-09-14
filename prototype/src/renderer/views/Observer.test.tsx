@@ -29,6 +29,8 @@ const SESSION = {
   label: 'abc',
   updatedAt: new Date().toISOString(),
   sizeBytes: 2048,
+  source: 'DESKTOP_LOCAL_AGENT' as const,
+  sourceEvidence: ['entrypoint=claude-desktop'],
 };
 const COUNTS = {
   claudeMatched: 1,
@@ -44,6 +46,8 @@ function projection(over: Partial<ObserverProjection> = {}): ObserverProjection 
   return {
     sessionId: SESSION.sessionId,
     vendor: 'CLAUDE_JOURNAL',
+    source: 'DESKTOP_LOCAL_AGENT',
+    sourceEvidence: ['entrypoint=claude-desktop'],
     status: 'OK',
     breaking: [],
     driftNotes: [],
@@ -51,6 +55,7 @@ function projection(over: Partial<ObserverProjection> = {}): ObserverProjection 
     counts: { records: 3, shownLines: 1, omittedLines: 0, unparseableLines: 0, blankLines: 1, headBytesSkipped: 0 },
     fileUpdatedAt: new Date().toISOString(),
     active: true,
+    completion: { state: 'READY_TO_HANDOFF', evidence: ['message.stop_reason=end_turn'] },
     ...over,
   };
 }
@@ -246,5 +251,41 @@ describe('观察面板', () => {
     });
     render(<ObserverView />);
     expect(await screen.findByText(/磁盘读取失败/)).toBeTruthy();
+  });
+
+  it('Desktop 会话按来源分组；机器结束后先冻结交接包，再由用户送入有界审核', async () => {
+    const onUse = vi.fn();
+    const artifact = {
+      handoffId: 'handoff_1',
+      sessionId: SESSION.sessionId,
+      projectDisplayPath: '~/demo',
+      vendor: 'CLAUDE_JOURNAL' as const,
+      source: 'DESKTOP_LOCAL_AGENT' as const,
+      sourceEvidence: ['entrypoint=claude-desktop'],
+      completion: { state: 'READY_TO_HANDOFF' as const, evidence: ['message.stop_reason=end_turn'] },
+      sourceUpdatedAt: '2026-09-14T00:00:00.000Z',
+      preparedAt: '2026-09-14T00:00:01.000Z',
+      payload: '来源：Claude Desktop',
+      digest: 'sha256:1234567890abcdef',
+      includedLines: 1,
+      omittedLines: 2,
+      suggestedGoal: '审核 Claude 的工作结果',
+    };
+    observerCallMock.mockImplementation(async (method: string) => {
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
+      if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
+      if (method === 'observer.prepareHandoff') return { artifact };
+      if (method === 'observer.unwatch') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<ObserverView reviewProjectDisplayPath="~/demo" onUseAsReviewTask={onUse} />);
+    await screen.findByText('~/demo');
+    expect(screen.getByRole('region', { name: 'Desktop 会话' })).toBeTruthy();
+    push({ kind: 'observer.projection', projection: projection({ fileUpdatedAt: artifact.sourceUpdatedAt }) });
+    fireEvent.click(await screen.findByText('准备交给另一边审核'));
+    expect(await screen.findByText(/交接包已冻结/)).toBeTruthy();
+    expect(screen.getByText(/省略 2 行/)).toBeTruthy();
+    fireEvent.click(screen.getByText('进入 RepoPilot 有界审核'));
+    expect(onUse).toHaveBeenCalledWith(artifact);
   });
 });

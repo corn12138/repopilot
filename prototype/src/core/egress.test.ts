@@ -65,6 +65,7 @@ const base = {
   reviewer: null,
   reviewerParity: null,
   author: null,
+  handoffDigest: null,
 };
 
 describe('buildDisclosure', () => {
@@ -98,6 +99,18 @@ describe('buildDisclosure', () => {
     expect(buildDisclosure({ ...base, reviewer: { kind: 'EXTERNAL_CLI', connector: connector('CLAUDE_CLI') } }).digest).not.toBe(d0);
     expect(buildDisclosure({ ...base, author: { connector: connector('CODEX_CLI') } }).digest).not.toBe(d0);
     expect(buildDisclosure({ ...base, snapshotId: 'snap_2' }).digest).not.toBe(d0);
+    expect(buildDisclosure({ ...base, handoffDigest: 'sha256:handoff' }).digest).not.toBe(d0);
+  });
+
+  it('观察会话交接单独披露给每个实际目的地，并绑定交接摘要', () => {
+    const d = buildDisclosure({
+      ...base,
+      reviewer: { kind: 'MODEL_API', profile: profile('moonshot'), resolution: resolution('moonshot') },
+      handoffDigest: 'sha256:handoff',
+    });
+    expect(d.disclosureVersion).toBe(3);
+    expect(d.handoffDigest).toBe('sha256:handoff');
+    expect(d.destinations.every((x) => x.dataClasses.includes('OBSERVED_SESSION_HANDOFF'))).toBe(true);
   });
 
   it('目的地：实现方 MODEL_API 带精确 origin 与路由 digest；中转 profile 标 isRelay；政策三项都是 UNKNOWN', () => {

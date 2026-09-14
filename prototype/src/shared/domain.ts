@@ -245,6 +245,8 @@ export interface TaskSpec {
   readonly snapshotId: string;
   readonly profileId: string;
   readonly goal: string;
+  /** 来自观察面的人为交接；只在 Core 重算 payload 摘要一致后写入。 */
+  readonly handoffDigest?: Digest;
   readonly taskClass: TaskClass;
   readonly allowedPaths: readonly string[];
   readonly protectedPaths: readonly string[];
@@ -1181,6 +1183,8 @@ export type EgressDataClass =
   | 'PATCH_DIFF'
   /** 审核方的发现（整改时回给实现方） */
   | 'REVIEW_FINDINGS'
+  /** 用户从只读观察面明确交接给任务的会话片段 */
+  | 'OBSERVED_SESSION_HANDOFF'
   /** 外部 CLI 当作者时，它在一次性副本里可读取**整个仓库**并自行决定送什么给其供应商 */
   | 'REPOSITORY_FULL_COPY_VIA_CLI';
 
@@ -1214,8 +1218,8 @@ export interface EgressPolicyKnowledge {
  * 同一个 digest，Core 重算比对 —— 用户同意的是**这一份**，不是"同意出站"这个动作。
  */
 export interface DataEgressDisclosure {
-  /** v2：新增 crossReviewParity —— 披露形状变了，版本如实跟着变 */
-  readonly disclosureVersion: 2;
+  /** v3：新增 handoffDigest，并把观察会话交接列为独立数据类别。 */
+  readonly disclosureVersion: 3;
   readonly snapshotId: string;
   readonly snapshotFileCount: number;
   readonly destinations: readonly EgressDestination[];
@@ -1225,6 +1229,7 @@ export interface DataEgressDisclosure {
    * 用户点头之前就该看见，而不是任务创建之后才在事件流里出现。
    */
   readonly crossReviewParity: VendorParity | null;
+  readonly handoffDigest: Digest | null;
   readonly policy: EgressPolicyKnowledge;
   readonly digest: Digest;
 }

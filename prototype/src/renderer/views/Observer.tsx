@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   OBSERVER_MAX_MIRRORS,
+  type ObserverHandoffArtifact,
   type ObserverProjection,
   type ObserverSessionEntry,
   type ObserverSweepCounts,
 } from '@shared/observerProtocol';
 import { observerCall, observerSubscribe } from '../observerBridge';
-import { Banner, Card, relativeTime } from '../components/common';
+import { Badge, Banner, Card, relativeTime } from '../components/common';
 
 /**
- * 观察面板（PRD-WKB-002 的可丢弃 spike 子集）：本机 Claude Code / Codex 会话的只读镜像。
+ * 观察与交接面板（PRD-WKB-002/003）：本机 Claude / Codex 会话的只读镜像。
  *
  * 视图层只做三件事：发起授权手势（真正的目录选择在 Main 的原生对话框里）、
  * 列会话、渲染 Main 推来的 volatile 投影。四条信任边界（DEC-020）里它负责说人话：
@@ -20,10 +21,17 @@ import { Banner, Card, relativeTime } from '../components/common';
  * 不动三栏任何宽度 —— N12「布局恒定」不受影响（交互评审 v0.2 §5.2 补注）。
  * 槽位序由 Main 的 observer.state 推送决定（先选在左），Renderer 不自己维护第二份真值。
  *
- * 这里的一切都不进 Run/Approval/Verification：徽标只是导航，正文只是镜像，
- * 改动要进主线仍走正常任务流程（PRD-WKB-003 采纳桥是另一条未开工的路）。
+ * 镜像本身不进 Run/Approval/Verification；人冻结交接包后仍要经正常任务、出站披露、
+ * 验证与补丁接受链，观察通道不会获得 Core 权威。
  */
-export function ObserverView() {
+export function ObserverView({
+  reviewProjectDisplayPath = null,
+  onUseAsReviewTask,
+}: {
+  /** 当前已导入项目；只有它与观察授权一致时，交接才能进入正常任务链。 */
+  reviewProjectDisplayPath?: string | null;
+  onUseAsReviewTask?: (artifact: ObserverHandoffArtifact) => void;
+}) {
   const [granted, setGranted] = useState<string | null>(null);
   const [sessions, setSessions] = useState<readonly ObserverSessionEntry[]>([]);
   const [counts, setCounts] = useState<ObserverSweepCounts | null>(null);
@@ -31,6 +39,9 @@ export function ObserverView() {
   const [projections, setProjections] = useState<Readonly<Record<string, ObserverProjection>>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [handoffBusy, setHandoffBusy] = useState<string | null>(null);
+  const [prepared, setPrepared] = useState<ObserverHandoffArtifact | null>(null);
+  const [copied, setCopied] = useState(false);
   const activeRef = useRef(true);
 
   const report = useCallback((err: unknown) => {
@@ -55,6 +66,9 @@ export function ObserverView() {
       if (!activeRef.current) return;
       if (event.kind === 'observer.projection') {
         const id = event.projection.sessionId;
+        setPrepared((current) =>
+          current?.sessionId === id && current.sourceUpdatedAt !== event.projection.fileUpdatedAt ? null : current,
+        );
         setProjections((prev) => ({ ...prev, [id]: event.projection }));
         // Main 推来投影 = 它在镜像中；状态推送通常先到，这里只是补位，不改槽位序
         setWatching((prev) => (prev.includes(id) ? prev : [...prev, id]));
@@ -70,6 +84,7 @@ export function ObserverView() {
         // 撤销即清除：Main 清缓存，这里清列表 —— 两边都不留残影
         setSessions([]);
         setCounts(null);
+        setPrepared(null);
       } else {
         /*
          * 授权可能不是本视图发起的（selftest 直接在服务层授权；将来任何 Main 侧的授权入口
@@ -138,10 +153,53 @@ export function ObserverView() {
     }
   };
 
+  const prepareHandoff = async (sessionId: string) => {
+    setHandoffBusy(sessionId);
+    setCopied(false);
+    setError(null);
+    try {
+      const { artifact } = await observerCall('observer.prepareHandoff', { sessionId });
+      if (activeRef.current) setPrepared(artifact);
+    } catch (err) {
+      report(err);
+    } finally {
+      if (activeRef.current) setHandoffBusy(null);
+    }
+  };
+
+  const copyPrepared = async () => {
+    if (!prepared) return;
+    try {
+      await navigator.clipboard.writeText(`[RepoPilot 交接包 ${prepared.digest}]\n${prepared.payload}`);
+      setCopied(true);
+    } catch (err) {
+      report(err);
+    }
+  };
+
   const vendorLabel = (v: ObserverSessionEntry['vendor']) =>
     v === 'CLAUDE_JOURNAL' ? 'Claude' : 'Codex';
   const labelOf = (sessionId: string) =>
     sessions.find((s) => s.sessionId === sessionId)?.label ?? sessionId.replace(/^[A-Z_]+:/, '');
+  const sourceLabel = (source: ObserverSessionEntry['source']) =>
+    source === 'DESKTOP_LOCAL_AGENT'
+      ? 'Desktop'
+      : source === 'USER_CLI'
+        ? 'CLI'
+        : source === 'SPAWNED_BY_US'
+          ? '平台启动'
+          : '来源未知';
+  const groupedSessions = [
+    'DESKTOP_LOCAL_AGENT',
+    'USER_CLI',
+    'SPAWNED_BY_US',
+    'UNKNOWN',
+  ] as const;
+  const canUsePreparedAsTask =
+    prepared !== null &&
+    onUseAsReviewTask !== undefined &&
+    granted !== null &&
+    reviewProjectDisplayPath === granted;
 
   return (
     <>
@@ -204,27 +262,38 @@ export function ObserverView() {
                * （2026-09-05 selftest 截图 04 抓到的）。列表是入口，镜像才是主体。
                */
               <div
-                style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 280, overflow: 'auto' }}
+                style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 320, overflow: 'auto' }}
                 aria-label="可观察的会话列表"
               >
-                {sessions.map((s) => {
-                  const mirrored = watching.includes(s.sessionId);
+                {groupedSessions.map((source) => {
+                  const group = sessions.filter((session) => session.source === source);
+                  if (group.length === 0) return null;
                   return (
-                    <button
-                      key={s.sessionId}
-                      className={`list-item ${mirrored ? 'active' : ''}`}
-                      onClick={() => void watch(s.sessionId)}
-                      title={s.sessionId}
-                      aria-pressed={mirrored}
-                    >
-                      <div className="name">
-                        {vendorLabel(s.vendor)} · {s.label}
-                        {mirrored ? '　镜像中' : ''}
+                    <section key={source} aria-label={`${sourceLabel(source)} 会话`}>
+                      <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 3 }}>
+                        {sourceLabel(source)} · {group.length}
                       </div>
-                      <div className="meta">
-                        {relativeTime(s.updatedAt)} · {(s.sizeBytes / 1024).toFixed(0)}KB
-                      </div>
-                    </button>
+                      {group.map((s) => {
+                        const mirrored = watching.includes(s.sessionId);
+                        return (
+                          <button
+                            key={s.sessionId}
+                            className={`list-item ${mirrored ? 'active' : ''}`}
+                            onClick={() => void watch(s.sessionId)}
+                            title={`${s.sessionId}\n${s.sourceEvidence.join('；')}`}
+                            aria-pressed={mirrored}
+                          >
+                            <div className="name">
+                              {vendorLabel(s.vendor)} · {s.label}
+                              {mirrored ? '　镜像中' : ''}
+                            </div>
+                            <div className="meta">
+                              {sourceLabel(s.source)} · {relativeTime(s.updatedAt)} · {(s.sizeBytes / 1024).toFixed(0)}KB
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </section>
                   );
                 })}
               </div>
@@ -294,6 +363,59 @@ export function ObserverView() {
                     {projection.counts.headBytesSkipped > 0
                       ? ` · 文件过大，跳过头部 ${projection.counts.headBytesSkipped} 字节`
                       : ''}
+                  </div>
+                )}
+                {projection && projection.status === 'OK' && (
+                  <div style={{ marginTop: 10 }}>
+                    <div className="row wrap">
+                      <Badge tone={projection.source === 'UNKNOWN' ? 'warn' : 'info'}>
+                        {sourceLabel(projection.source)}
+                      </Badge>
+                      <Badge tone={projection.completion.state === 'READY_TO_HANDOFF' ? 'ok' : 'warn'}>
+                        {projection.completion.state === 'READY_TO_HANDOFF'
+                          ? '机器记录显示本轮结束'
+                          : projection.completion.state === 'RUNNING'
+                            ? '仍在运行或等待结果'
+                            : '结束状态未知'}
+                      </Badge>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>
+                      来源依据：{projection.sourceEvidence.join('；')} · 结束依据：
+                      {projection.completion.evidence.join('；')}
+                    </div>
+                    <button
+                      style={{ marginTop: 8 }}
+                      disabled={projection.completion.state !== 'READY_TO_HANDOFF' || handoffBusy !== null}
+                      onClick={() => void prepareHandoff(sessionId)}
+                    >
+                      {handoffBusy === sessionId ? '正在生成交接包…' : '准备交给另一边审核'}
+                    </button>
+                  </div>
+                )}
+                {prepared?.sessionId === sessionId && (
+                  <div style={{ marginTop: 10 }}>
+                    <Banner tone="info">
+                      <strong>交接包已冻结，尚未发送。</strong>
+                      <div style={{ fontSize: 12, marginTop: 5 }}>
+                        摘要 <code>{prepared.digest.slice(0, 24)}…</code> · 纳入 {prepared.includedLines} 行
+                        {prepared.omittedLines > 0 ? `，省略 ${prepared.omittedLines} 行` : ''}。
+                      </div>
+                    </Banner>
+                    <div className="row wrap" style={{ marginTop: 8 }}>
+                      <button onClick={() => void copyPrepared()}>{copied ? '已复制' : '复制给另一个 Desktop'}</button>
+                      <button
+                        className="primary"
+                        disabled={!canUsePreparedAsTask}
+                        onClick={() => prepared && onUseAsReviewTask?.(prepared)}
+                      >
+                        进入 RepoPilot 有界审核
+                      </button>
+                    </div>
+                    {!canUsePreparedAsTask && (
+                      <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 5 }}>
+                        要进入有界审核，请先在左侧选择并导入与观察授权相同的项目。
+                      </div>
+                    )}
                   </div>
                 )}
               </Card>

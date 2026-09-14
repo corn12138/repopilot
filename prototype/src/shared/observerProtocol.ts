@@ -1,10 +1,10 @@
 /**
- * 观察面板的旁路通道契约（PRD-WKB-002 的可丢弃 spike 子集，不是合同实现）。
+ * 观察面板的旁路通道契约（PRD-WKB-002/003 的产品种子实现）。
  *
  * 为什么不进 `protocol.ts`：TD-DEC-022 (a) —— 工位/观察是**用户能力面**，
  * 不进 authority 链。这条通道 Renderer ⇄ Main 直连，从不经过 Core：
  * 没有 Core 代次（Core 重启不影响观察）、没有 Run/Approval 语义、
- * 产出全部是 volatile 投影（先例：`run.stream` 易失不持久）。
+ * 日志投影全部 volatile；只有人明确交接且 Core 复核 digest 后，交接内容才进入任务链。
  *
  * 信任边界（DEC-020，四条缺一不可）：
  *   - **显式授权**：启用观察 = 一次原生目录选择手势（与 `project.pick` 同构）。
@@ -18,7 +18,7 @@
  * 校验 schema 放在 main/observer/observerSchema.ts，不进 Preload 包。
  */
 
-export const OBSERVER_PROTOCOL_VERSION = 1;
+export const OBSERVER_PROTOCOL_VERSION = 2;
 
 /** 独立通道名 —— 刻意不与 `repopilot:request/event`（Core 契约）共用 */
 export const OBSERVER_CHANNEL = {
@@ -33,6 +33,21 @@ export const OBSERVER_CHANNEL = {
  */
 export type JournalVendor = 'CLAUDE_JOURNAL' | 'CODEX_ROLLOUT';
 
+/** 会话从哪里启动。没有明确元数据或元数据互相冲突时必须落 UNKNOWN。 */
+export type ObserverSessionSource =
+  | 'USER_CLI'
+  | 'DESKTOP_LOCAL_AGENT'
+  | 'SPAWNED_BY_US'
+  | 'UNKNOWN';
+
+export type ObserverCompletionState = 'RUNNING' | 'READY_TO_HANDOFF' | 'UNKNOWN';
+
+export interface ObserverCompletion {
+  readonly state: ObserverCompletionState;
+  /** 只记录机器字段，不采用模型正文里的“已完成”陈述。 */
+  readonly evidence: readonly string[];
+}
+
 /** 会话条目。sessionId 是不透明句柄（vendor:basename），不携带宿主路径 */
 export interface ObserverSessionEntry {
   readonly sessionId: string;
@@ -41,6 +56,9 @@ export interface ObserverSessionEntry {
   readonly label: string;
   readonly updatedAt: string;
   readonly sizeBytes: number;
+  readonly source: ObserverSessionSource;
+  /** 用于解释来源判定的有限元数据，不含会话正文或宿主路径。 */
+  readonly sourceEvidence: readonly string[];
 }
 
 /** 会话发现的扫描账目 —— 省略要报数：扫了多少、按什么被跳过 */
@@ -71,6 +89,8 @@ export interface ObserverProjectionLine {
 export interface ObserverProjection {
   readonly sessionId: string;
   readonly vendor: JournalVendor;
+  readonly source: ObserverSessionSource;
+  readonly sourceEvidence: readonly string[];
   /**
    * FORMAT_UNKNOWN = 记录违反了**面板消费键契约**（type/message/content/payload 的形状），
    * 即面板真的读不了：此时 lines 为空 —— 错读比不读更糟，只报计数与违规明细。
@@ -95,6 +115,28 @@ export interface ObserverProjection {
   readonly fileUpdatedAt: string;
   /** 启发式（mtime 距今 < 20s）。只用于导航徽标，不驱动任何判定 */
   readonly active: boolean;
+  readonly completion: ObserverCompletion;
+}
+
+/**
+ * 人工交接前的只读快照。payload 与 digest 一起进入 task.create；Core 会重算并拒绝不一致。
+ * 这份对象只活在 Main/Renderer 内存里，未点击交接时不会进入 Run 或模型上下文。
+ */
+export interface ObserverHandoffArtifact {
+  readonly handoffId: string;
+  readonly sessionId: string;
+  readonly projectDisplayPath: string;
+  readonly vendor: JournalVendor;
+  readonly source: ObserverSessionSource;
+  readonly sourceEvidence: readonly string[];
+  readonly completion: ObserverCompletion;
+  readonly sourceUpdatedAt: string;
+  readonly preparedAt: string;
+  readonly payload: string;
+  readonly digest: string;
+  readonly includedLines: number;
+  readonly omittedLines: number;
+  readonly suggestedGoal: string;
 }
 
 /**
@@ -130,6 +172,11 @@ export interface ObserverRequestMap {
   'observer.watch': { payload: { sessionId: string }; response: { ok: true } };
   /** 不带 sessionId = 全部停止（关面板时用）；带 = 只关那一个镜像 */
   'observer.unwatch': { payload: { sessionId?: string }; response: { ok: true } };
+  /** 只接受已发现会话；重新读取文件并用机器结束字段判定，不能拿陈旧投影交接。 */
+  'observer.prepareHandoff': {
+    payload: { sessionId: string };
+    response: { artifact: ObserverHandoffArtifact };
+  };
 }
 
 export type ObserverMethod = keyof ObserverRequestMap;

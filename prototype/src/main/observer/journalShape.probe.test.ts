@@ -152,10 +152,19 @@ describe.skipIf(MODE === '')('本机日志字段快照对照（REPOPILOT_PROBE_J
     );
     expect(sessions.length, `该项目在本机没有任何代理会话日志：${project}`).toBeGreaterThan(0);
 
+    const bySource = { USER_CLI: 0, DESKTOP_LOCAL_AGENT: 0, SPAWNED_BY_US: 0, UNKNOWN: 0 };
+    for (const session of sessions) bySource[session.source] += 1;
+    console.log(
+      `[dry-run] 来源：Desktop ${bySource.DESKTOP_LOCAL_AGENT}，CLI ${bySource.USER_CLI}，` +
+        `平台启动 ${bySource.SPAWNED_BY_US}，UNKNOWN ${bySource.UNKNOWN}`,
+    );
+
     const byStatus: Record<ObserverProjection['status'], number> = { OK: 0, FORMAT_UNKNOWN: 0 };
+    const byCompletion = { RUNNING: 0, READY_TO_HANDOFF: 0, UNKNOWN: 0 };
     const driftFreq = new Map<string, number>();
     const unknown: string[] = [];
     const watchMs: number[] = [];
+    let handoffDryRun = 0;
     let totalRecords = 0;
     for (const s of sessions.slice(0, MAX_DRY_RUN_SESSIONS)) {
       const before = events.length;
@@ -168,6 +177,17 @@ describe.skipIf(MODE === '')('本机日志字段快照对照（REPOPILOT_PROBE_J
         continue;
       }
       byStatus[ev.projection.status] += 1;
+      byCompletion[ev.projection.completion.state] += 1;
+      if (
+        handoffDryRun === 0 &&
+        ev.projection.source === 'DESKTOP_LOCAL_AGENT' &&
+        ev.projection.completion.state === 'READY_TO_HANDOFF'
+      ) {
+        const artifact = service.prepareHandoff(s.sessionId);
+        expect(artifact.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+        expect(artifact.payload.length).toBeGreaterThan(0);
+        handoffDryRun += 1;
+      }
       totalRecords += ev.projection.counts.records;
       for (const d of ev.projection.driftNotes) driftFreq.set(d, (driftFreq.get(d) ?? 0) + 1);
       if (ev.projection.status === 'FORMAT_UNKNOWN') {
@@ -180,6 +200,8 @@ describe.skipIf(MODE === '')('本机日志字段快照对照（REPOPILOT_PROBE_J
     const p = (q: number) => Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] ?? 0);
     console.log(
       `[dry-run] 监视 ${watchMs.length} 个会话，共 ${totalRecords} 条记录：OK ${byStatus.OK}，FORMAT_UNKNOWN ${byStatus.FORMAT_UNKNOWN}；` +
+        `结束状态 READY ${byCompletion.READY_TO_HANDOFF} / RUNNING ${byCompletion.RUNNING} / UNKNOWN ${byCompletion.UNKNOWN}；` +
+        `Desktop 交接冻结干跑 ${handoffDryRun}；` +
         `单次 watch（含整文件读取+投影）耗时 p50 ${p(0.5)}ms · p90 ${p(0.9)}ms · max ${Math.round(sorted[sorted.length - 1] ?? 0)}ms`,
     );
     if (driftFreq.size > 0) {
@@ -190,5 +212,6 @@ describe.skipIf(MODE === '')('本机日志字段快照对照（REPOPILOT_PROBE_J
 
     // 面板对真实数据的可用率是这条验证的核心断言：消费契约不该在自家日志上误报
     expect(unknown, '真实会话被判成格式未知 —— 要么日志真的变了，要么消费契约写窄了').toEqual([]);
+    expect(handoffDryRun, '没有找到可冻结的 Desktop 完成会话').toBe(1);
   });
 });

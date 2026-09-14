@@ -1,11 +1,15 @@
 import { closeSync, lstatSync, openSync, readSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { basename, isAbsolute, join, normalize, relative } from 'node:path';
 import type {
   JournalVendor,
+  ObserverCompletion,
+  ObserverHandoffArtifact,
   ObserverProjection,
   ObserverProjectionLine,
   ObserverPushEvent,
   ObserverSessionEntry,
+  ObserverSessionSource,
   ObserverStateSnapshot,
   ObserverSweepCounts,
 } from '@shared/observerProtocol';
@@ -21,14 +25,14 @@ import claudeBaselineRaw from './claude-journal.shape.json';
 import codexBaselineRaw from './codex-rollout.shape.json';
 
 /**
- * 观察面板的 Main 侧服务（PRD-WKB-002 的可丢弃 spike 子集，不是合同实现）。
+ * 观察面板与人工交接的 Main 侧服务（PRD-WKB-002/003 的产品种子实现）。
  *
  * 定位按 TD-DEC-022：读点在体验侧（Main），产出全部 volatile、不落任何持久化、
  * 从不经过 Core。信任边界四条（DEC-020）在实现层的着落：
  *   - 显式授权：`enable(projectPath)` 的 projectPath 只能来自 Main 自己的原生
  *     目录选择对话框（observerIpc.ts），Renderer 递不进来 —— 它连方法参数里都没有。
  *   - 只读：本文件只有 lstat/open/read，没有任何写路径。
- *   - 零出站：投影只经 emit 回调（→ Renderer 渲染）；不进模型上下文、遥测、证据。
+ *   - 零出站：投影只经 emit 回调渲染；只有人点击交接并再次确认出站披露后才进入任务。
  *   - 可撤销：`disable()` 同步清掉授权、监视、缓存，并推送空状态。
  *
  * 降级语义：任一记录违反**面板消费键契约**（见 consumedContractViolations）→ 整个会话
@@ -56,12 +60,18 @@ const MAX_READ_BYTES = 4_000_000;
 const MAX_PROJECTION_LINES = 200;
 const MAX_LINE_TEXT = 600;
 const MAX_BREAKING_REPORTED = 8;
+const MAX_PROVENANCE_RECORDS = 80;
+const MAX_PROVENANCE_BYTES = 512_000;
+const MAX_HANDOFF_LINES = 16;
 /** mtime 距今小于该值 → 徽标显示「活跃」。启发式，仅导航（PRD-WKB-004） */
 const ACTIVE_WINDOW_MS = 20_000;
 
+const handoffDigestOf = (payload: string): string =>
+  `sha256:${createHash('sha256').update(payload).digest('hex')}`;
+
 export class ObserverError extends Error {
   constructor(
-    readonly code: 'NOT_GRANTED' | 'UNKNOWN_SESSION' | 'BAD_REQUEST',
+    readonly code: 'NOT_GRANTED' | 'UNKNOWN_SESSION' | 'BAD_REQUEST' | 'POLICY_DENIED',
     message: string,
   ) {
     super(message);
@@ -85,6 +95,114 @@ interface WatchState {
 
 function isPlainRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function readHeadRecords(path: string): Record<string, unknown>[] {
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      const stat = lstatSync(path);
+      const size = Math.min(stat.size, MAX_PROVENANCE_BYTES);
+      const buf = Buffer.alloc(size);
+      const read = readSync(fd, buf, 0, size, 0);
+      const raw = buf.subarray(0, read).toString('utf8');
+      const complete = stat.size <= size ? raw : raw.slice(0, Math.max(0, raw.lastIndexOf('\n')));
+      const out: Record<string, unknown>[] = [];
+      for (const line of complete.split('\n')) {
+        if (out.length >= MAX_PROVENANCE_RECORDS) break;
+        try {
+          const parsed: unknown = JSON.parse(line);
+          if (isPlainRecord(parsed)) out.push(parsed);
+        } catch {
+          // 来源识别只采用完整 JSON；截断或坏行不会被猜成某个来源。
+        }
+      }
+      return out;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+}
+
+/** 归属值域来自两家日志的显式启动字段；多种来源同时出现时 fail closed。 */
+export function sessionSourceFromRecords(
+  vendor: JournalVendor,
+  records: readonly Record<string, unknown>[],
+): { source: ObserverSessionSource; evidence: readonly string[] } {
+  const claims = new Set<Exclude<ObserverSessionSource, 'UNKNOWN'>>();
+  const evidence = new Set<string>();
+  const add = (field: string, raw: unknown): void => {
+    if (typeof raw !== 'string') return;
+    const value = raw.trim().slice(0, 80);
+    if (!value) return;
+    const lower = value.toLowerCase();
+    if (field !== 'userType' && evidence.size < 6) evidence.add(`${field}=${value}`);
+    if (lower.includes('repopilot')) claims.add('SPAWNED_BY_US');
+    else if (lower.includes('desktop') || lower === 'vscode') claims.add('DESKTOP_LOCAL_AGENT');
+    else if (lower === 'cli' || lower.includes('tui')) claims.add('USER_CLI');
+  };
+  for (const rec of records) {
+    if (vendor === 'CLAUDE_JOURNAL') {
+      add('entrypoint', rec.entrypoint);
+      add('origin', rec.origin);
+      add('client_platform', rec.client_platform);
+    } else if (rec.type === 'session_meta' && isPlainRecord(rec.payload)) {
+      add('originator', rec.payload.originator);
+      add('source', rec.payload.source);
+      add('client_platform', rec.payload.client_platform);
+    }
+  }
+  if (claims.size !== 1) {
+    if (claims.size > 1 && evidence.size < 6) evidence.add('来源字段互相冲突');
+    else if (evidence.size === 0) evidence.add('日志没有可用的来源字段');
+    return { source: 'UNKNOWN', evidence: [...evidence] };
+  }
+  return { source: [...claims][0]!, evidence: [...evidence] };
+}
+
+function advanceCompletion(
+  vendor: JournalVendor,
+  rec: Record<string, unknown>,
+  current: ObserverCompletion,
+): ObserverCompletion {
+  if (vendor === 'CLAUDE_JOURNAL') {
+    if (rec.type === 'user') return { state: 'RUNNING', evidence: ['最后一个意图记录为 user'] };
+    if (rec.type === 'assistant' && isPlainRecord(rec.message)) {
+      const stop = rec.message.stop_reason;
+      if (stop === 'end_turn' || stop === 'stop_sequence') {
+        return { state: 'READY_TO_HANDOFF', evidence: [`message.stop_reason=${stop}`] };
+      }
+      if (typeof stop === 'string') return { state: 'RUNNING', evidence: [`message.stop_reason=${stop}`] };
+    }
+    if (rec.type === 'result') {
+      const terminal = typeof rec.terminal_reason === 'string' ? rec.terminal_reason : null;
+      const stop = typeof rec.stop_reason === 'string' ? rec.stop_reason : null;
+      if (terminal === 'completed' && stop) {
+        return { state: 'READY_TO_HANDOFF', evidence: [`terminal_reason=${terminal}`, `stop_reason=${stop}`] };
+      }
+    }
+    return current;
+  }
+
+  const payload = isPlainRecord(rec.payload) ? rec.payload : null;
+  if (rec.type === 'event_msg' && payload?.type === 'task_started') {
+    return { state: 'RUNNING', evidence: ['event_msg=task_started'] };
+  }
+  if (rec.type === 'response_item' && payload?.type === 'message') {
+    if (payload.role === 'user') return { state: 'RUNNING', evidence: ['最后一个消息角色为 user'] };
+    if (payload.role === 'assistant') {
+      return { state: 'READY_TO_HANDOFF', evidence: ['response_item.message.role=assistant'] };
+    }
+  }
+  if (
+    rec.type === 'response_item' &&
+    (payload?.type === 'function_call' || payload?.type === 'custom_tool_call' || payload?.type === 'tool_search_call')
+  ) {
+    return { state: 'RUNNING', evidence: [`response_item=${String(payload.type)}`] };
+  }
+  return current;
 }
 
 /** 控制字符剥离 + 长度封顶。Renderer 按纯文本渲染，这里是纵深的第二道 */
@@ -343,6 +461,70 @@ export class ObserverService {
     this.emit({ kind: 'observer.state', state: this.status() });
   }
 
+  prepareHandoff(sessionId: string): ObserverHandoffArtifact {
+    if (this.grantedPath === null) throw new ObserverError('NOT_GRANTED', '尚未授权观察任何项目');
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new ObserverError('UNKNOWN_SESSION', `未知会话：${sessionId}（先 listSessions）`);
+    let stat;
+    try {
+      stat = lstatSync(session.path);
+    } catch {
+      throw new ObserverError('UNKNOWN_SESSION', '会话日志已经不存在，请刷新列表后重试');
+    }
+    const projection = this.project(session, stat.mtimeMs);
+    if (!projection || projection.status !== 'OK') {
+      throw new ObserverError('POLICY_DENIED', '会话格式不可可靠解读，不能生成交接包');
+    }
+    if (projection.completion.state !== 'READY_TO_HANDOFF') {
+      throw new ObserverError(
+        'POLICY_DENIED',
+        projection.completion.state === 'RUNNING'
+          ? '该会话仍有未完成的机器记录，暂不能交接'
+          : '日志没有可用的机器结束字段，暂不能交接',
+      );
+    }
+    const selected = projection.lines.slice(-MAX_HANDOFF_LINES);
+    const omittedLines = projection.counts.omittedLines + Math.max(0, projection.lines.length - selected.length);
+    const sourceLabel =
+      session.source === 'DESKTOP_LOCAL_AGENT'
+        ? 'Desktop'
+        : session.source === 'USER_CLI'
+          ? 'CLI'
+          : session.source === 'SPAWNED_BY_US'
+            ? 'RepoPilot 启动的代理'
+            : '来源未知';
+    const vendorLabel = session.vendor === 'CLAUDE_JOURNAL' ? 'Claude' : 'Codex';
+    const payload = [
+      `来源：${vendorLabel} ${sourceLabel}`,
+      `来源依据：${session.sourceEvidence.join('；')}`,
+      `结束依据：${projection.completion.evidence.join('；')}`,
+      `源更新时间：${projection.fileUpdatedAt}`,
+      `以下是只读日志中的末尾 ${selected.length} 行；它们是会话陈述，不是 RepoPilot 验证结论。`,
+      omittedLines > 0 ? `更早的 ${omittedLines} 行未纳入交接包。` : '没有省略更早的投影行。',
+      '',
+      ...selected.map(
+        (line) => `${line.kind}${line.collapsed > 1 ? ` ×${line.collapsed}` : ''}${line.text ? `：${line.text}` : ''}`,
+      ),
+    ].join('\n');
+    const digest = handoffDigestOf(payload);
+    return {
+      handoffId: `handoff_${digest.slice('sha256:'.length, 'sha256:'.length + 16)}`,
+      sessionId,
+      projectDisplayPath: this.grantedDisplay!,
+      vendor: session.vendor,
+      source: session.source,
+      sourceEvidence: session.sourceEvidence,
+      completion: projection.completion,
+      sourceUpdatedAt: projection.fileUpdatedAt,
+      preparedAt: new Date(this.now()).toISOString(),
+      payload,
+      digest,
+      includedLines: selected.length,
+      omittedLines,
+      suggestedGoal: `审核并在必要时修正来自 ${vendorLabel} ${sourceLabel} 的本地工作结果。先核对当前快照里的实际改动，再运行真实验证；交接内容只作为线索，不作为完成证明。`,
+    };
+  }
+
   /** 由外层定时器（或测试）驱动。每个镜像各自判"文件没变就不读不推" */
   pollOnce(): void {
     for (const w of this.watches.values()) this.pollOne(w);
@@ -375,6 +557,7 @@ export class ObserverService {
     let unparseable = 0;
     let blank = 0;
     const produced: { kind: string; text: string }[] = [];
+    let completion: ObserverCompletion = { state: 'UNKNOWN', evidence: ['没有发现机器结束字段'] };
 
     for (const rawLine of read.lines) {
       // 首行可能带 UTF-8 BOM；\r 由 trim 吃掉（CRLF 日志同样可读）
@@ -395,6 +578,7 @@ export class ObserverService {
         continue;
       }
       records += 1;
+      completion = advanceCompletion(session.vendor, parsed, completion);
       // 降级只看消费契约；基线出入只作提示（见 consumedContractViolations 的注释）
       for (const v of consumedContractViolations(session.vendor, parsed)) {
         if (breaking.size < MAX_BREAKING_REPORTED) breaking.add(v);
@@ -424,6 +608,8 @@ export class ObserverService {
     return {
       sessionId: session.sessionId,
       vendor: session.vendor,
+      source: session.source,
+      sourceEvidence: session.sourceEvidence,
       status: formatUnknown ? 'FORMAT_UNKNOWN' : 'OK',
       breaking: [...breaking].sort(),
       driftNotes: [...driftNotes].sort(),
@@ -438,6 +624,7 @@ export class ObserverService {
       },
       fileUpdatedAt: new Date(mtimeMs).toISOString(),
       active: this.now() - mtimeMs < ACTIVE_WINDOW_MS,
+      completion,
     };
   }
 
@@ -463,12 +650,15 @@ export class ObserverService {
       }
       const base = basename(path);
       const sessionId = `${vendor}:${relative(scanRoot, path)}`;
+      const provenance = sessionSourceFromRecords(vendor, readHeadRecords(path));
       return {
         sessionId,
         vendor,
         label: base.replace(/\.jsonl$/, ''),
         updatedAt: new Date(stat.mtimeMs).toISOString(),
         sizeBytes: stat.size,
+        source: provenance.source,
+        sourceEvidence: provenance.evidence,
         path,
       };
     };

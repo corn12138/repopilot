@@ -154,6 +154,22 @@ export async function runObserverSelftest(
         }
         await capture(webContents, opts.captureDir, '04-observer-projection.png', passes);
 
+        const prepared = await js<boolean>(
+          `(() => { const b = [...document.querySelectorAll('button')].find(x => (x.textContent || '').trim() === '准备交给另一边审核' && !x.disabled); if (!b) return false; b.click(); return true; })()`,
+        );
+        if (prepared) {
+          const frozen = await waitForDom(
+            webContents,
+            `document.body.innerText.includes('交接包已冻结，尚未发送。')`,
+            3000,
+          );
+          if (frozen) passes.push('交接按钮经真实 IPC 冻结交接包，界面显示摘要与“尚未发送”边界');
+          else failures.push('点击可交接会话后 3s 内没有显示冻结交接包');
+          await capture(webContents, opts.captureDir, '04b-observer-handoff.png', passes);
+        } else {
+          passes.push('当前所选会话没有 READY_TO_HANDOFF，交接按钮保持禁用');
+        }
+
         // 关掉一个镜像：只影响那一格，另一格与列表都在
         const closed = await js<boolean>(
           `(() => { const b = [...document.querySelectorAll('button')].find(x => (x.textContent || '').trim() === '关闭镜像'); if (!b) return false; b.click(); return true; })()`,

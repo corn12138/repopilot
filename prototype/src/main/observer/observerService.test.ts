@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ObserverPushEvent } from '@shared/observerProtocol';
+import { sha256 } from '@shared/ids';
 import {
   ObserverError,
   ObserverService,
@@ -40,14 +41,19 @@ function writeClaudeSession(name: string, lines: string[], mtimeSec: number): st
   return p;
 }
 
-function writeCodexRollout(name: string, cwd: string | null, extraLines: string[] = []): string {
+function writeCodexRollout(
+  name: string,
+  cwd: string | null,
+  extraLines: string[] = [],
+  meta: Record<string, unknown> = {},
+): string {
   const dir = join(codexRoot, '2026', '09', '02');
   mkdirSync(dir, { recursive: true });
   const p = join(dir, name);
   const head =
     cwd === null
       ? 'not-json-at-all'
-      : j({ timestamp: 't', type: 'session_meta', payload: { id: 'x', cwd } });
+      : j({ timestamp: 't', type: 'session_meta', payload: { id: 'x', cwd, ...meta } });
   writeFileSync(p, `${[head, ...extraLines].join('\n')}\n`);
   return p;
 }
@@ -107,6 +113,30 @@ describe('授权与会话发现', () => {
     expect(sessions).toEqual([]);
     expect(counts.claudeMatched).toBe(0);
     expect(counts.codexMatched).toBe(0);
+  });
+
+  it('来源按显式元数据分组：Claude/Codex Desktop、CLI 与冲突 UNKNOWN 都不靠猜', () => {
+    writeClaudeSession(
+      'claude-desktop.jsonl',
+      [j({ type: 'assistant', entrypoint: 'claude-desktop', message: { content: 'done', stop_reason: 'end_turn' } })],
+      1_000,
+    );
+    writeClaudeSession('claude-cli.jsonl', [j({ type: 'spec', entrypoint: 'cli' })], 2_000);
+    writeClaudeSession(
+      'claude-conflict.jsonl',
+      [j({ type: 'spec', entrypoint: 'cli' }), j({ type: 'spec', entrypoint: 'claude-desktop' })],
+      3_000,
+    );
+    writeCodexRollout('rollout-desktop.jsonl', PROJECT, [], { originator: 'Codex Desktop', source: 'vscode' });
+    const { sessions } = service.enable(PROJECT, PROJECT);
+    const sources = Object.fromEntries(sessions.map((s) => [s.label, s.source]));
+    expect(sources).toMatchObject({
+      'claude-desktop': 'DESKTOP_LOCAL_AGENT',
+      'claude-cli': 'USER_CLI',
+      'claude-conflict': 'UNKNOWN',
+      'rollout-desktop': 'DESKTOP_LOCAL_AGENT',
+    });
+    expect(sessions.find((s) => s.label === 'claude-conflict')?.sourceEvidence).toContain('来源字段互相冲突');
   });
 });
 
@@ -241,6 +271,38 @@ describe('撤销即清除', () => {
     service.pollOnce();
     expect(events).toEqual([]);
     expect(() => service.listSessions()).toThrow(ObserverError);
+  });
+});
+
+describe('人为交接', () => {
+  it('只有机器结束字段完整的会话能冻结交接包；正文摘要可由 Core 原样重算', () => {
+    writeClaudeSession(
+      'done.jsonl',
+      [
+        j({ type: 'user', entrypoint: 'claude-desktop', message: { content: '修复问题' } }),
+        j({ type: 'assistant', entrypoint: 'claude-desktop', message: { content: '已修改并测试', stop_reason: 'end_turn' } }),
+      ],
+      1_000,
+    );
+    service.enable(PROJECT, '~/demo-project');
+    const artifact = service.prepareHandoff('CLAUDE_JOURNAL:done.jsonl');
+    expect(artifact.source).toBe('DESKTOP_LOCAL_AGENT');
+    expect(artifact.completion).toEqual({ state: 'READY_TO_HANDOFF', evidence: ['message.stop_reason=end_turn'] });
+    expect(artifact.payload).toContain('它们是会话陈述，不是 RepoPilot 验证结论');
+    expect(artifact.digest).toBe(sha256(artifact.payload));
+    expect(artifact.projectDisplayPath).toBe('~/demo-project');
+  });
+
+  it('工具调用未收口或没有机器结束字段时拒绝交接', () => {
+    writeClaudeSession(
+      'running.jsonl',
+      [j({ type: 'assistant', entrypoint: 'cli', message: { content: [], stop_reason: 'tool_use' } })],
+      1_000,
+    );
+    writeClaudeSession('unknown.jsonl', [j({ type: 'spec', entrypoint: 'cli' })], 2_000);
+    service.enable(PROJECT, PROJECT);
+    expect(() => service.prepareHandoff('CLAUDE_JOURNAL:running.jsonl')).toThrow(/仍有未完成/);
+    expect(() => service.prepareHandoff('CLAUDE_JOURNAL:unknown.jsonl')).toThrow(/没有可用的机器结束字段/);
   });
 });
 
