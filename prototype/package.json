@@ -2,7 +2,7 @@
   "name": "repopilot-prototype",
   "version": "0.0.1",
   "private": true,
-  "description": "RepoPilot 可丢弃原型 / disposable spike — Electron + React Agent Workbench",
+  "description": "RepoPilot 产品种子 — Electron + React Agent Workbench",
   "type": "module",
   "main": "./out/main/index.js",
   "scripts": {

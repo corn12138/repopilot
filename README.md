@@ -96,7 +96,7 @@ pnpm dev
 可以直接拿它当第一个任务目标。
 
 ```bash
-pnpm test        # 74 个文件 / 1329 个测试（本机日志 probe 的 3 个默认跳过），含真实 tsc + vite build 的端到端链路
+pnpm test        # 75 个文件 / 1344 个测试（两个本机 probe 文件共 6 个默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
 ```
 
@@ -133,6 +133,20 @@ pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
   15 分钟 TTL、一张票只进一个 Run，批准不洗白风险等级
 - eval：case 不声明可修改范围就拒绝加载，范围逐字进 `task.create`；
   B 臂审核方被降级 → 观察作废，绝不密封成 B 臂结果
+- Claude/Codex 本机会话按 Desktop / CLI / 平台启动 / 未知来源分组；来源冲突不猜，
+  未出现机器结束字段时不能生成交接包
+- 观察交接必须由人点击；交接正文以 digest 冻结，Core 重算不一致整笔拒绝，
+  并在出站披露里单列“本机会话交接内容”
+
+## Desktop 同屏观察与人工交接
+
+观察页可以把两个 Claude/Codex 会话并排显示。它读取按项目授权的本地结构化日志，
+不会嵌入或操控别的应用窗口；列表按来源分组，并展示来源与结束判定所依据的机器字段。
+
+当一边出现可信的本轮结束记录后，可以先冻结交接包，再选择：复制给另一个 Desktop，
+或进入 RepoPilot 审核任务。后一条路径会重新导入当前仓库，把交接内容纳入 DLP 与出站披露，
+然后复用现有任务预算、真实验证和可选的 **2 次审核 + 1 次整改**循环。交接不会自动发生，
+观察到的模型也不能据此宣布任务成功。
 
 ## 一写一审：交叉审核与外部 CLI
 
@@ -174,7 +188,7 @@ confidence / file / range / evidence / blocking）。审核方由平台强制只
   基线红 / 参考修复绿证据，参考修复不进 case 目录。这些是零依赖、秒级验证的
   确定性任务，**不是**真实 Vite/React/TS 工具链 fixture（那是正式 benchmark
   未解冻的 blocker）。
-- **执行入口**：`pnpm eval:spk010 -- --implementer <provider> --reviewer <provider>`
+- **执行入口**：`pnpm eval:spk010 --implementer <provider> --reviewer <provider>`
   —— 预检（路由 / 默认模型 / 凭据就绪度）、`--dry-run` 零出站、断点续跑、连续失败熔断，
   收口落 `ab-report.json` 与盲评包。凭据只从环境变量读，脚本不接受明文 key。
 - **诚实边界**：样本门槛已达、执行入口就绪，但正式实验（真实模型 + 人工盲评）
@@ -198,7 +212,7 @@ confidence / file / range / evidence / blocking）。审核方由平台强制只
 
 ## 开发记录
 
-[`docs/devlog/`](docs/devlog/) 按天记录设计取舍和踩过的坑，目前 **76 篇**，
+[`docs/devlog/`](docs/devlog/) 按天记录设计取舍和踩过的坑，目前 **78 篇**，
 完整索引见 [devlog/README.md](docs/devlog/README.md)。几篇有代表性的：
 
 | 篇 | 主题 |

@@ -1,22 +1,21 @@
 {
   "vendor": "CODEX_ROLLOUT",
-  "capturedAt": "2026-09-05T01:08:51.402Z",
-  "files": 198,
-  "records": 115433,
+  "capturedAt": "2026-09-14T07:17:53.992Z",
+  "files": 199,
+  "records": 121828,
   "unparseableLines": 0,
-  "blankLines": 197,
-  "truncatedLines": 3455,
+  "blankLines": 198,
+  "truncatedLines": 11243,
   "droppedForTypeCap": 0,
   "types": {
     "compacted": {
       "required": [
+        "ordinal",
         "payload",
         "timestamp",
         "type"
       ],
-      "optional": [
-        "ordinal"
-      ]
+      "optional": []
     },
     "event_msg": {
       "required": [
@@ -30,13 +29,12 @@
     },
     "inter_agent_communication_metadata": {
       "required": [
+        "ordinal",
         "payload",
         "timestamp",
         "type"
       ],
-      "optional": [
-        "ordinal"
-      ]
+      "optional": []
     },
     "response_item": {
       "required": [
@@ -103,6 +101,7 @@
         "cli_version",
         "collaboration_mode",
         "comp_hash",
+        "compaction_response_id",
         "context_window",
         "current_date",
         "cwd",
@@ -113,13 +112,13 @@
         "forked_from_id",
         "full",
         "git",
+        "guardian_history",
         "history_mode",
         "id",
-        "memory_mode",
+        "latest_token_usage_record",
         "message",
         "model",
         "model_provider",
-        "multi_agent_mode",
         "multi_agent_version",
         "originator",
         "parent_thread_id",
@@ -129,6 +128,7 @@
         "realtime_active",
         "replacement_history",
         "response_id",
+        "retained_context",
         "root_turn_id",
         "sandbox_policy",
         "session_id",
@@ -181,12 +181,6 @@
       ],
       "optional": []
     },
-    "context_compacted": {
-      "required": [
-        "type"
-      ],
-      "optional": []
-    },
     "custom_tool_call": {
       "required": [
         "call_id",
@@ -224,39 +218,27 @@
     },
     "function_call_output": {
       "required": [
-        "call_id",
         "id",
         "internal_chat_message_metadata_passthrough",
         "output",
         "type"
       ],
-      "optional": []
+      "optional": [
+        "call_id",
+        "name",
+        "namespace"
+      ]
     },
     "item_completed": {
       "required": [
         "completed_at_ms",
         "item",
-        "started_at_ms",
         "thread_id",
         "turn_id",
         "type"
       ],
-      "optional": []
-    },
-    "mcp_tool_call_end": {
-      "required": [
-        "call_id",
-        "duration",
-        "invocation",
-        "read_only_hint",
-        "result",
-        "type"
-      ],
       "optional": [
-        "action_name",
-        "app_name",
-        "connector_id",
-        "link_id"
+        "started_at_ms"
       ]
     },
     "message": {
@@ -271,19 +253,6 @@
         "phase"
       ]
     },
-    "patch_apply_end": {
-      "required": [
-        "call_id",
-        "changes",
-        "status",
-        "stderr",
-        "stdout",
-        "success",
-        "turn_id",
-        "type"
-      ],
-      "optional": []
-    },
     "reasoning": {
       "required": [
         "encrypted_content",
@@ -292,30 +261,21 @@
         "summary",
         "type"
       ],
-      "optional": []
-    },
-    "sub_agent_activity": {
-      "required": [
-        "agent_path",
-        "agent_thread_id",
-        "event_id",
-        "kind",
-        "occurred_at_ms",
-        "type"
-      ],
-      "optional": []
+      "optional": [
+        "content"
+      ]
     },
     "task_complete": {
       "required": [
         "completed_at",
-        "duration_ms",
         "last_agent_message",
-        "started_at",
         "turn_id",
         "type"
       ],
       "optional": [
+        "duration_ms",
         "error",
+        "started_at",
         "time_to_first_token_ms"
       ]
     },
@@ -325,6 +285,14 @@
         "model_context_window",
         "started_at",
         "turn_id",
+        "type"
+      ],
+      "optional": []
+    },
+    "thread_goal_updated": {
+      "required": [
+        "goal",
+        "threadId",
         "type"
       ],
       "optional": []
@@ -389,18 +357,6 @@
         "local_images",
         "message",
         "text_elements",
-        "type"
-      ],
-      "optional": [
-        "client_id"
-      ]
-    },
-    "web_search_end": {
-      "required": [
-        "action",
-        "call_id",
-        "query",
-        "results",
         "type"
       ],
       "optional": []
