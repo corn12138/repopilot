@@ -49,8 +49,29 @@ describe('classifyUserCommand', () => {
     [['chmod', '777', 'x']],
     [['dd', 'if=/dev/zero']],
     [['mv', 'a', 'b']],
+    // R1 二进制仍需拒绝可由 argv 直接触发的破坏性行为。
+    [['find', '.', '-delete']],
+    [['find', '.', '-exec', 'rm', '{}', '+']],
+    [['find', '/Users', '-execdir', 'sh', '-c', 'x', ';']],
   ])('R3：%j', (argv) => {
     expect(classifyUserCommand(argv).risk).toBe('R3');
+  });
+
+  it('find 的破坏性参数把它从 R1 提到 R3，且不可批准；普通 find 仍是 R1', () => {
+    const plain = classifyUserCommand(['find', '.', '-name', '*.log']);
+    expect(plain.risk).toBe('R1');
+    expect(userCommandAdmission(['find', '.', '-name', '*.log']).ok).toBe(true);
+
+    const destructive = classifyUserCommand(['find', '.', '-delete']);
+    expect(destructive.risk).toBe('R3');
+    expect(destructive.cause).toBe('DESTRUCTIVE');
+    expect(isApprovableCause(destructive)).toBe(false);
+    const admission = userCommandAdmission(['find', '.', '-delete']);
+    expect(admission.ok).toBe(false);
+    if (!admission.ok) {
+      expect(admission.approvable).toBe(false);
+      expect(admission.message).toContain('破坏性参数');
+    }
   });
 
   it.each([

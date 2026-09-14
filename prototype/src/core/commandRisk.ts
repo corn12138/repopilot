@@ -3,9 +3,11 @@ import { createHash } from 'node:crypto';
 import type { ToolRisk } from '@shared/domain';
 
 /**
- * 用户手填命令的风险分级（Slice I-1，对应 08-17 审计 D3：此前一律硬编码 R1）。
+ * 用户手填命令的风险分级（Slice I-1，对应 08-17 审计 D3）。
  *
- * 分级只看 argv：可执行名 + 第一个子命令，外加少数危险 flag。它不是"猜用户意图"，
+ * 分级只看 argv 的**前两段**：可执行名 + 第一个子命令；唯一的参数级例外是
+ * `DESTRUCTIVE_ARGS_OF_R1`（`find -delete` 这类纯 argv 就能删宿主文件的形态）。
+ * 它不是"猜用户意图"，
  * 是在登记为验证命令之前判断这条命令属于哪一档 —— 因为登记之后它会在**计划批准前**作为
  * 基线跑一次，之后模型还能在预算内用 `run_command` 重复调用。一条 `git push` 或 `rm -rf dist`
  * 被登记成 R1，就等于"填一次即永久授权"。
@@ -14,7 +16,12 @@ import type { ToolRisk } from '@shared/domain';
  *   R2  依赖安装、网络、服务生命周期（install/add/ci/curl/wget/docker/…）—— 需要一次性精确审批
  *   R3  删除/覆盖/权限/迁移类（rm/rmdir/chmod/chown/dd/mkfs/…）—— 首切片 hard deny
  *   R4  push/merge/部署/发布/凭据读写（git push/merge/rebase/reset --hard、npm publish、
- *       sudo、ssh、scp、env/printenv、cat ~/.ssh/…）—— always deny
+ *       sudo、ssh、scp、env/printenv）—— always deny
+ *
+ * ## 这份分级**不是**安全边界
+ *
+ * 除 `DESTRUCTIVE_ARGS_OF_R1` 外不做参数级检查；例如 `cat <宿主绝对路径>` 仍是 R1。
+ * 参数级读取由 MaterializedWorkspace 的执行边界和命令输出 DLP 兜底，不能把本分级当成沙箱。
  *
  * 认不出的可执行名按 R1 放行？不 —— 认不出按 **R2** 处理（fail-closed）：未知二进制可能是任何东西，
  * 用户可以用 `node`/`pnpm` 等已知入口包装它。白名单比黑名单诚实。
@@ -75,6 +82,16 @@ const R1_BINARIES = new Set([
   'true', 'echo', 'ls', 'cat', 'grep', 'rg', 'find', 'wc', 'head', 'tail', 'diff',
 ]);
 
+/**
+ * R1 白名单里能仅靠参数产生破坏性写入的形态。
+ *
+ * 命令以结构化 argv 执行，所以不考虑 shell 重定向；`find -delete/-exec` 本身即可删除或
+ * 启动任意程序，必须在登记前提升到 R3。这里只收录可以精确识别的破坏性参数。
+ */
+const DESTRUCTIVE_ARGS_OF_R1: Readonly<Record<string, readonly string[]>> = {
+  find: ['-delete', '-exec', '-execdir', '-ok', '-okdir'],
+};
+
 /** 包管理器的子命令：哪些是跑脚本（R1），哪些是装依赖/发布（R2/R4） */
 const PM_R2 = new Set(['install', 'i', 'add', 'ci', 'update', 'up', 'upgrade', 'remove', 'rm', 'uninstall', 'link', 'dedupe', 'prune', 'rebuild', 'import', 'patch', 'patch-commit', 'dlx', 'exec', 'create', 'init', 'login', 'logout', 'config', 'set', 'cache']);
 const PM_R4 = new Set(['publish', 'unpublish', 'deprecate', 'owner', 'access', 'token', 'adduser', 'whoami', 'version', 'pack']);
@@ -110,8 +127,15 @@ export function classifyUserCommand(argv: readonly string[]): CommandRiskVerdict
   }
 
   if (R1_BINARIES.has(bin)) {
-    // 少数危险 flag：node -e 仍是本地执行（R1）；但 `node -e "require('child_process')…"` 我们管不住，
-    // 这正是"验证命令在 MaterializedWorkspace 里跑、宿主仓库只读"要兜的底，不在这里重复分级
+    const destructiveArg = DESTRUCTIVE_ARGS_OF_R1[bin]?.find((flag) => argv.includes(flag));
+    if (destructiveArg) {
+      return {
+        risk: 'R3',
+        cause: 'DESTRUCTIVE',
+        reason: `${bin} 带破坏性参数 ${destructiveArg}：纯 argv 就能删宿主文件，按删除/覆盖类处理`,
+      };
+    }
+    // 任意脚本入口仍由 MaterializedWorkspace 与输出 DLP 约束，不能靠 argv 枚举穷尽。
     return { risk: 'R1', cause: 'KNOWN_LOCAL', reason: `${bin} 属于构建/测试/本地脚本类` };
   }
   return { risk: 'R2', cause: 'UNKNOWN_BINARY', reason: `未知可执行名 ${bin}：不在已知本地工具白名单内，fail-closed` };

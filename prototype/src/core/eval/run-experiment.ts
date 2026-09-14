@@ -2,7 +2,7 @@
  * SPK-010 sealed A/B 实验执行器（实验设计 v0.1-r2 §5、§6）。
  *
  * 用法（在 prototype/ 下）：
- *   pnpm eval:spk010 -- --implementer deepseek --reviewer moonshot-cn [选项]
+ *   pnpm eval:spk010 --implementer deepseek --reviewer moonshot-cn [选项]
  *
  * 选项：
  *   --implementer <providerId>   写手 provider（必填）
@@ -26,7 +26,7 @@
 import type { ProviderDescriptor } from '../model/registry';
 import type { EvalArm } from './runner';
 
-const HELP_HINT = '用法：pnpm eval:spk010 -- --implementer <providerId> --reviewer <providerId> [--dry-run]';
+const HELP_HINT = '用法：pnpm eval:spk010 --implementer <providerId> --reviewer <providerId> [--dry-run]';
 
 interface CliArgs {
   implementer: string;

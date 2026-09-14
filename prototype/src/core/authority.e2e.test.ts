@@ -886,6 +886,28 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
   );
 
   it(
+    'CLEANUP_SUMMARY 只说能证实的：非取消终态下子进程报 UNKNOWN，不声称已释放（RISK-15）',
+    async () => {
+      // 首轮模型调用失败覆盖未触发取消时的终态清理语义。
+      harness.script(IMPL, []);
+      const { runId } = await harness.createRun({ hostPath: makeFixtureRepo() });
+      const failed = await harness.waitForStatus(runId, ['FAILED']);
+      expect(failed.failureClass).toBe('MODEL_INVOCATION_FAILED');
+
+      const { events } = await harness.call<{ events: RunEvent[] }>('run.events', {
+        runId,
+        afterSeq: 0,
+      });
+      const summary = events.filter((e) => e.kind === 'CLEANUP_SUMMARY').at(-1);
+      expect(summary, '终态 Run 必须有 CLEANUP_SUMMARY').toBeDefined();
+      expect(summary!.payload).toMatchObject({ reason: 'RUN_TERMINAL', childProcesses: 'UNKNOWN' });
+      expect(summary!.summary).toContain('状态未知');
+      expect(summary!.summary).not.toContain('已释放模型流、子进程与审批等待');
+    },
+    30_000,
+  );
+
+  it(
     '交叉审核整改闭环：阻断发现 → 实现方整改 → 重验 → 重封存 → 第二轮通过',
     async () => {
       harness.script(IMPL, [
