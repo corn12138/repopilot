@@ -91,7 +91,7 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 75 个文件 / 1344 个测试（两个本机 probe 文件共 6 个默认跳过），含真实 tsc + vite build 的端到端链路
+pnpm test       # 75 个文件 / 1347 个测试（两个本机 probe 文件共 6 个默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 pnpm eval:spk010 --implementer <provider> --reviewer <provider> --dry-run

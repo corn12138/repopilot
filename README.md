@@ -96,7 +96,7 @@ pnpm dev
 可以直接拿它当第一个任务目标。
 
 ```bash
-pnpm test        # 75 个文件 / 1344 个测试（两个本机 probe 文件共 6 个默认跳过），含真实 tsc + vite build 的端到端链路
+pnpm test        # 75 个文件 / 1347 个测试（两个本机 probe 文件共 6 个默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
 ```
 
@@ -142,6 +142,10 @@ pnpm selftest    # 三进程 + 私有 IPC + Renderer 挂载的启动自检
 
 观察页可以把两个 Claude/Codex 会话并排显示。它读取按项目授权的本地结构化日志，
 不会嵌入或操控别的应用窗口；列表按来源分组，并展示来源与结束判定所依据的机器字段。
+
+观察页还把机器字段显示本轮结束的会话集中到“待你输入 / 决定”队列。队列每 3 秒刷新，
+文件未变时复用有限元数据缓存；最多展开最近 8 个并报告更早项与未知状态数量。点击只会定位镜像，
+不会自动传话、交接、审批或改变任务终态。
 
 当一边出现可信的本轮结束记录后，可以先冻结交接包，再选择：复制给另一个 Desktop，
 或进入 RepoPilot 审核任务。后一条路径会重新导入当前仓库，把交接内容纳入 DLP 与出站披露，
@@ -212,7 +216,7 @@ confidence / file / range / evidence / blocking）。审核方由平台强制只
 
 ## 开发记录
 
-[`docs/devlog/`](docs/devlog/) 按天记录设计取舍和踩过的坑，目前 **78 篇**，
+[`docs/devlog/`](docs/devlog/) 按天记录设计取舍和踩过的坑，目前 **79 篇**，
 完整索引见 [devlog/README.md](docs/devlog/README.md)。几篇有代表性的：
 
 | 篇 | 主题 |
