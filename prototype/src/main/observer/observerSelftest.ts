@@ -123,6 +123,24 @@ export async function runObserverSelftest(
       const granted = await waitForDom(webContents, `document.body.innerText.includes('已授权')`, 3000);
       if (granted) passes.push('状态推送到达 Renderer：视图切到已授权态');
       else failures.push('授权后 3s 内 Renderer 未显示已授权态（observer.state 推送没到或视图没订到）');
+      const waiting = listed.sessions.filter((session) => session.completion.state === 'READY_TO_HANDOFF').length;
+      if (waiting > 0) {
+        const queueVisible = await waitForDom(
+          webContents,
+          `document.body.innerText.includes('待你输入 / 决定 · ${waiting}')`,
+          3000,
+        );
+        if (queueVisible) passes.push(`等待队列按机器结束字段渲染 ${waiting} 个会话，并明确只用于导航`);
+        else failures.push(`服务层识别 ${waiting} 个待决定会话，但 Renderer 3s 内未显示对应队列`);
+      } else {
+        const emptyQueue = await waitForDom(
+          webContents,
+          `document.body.innerText.includes('待你输入 / 决定 · 0') && document.body.innerText.includes('暂无机器字段显示本轮结束的会话')`,
+          3000,
+        );
+        if (emptyQueue) passes.push('当前项目没有机器字段已结束的会话，等待队列明确显示 0');
+        else failures.push('服务层没有待决定会话，但 Renderer 未显示空队列说明');
+      }
       await capture(webContents, opts.captureDir, '03-observer-granted.png', passes);
 
       if (listed.sessions.length > 0) {

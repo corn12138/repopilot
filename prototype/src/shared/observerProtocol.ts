@@ -1,5 +1,5 @@
 /**
- * 观察面板的旁路通道契约（PRD-WKB-002/003 的产品种子实现）。
+ * 观察面板的旁路通道契约（PRD-WKB-002/003/004 的产品种子实现）。
  *
  * 为什么不进 `protocol.ts`：TD-DEC-022 (a) —— 工位/观察是**用户能力面**，
  * 不进 authority 链。这条通道 Renderer ⇄ Main 直连，从不经过 Core：
@@ -18,7 +18,7 @@
  * 校验 schema 放在 main/observer/observerSchema.ts，不进 Preload 包。
  */
 
-export const OBSERVER_PROTOCOL_VERSION = 2;
+export const OBSERVER_PROTOCOL_VERSION = 3;
 
 /** 独立通道名 —— 刻意不与 `repopilot:request/event`（Core 契约）共用 */
 export const OBSERVER_CHANNEL = {
@@ -59,6 +59,8 @@ export interface ObserverSessionEntry {
   readonly source: ObserverSessionSource;
   /** 用于解释来源判定的有限元数据，不含会话正文或宿主路径。 */
   readonly sourceEvidence: readonly string[];
+  /** 会话列表与等待队列共享同一份机器字段判定；只能用于导航提示。 */
+  readonly completion: ObserverCompletion;
 }
 
 /** 会话发现的扫描账目 —— 省略要报数：扫了多少、按什么被跳过 */

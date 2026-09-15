@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ObserverProjection, ObserverPushEvent } from '@shared/observerProtocol';
 
 const observerCallMock = vi.fn();
+const clipboardWriteMock = vi.fn();
 let pushHandlers: Array<(e: ObserverPushEvent) => void> = [];
 vi.mock('../observerBridge', () => ({
   observerCall: (...args: unknown[]) => observerCallMock(...args),
@@ -31,6 +32,7 @@ const SESSION = {
   sizeBytes: 2048,
   source: 'DESKTOP_LOCAL_AGENT' as const,
   sourceEvidence: ['entrypoint=claude-desktop'],
+  completion: { state: 'READY_TO_HANDOFF' as const, evidence: ['message.stop_reason=end_turn'] },
 };
 const COUNTS = {
   claudeMatched: 1,
@@ -67,6 +69,11 @@ const push = (e: ObserverPushEvent): void => {
 beforeEach(() => {
   pushHandlers = [];
   observerCallMock.mockReset();
+  clipboardWriteMock.mockReset().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: clipboardWriteMock },
+  });
   observerCallMock.mockImplementation(async (method: string) => {
     if (method === 'observer.status') return { granted: null, watching: [] };
     if (method === 'observer.unwatch') return { ok: true };
@@ -167,6 +174,31 @@ describe('观察面板', () => {
     expect(screen.queryByText(/Claude · abc/)).toBeNull();
   });
 
+  it('撤销与列表刷新竞态：旧授权的迟到响应不能把已清除会话重新填回', async () => {
+    let resolveList!: (value: { sessions: readonly [typeof SESSION]; counts: typeof COUNTS }) => void;
+    const pendingList = new Promise<{ sessions: readonly [typeof SESSION]; counts: typeof COUNTS }>((resolve) => {
+      resolveList = resolve;
+    });
+    observerCallMock.mockImplementation(async (method: string) => {
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
+      if (method === 'observer.listSessions') return pendingList;
+      if (method === 'observer.unwatch') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<ObserverView />);
+    await screen.findByText('~/demo');
+
+    push({ kind: 'observer.state', state: { granted: null, watching: [] } });
+    expect(await screen.findByText('选择项目目录并启用观察')).toBeTruthy();
+    await act(async () => {
+      resolveList({ sessions: [SESSION], counts: COUNTS });
+      await pendingList;
+    });
+
+    expect(screen.queryByText(/Claude · abc/)).toBeNull();
+    expect(screen.queryByRole('region', { name: '待你输入队列' })).toBeNull();
+  });
+
   it('授权来自 Main 侧推送（非本视图发起）时也会去拉会话列表 —— selftest 截图抓到的空档', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
       if (method === 'observer.status') return { granted: null, watching: [] };
@@ -229,7 +261,7 @@ describe('观察面板', () => {
     expect(await screen.findByText(/你好，这是镜像正文/)).toBeTruthy();
     expect(screen.getByText(/这是 codex 那一格/)).toBeTruthy();
     expect(screen.getAllByText('关闭镜像')).toHaveLength(2);
-    expect(screen.getAllByText(/镜像中/)).toHaveLength(2);
+    expect(within(screen.getByLabelText('可观察的会话列表')).getAllByText(/镜像中/)).toHaveLength(2);
 
     fireEvent.click(screen.getAllByText('关闭镜像')[0]!);
     await waitFor(() =>
@@ -285,7 +317,50 @@ describe('观察面板', () => {
     fireEvent.click(await screen.findByText('准备交给另一边审核'));
     expect(await screen.findByText(/交接包已冻结/)).toBeTruthy();
     expect(screen.getByText(/省略 2 行/)).toBeTruthy();
+    fireEvent.click(screen.getByText('复制给另一个 Desktop'));
+    await waitFor(() =>
+      expect(clipboardWriteMock).toHaveBeenCalledWith(`[RepoPilot 交接包 ${artifact.digest}]\n${artifact.payload}`),
+    );
+    expect(await screen.findByText('已复制')).toBeTruthy();
     fireEvent.click(screen.getByText('进入 RepoPilot 有界审核'));
     expect(onUse).toHaveBeenCalledWith(artifact);
+  });
+
+  it('待你输入队列只收机器结束会话；点击只打开镜像，UNKNOWN 数量单独披露', async () => {
+    const running = {
+      ...SESSION,
+      sessionId: 'CLAUDE_JOURNAL:running.jsonl',
+      label: 'running',
+      completion: { state: 'RUNNING' as const, evidence: ['最后一个意图记录为 user'] },
+    };
+    const unknown = {
+      ...SESSION,
+      sessionId: 'CODEX_ROLLOUT:unknown.jsonl',
+      vendor: 'CODEX_ROLLOUT' as const,
+      label: 'unknown',
+      completion: { state: 'UNKNOWN' as const, evidence: ['有限尾部没有发现机器结束字段'] },
+    };
+    observerCallMock.mockImplementation(async (method: string) => {
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
+      if (method === 'observer.listSessions') return { sessions: [SESSION, running, unknown], counts: COUNTS };
+      if (method === 'observer.watch') return { ok: true };
+      if (method === 'observer.unwatch') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<ObserverView />);
+
+    const queue = await screen.findByRole('region', { name: '待你输入队列' });
+    expect(within(queue).getByText('Claude / abc')).toBeTruthy();
+    expect(within(queue).queryByText(/running/)).toBeNull();
+    expect(within(queue).getByText(/另有 1 个会话结束状态未知/)).toBeTruthy();
+
+    fireEvent.click(within(queue).getByText('Claude / abc'));
+    await waitFor(() =>
+      expect(observerCallMock).toHaveBeenCalledWith('observer.watch', { sessionId: SESSION.sessionId }),
+    );
+    push({ kind: 'observer.state', state: { granted: '~/demo', watching: [SESSION.sessionId] } });
+    push({ kind: 'observer.projection', projection: projection() });
+    expect(await within(queue).findByText(/镜像中/)).toBeTruthy();
+    expect(screen.getByText(/你好，这是镜像正文/)).toBeTruthy();
   });
 });

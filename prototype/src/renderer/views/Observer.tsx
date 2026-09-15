@@ -9,11 +9,14 @@ import {
 import { observerCall, observerSubscribe } from '../observerBridge';
 import { Badge, Banner, Card, relativeTime } from '../components/common';
 
+const SESSION_REFRESH_MS = 3_000;
+const ATTENTION_QUEUE_LIMIT = 8;
+
 /**
- * 观察与交接面板（PRD-WKB-002/003）：本机 Claude / Codex 会话的只读镜像。
+ * 观察与交接面板（PRD-WKB-002/003/004）：本机 Claude / Codex 会话的只读镜像。
  *
- * 视图层只做三件事：发起授权手势（真正的目录选择在 Main 的原生对话框里）、
- * 列会话、渲染 Main 推来的 volatile 投影。四条信任边界（DEC-020）里它负责说人话：
+ * 视图层只做四件事：发起授权手势（真正的目录选择在 Main 的原生对话框里）、
+ * 列会话、汇总待输入导航、渲染 Main 推来的 volatile 投影。四条信任边界（DEC-020）里它负责说人话：
  * 登录态属用户、只读、零出站、可随时关闭。所有计数如实展示 —— 省略要报数。
  *
  * 双镜像（2026-09-05）：最多 OBSERVER_MAX_MIRRORS 个会话并排镜像，这是"甲乙对照"的最小形态。
@@ -23,6 +26,7 @@ import { Badge, Banner, Card, relativeTime } from '../components/common';
  *
  * 镜像本身不进 Run/Approval/Verification；人冻结交接包后仍要经正常任务、出站披露、
  * 验证与补丁接受链，观察通道不会获得 Core 权威。
+ * 等待队列同样只消费机器结束字段，不会自动交接或把启发式状态上移成任何判定。
  */
 export function ObserverView({
   reviewProjectDisplayPath = null,
@@ -42,21 +46,37 @@ export function ObserverView({
   const [handoffBusy, setHandoffBusy] = useState<string | null>(null);
   const [prepared, setPrepared] = useState<ObserverHandoffArtifact | null>(null);
   const [copied, setCopied] = useState(false);
+  const [focusTarget, setFocusTarget] = useState<string | null>(null);
   const activeRef = useRef(true);
+  const grantedRef = useRef<string | null>(null);
+  const refreshInFlightRef = useRef(false);
+  const mirrorRefs = useRef(new Map<string, HTMLDivElement>());
 
   const report = useCallback((err: unknown) => {
     if (activeRef.current) setError((err as Error).message ?? '未知错误');
   }, []);
 
   const refreshSessions = useCallback(async () => {
+    if (refreshInFlightRef.current) return;
+    const expectedGrant = grantedRef.current;
+    if (expectedGrant === null) return;
+    refreshInFlightRef.current = true;
     try {
       const r = await observerCall('observer.listSessions', {});
-      if (!activeRef.current) return;
+      // 撤销或换项目后，旧 IPC 响应不能把已清除的会话重新塞回 Renderer。
+      if (!activeRef.current || grantedRef.current !== expectedGrant) return;
       setSessions(r.sessions);
       setCounts(r.counts);
+      setPrepared((current) => {
+        if (!current) return null;
+        const latest = r.sessions.find((session) => session.sessionId === current.sessionId);
+        return latest?.updatedAt === current.sourceUpdatedAt ? current : null;
+      });
       setError(null);
     } catch (err) {
-      report(err);
+      if (grantedRef.current === expectedGrant) report(err);
+    } finally {
+      refreshInFlightRef.current = false;
     }
   }, [report]);
 
@@ -74,6 +94,7 @@ export function ObserverView({
         setWatching((prev) => (prev.includes(id) ? prev : [...prev, id]));
         return;
       }
+      grantedRef.current = event.state.granted;
       setGranted(event.state.granted);
       setWatching(event.state.watching);
       // 被顶掉/被关闭的镜像，其投影一并丢弃 —— 槽位以 Main 为准，不留残影
@@ -97,6 +118,7 @@ export function ObserverView({
     void observerCall('observer.status', {})
       .then((s) => {
         if (!activeRef.current) return;
+        grantedRef.current = s.granted;
         setGranted(s.granted);
         setWatching(s.watching);
         if (s.granted !== null) void refreshSessions();
@@ -110,6 +132,13 @@ export function ObserverView({
     };
   }, [refreshSessions, report]);
 
+  useEffect(() => {
+    if (granted === null) return;
+    // 等待队列要跟得上 Desktop 新轮次，但文件未变时 Main 会复用元数据缓存。
+    const timer = window.setInterval(() => void refreshSessions(), SESSION_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [granted, refreshSessions]);
+
   const enable = async () => {
     setBusy(true);
     setError(null);
@@ -117,6 +146,7 @@ export function ObserverView({
       const r = await observerCall('observer.enable', {});
       if (!activeRef.current) return;
       if (r.granted === null) return; // 用户取消了目录选择 —— 什么都没发生
+      grantedRef.current = r.granted;
       setGranted(r.granted);
       setSessions(r.sessions);
       setCounts(r.counts);
@@ -136,13 +166,20 @@ export function ObserverView({
   };
 
   /** 加入镜像槽。槽位序与顶替由 Main 决定并经 state 推送回来 */
-  const watch = async (sessionId: string) => {
+  const watch = async (sessionId: string): Promise<boolean> => {
     setError(null);
     try {
       await observerCall('observer.watch', { sessionId });
+      return true;
     } catch (err) {
       report(err);
+      return false;
     }
+  };
+
+  const focusFromQueue = async (sessionId: string) => {
+    setFocusTarget(sessionId);
+    if (!(await watch(sessionId))) setFocusTarget(null);
   };
 
   const unwatchOne = async (sessionId: string) => {
@@ -181,6 +218,8 @@ export function ObserverView({
     v === 'CLAUDE_JOURNAL' ? 'Claude' : 'Codex';
   const labelOf = (sessionId: string) =>
     sessions.find((s) => s.sessionId === sessionId)?.label ?? sessionId.replace(/^[A-Z_]+:/, '');
+  const compactLabel = (label: string) =>
+    label.length <= 18 ? label : `${label.slice(0, 8)}…${label.slice(-8)}`;
   const sourceLabel = (source: ObserverSessionEntry['source']) =>
     source === 'DESKTOP_LOCAL_AGENT'
       ? 'Desktop'
@@ -195,11 +234,30 @@ export function ObserverView({
     'SPAWNED_BY_US',
     'UNKNOWN',
   ] as const;
+  const waitingSessions = sessions.filter((session) => session.completion.state === 'READY_TO_HANDOFF');
+  const visibleWaitingSessions = waitingSessions.slice(0, ATTENTION_QUEUE_LIMIT);
+  const omittedWaitingSessions = waitingSessions.length - visibleWaitingSessions.length;
+  const unknownCompletionCount = sessions.filter((session) => session.completion.state === 'UNKNOWN').length;
+  const completionLabel = (session: ObserverSessionEntry) =>
+    session.completion.state === 'READY_TO_HANDOFF'
+      ? '待你决定'
+      : session.completion.state === 'RUNNING'
+        ? '本轮进行中'
+        : '结束状态未知';
   const canUsePreparedAsTask =
     prepared !== null &&
     onUseAsReviewTask !== undefined &&
     granted !== null &&
     reviewProjectDisplayPath === granted;
+
+  useEffect(() => {
+    if (!focusTarget || !projections[focusTarget]) return;
+    const mirror = mirrorRefs.current.get(focusTarget);
+    if (!mirror) return;
+    mirror.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+    mirror.focus({ preventScroll: true });
+    setFocusTarget(null);
+  }, [focusTarget, projections]);
 
   return (
     <>
@@ -252,6 +310,44 @@ export function ObserverView({
             <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
               点会话加入镜像，最多同屏 {OBSERVER_MAX_MIRRORS} 个；满了会替换最早的一个。
             </div>
+            {sessions.length > 0 && (
+              <section
+                aria-label="待你输入队列"
+                style={{ marginTop: 10, padding: 10, border: '1px solid var(--border)', borderRadius: 8 }}
+              >
+                <div className="row wrap" style={{ justifyContent: 'space-between' }}>
+                  <strong style={{ fontSize: 12 }}>待你输入 / 决定 · {waitingSessions.length}</strong>
+                  <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>只用于导航</span>
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+                  机器字段只说明本轮已经结束；不会自动交接，也不会改变任务、审批或成功状态。
+                </div>
+                {visibleWaitingSessions.length > 0 ? (
+                  <div className="row wrap" style={{ marginTop: 7 }}>
+                    {visibleWaitingSessions.map((session) => (
+                      <button
+                        key={session.sessionId}
+                        onClick={() => void focusFromQueue(session.sessionId)}
+                        title={`${session.sessionId}\n结束依据：${session.completion.evidence.join('；')}`}
+                      >
+                        {vendorLabel(session.vendor)} / {compactLabel(session.label)}
+                        {watching.includes(session.sessionId) ? ' · 镜像中' : ''}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
+                    暂无机器字段显示本轮结束的会话。
+                  </div>
+                )}
+                {(omittedWaitingSessions > 0 || unknownCompletionCount > 0) && (
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
+                    {omittedWaitingSessions > 0 ? `更早的 ${omittedWaitingSessions} 个待决定会话未在队列展开。` : ''}
+                    {unknownCompletionCount > 0 ? `另有 ${unknownCompletionCount} 个会话结束状态未知。` : ''}
+                  </div>
+                )}
+              </section>
+            )}
             {sessions.length === 0 ? (
               <div className="empty" style={{ marginTop: 8 }}>
                 该目录下没有发现本机代理会话日志。
@@ -288,7 +384,8 @@ export function ObserverView({
                               {mirrored ? '　镜像中' : ''}
                             </div>
                             <div className="meta">
-                              {sourceLabel(s.source)} · {relativeTime(s.updatedAt)} · {(s.sizeBytes / 1024).toFixed(0)}KB
+                              {sourceLabel(s.source)} · {completionLabel(s)} · {relativeTime(s.updatedAt)} ·{' '}
+                              {(s.sizeBytes / 1024).toFixed(0)}KB
                             </div>
                           </button>
                         );
@@ -316,18 +413,25 @@ export function ObserverView({
             const projection = projections[sessionId];
             const vendor = projection?.vendor ?? sessions.find((s) => s.sessionId === sessionId)?.vendor;
             return (
-              <Card
+              <div
                 key={sessionId}
-                title={`会话镜像 · ${vendor ? vendorLabel(vendor) : ''} ${labelOf(sessionId).slice(0, 12)}`}
-                hint={
-                  projection
-                    ? projection.active
-                      ? '活跃（启发式，仅导航提示）'
-                      : `最后更新 ${relativeTime(projection.fileUpdatedAt)}`
-                    : '读取中…'
-                }
-                right={<button onClick={() => void unwatchOne(sessionId)}>关闭镜像</button>}
+                ref={(node) => {
+                  if (node) mirrorRefs.current.set(sessionId, node);
+                  else mirrorRefs.current.delete(sessionId);
+                }}
+                tabIndex={-1}
               >
+                <Card
+                  title={`会话镜像 · ${vendor ? vendorLabel(vendor) : ''} ${compactLabel(labelOf(sessionId))}`}
+                  hint={
+                    projection
+                      ? projection.active
+                        ? '活跃（启发式，仅导航提示）'
+                        : `最后更新 ${relativeTime(projection.fileUpdatedAt)}`
+                      : '读取中…'
+                  }
+                  right={<button onClick={() => void unwatchOne(sessionId)}>关闭镜像</button>}
+                >
                 {!projection ? (
                   <div className="empty">正在读取该会话的日志…</div>
                 ) : projection.status === 'FORMAT_UNKNOWN' ? (
@@ -418,7 +522,8 @@ export function ObserverView({
                     )}
                   </div>
                 )}
-              </Card>
+                </Card>
+              </div>
             );
           })}
         </div>

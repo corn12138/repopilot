@@ -25,7 +25,7 @@ import claudeBaselineRaw from './claude-journal.shape.json';
 import codexBaselineRaw from './codex-rollout.shape.json';
 
 /**
- * 观察面板与人工交接的 Main 侧服务（PRD-WKB-002/003 的产品种子实现）。
+ * 观察面板、等待队列与人工交接的 Main 侧服务（PRD-WKB-002/003/004 的产品种子实现）。
  *
  * 定位按 TD-DEC-022：读点在体验侧（Main），产出全部 volatile、不落任何持久化、
  * 从不经过 Core。信任边界四条（DEC-020）在实现层的着落：
@@ -39,6 +39,7 @@ import codexBaselineRaw from './codex-rollout.shape.json';
  * FORMAT_UNKNOWN，正文清空只留计数与违规明细 —— 错读比不读更糟。与字段快照基线的出入
  * 只进 driftNotes 提示（ASM-027 的基线归纳不配当运行时判据，2026-09-05 实测）。
  * 镜像槽最多 OBSERVER_MAX_MIRRORS 个（Map 插入序 = 槽位序），满了顶掉最早的。
+ * 列表层只读有限尾部生成完成态；状态仅作导航，且按 size/mtime 缓存，避免 3 秒轮询重读。
  * 授权与监视都只活在内存里：应用重启即消失，重新观察需要重新授权。
  * 这不是偷懒 —— 授权持久化的粒度/保留是 Q-027 未决问题，未决就不落盘。
  */
@@ -62,6 +63,8 @@ const MAX_LINE_TEXT = 600;
 const MAX_BREAKING_REPORTED = 8;
 const MAX_PROVENANCE_RECORDS = 80;
 const MAX_PROVENANCE_BYTES = 512_000;
+/** 列表轮询只需末尾状态，不为每个未展开会话读取完整 4MB 投影窗口。 */
+const MAX_COMPLETION_BYTES = 512_000;
 const MAX_HANDOFF_LINES = 16;
 /** mtime 距今小于该值 → 徽标显示「活跃」。启发式，仅导航（PRD-WKB-004） */
 const ACTIVE_WINDOW_MS = 20_000;
@@ -91,6 +94,14 @@ interface WatchState {
   readonly sessionId: string;
   lastSize: number;
   lastMtimeMs: number;
+}
+
+interface SessionInspection {
+  readonly sizeBytes: number;
+  readonly mtimeMs: number;
+  readonly source: ObserverSessionSource;
+  readonly sourceEvidence: readonly string[];
+  readonly completion: ObserverCompletion;
 }
 
 function isPlainRecord(v: unknown): v is Record<string, unknown> {
@@ -203,6 +214,24 @@ function advanceCompletion(
     return { state: 'RUNNING', evidence: [`response_item=${String(payload.type)}`] };
   }
   return current;
+}
+
+function completionFromLines(
+  vendor: JournalVendor,
+  lines: readonly string[],
+): ObserverCompletion {
+  let completion: ObserverCompletion = { state: 'UNKNOWN', evidence: ['有限尾部没有发现机器结束字段'] };
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/^\uFEFF/, '').trim();
+    if (!line) continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (isPlainRecord(parsed)) completion = advanceCompletion(vendor, parsed, completion);
+    } catch {
+      // 队列只采用完整 JSON 机器字段；坏行不会被猜成运行中或待输入。
+    }
+  }
+  return completion;
 }
 
 /** 控制字符剥离 + 长度封顶。Renderer 按纯文本渲染，这里是纵深的第二道 */
@@ -322,29 +351,32 @@ export function consumedContractViolations(
   return out;
 }
 
-/** 有界读取：超上限只保留尾部，丢掉第一个（可能不完整的）行，字节数如实上报 */
-function readTailLines(path: string): { lines: readonly string[]; headBytesSkipped: number } | null {
+/** 有界读取：超上限只保留尾部，丢掉第一个（可能不完整的）行，字节数如实上报。 */
+function readTailLines(
+  path: string,
+  maxBytes = MAX_READ_BYTES,
+): { lines: readonly string[]; headBytesSkipped: number } | null {
   let stat;
   try {
     stat = lstatSync(path);
   } catch {
     return null;
   }
-  if (stat.size <= MAX_READ_BYTES) {
+  if (stat.size <= maxBytes) {
     const lines = readJournalLines(path);
     return lines === null ? null : { lines, headBytesSkipped: 0 };
   }
   try {
     const fd = openSync(path, 'r');
     try {
-      const buf = Buffer.alloc(MAX_READ_BYTES);
-      const read = readSync(fd, buf, 0, MAX_READ_BYTES, stat.size - MAX_READ_BYTES);
+      const buf = Buffer.alloc(maxBytes);
+      const read = readSync(fd, buf, 0, maxBytes, stat.size - maxBytes);
       const text = buf.subarray(0, read).toString('utf8');
       const firstNewline = text.indexOf('\n');
       const usable = firstNewline >= 0 ? text.slice(firstNewline + 1) : '';
       return {
         lines: usable.split('\n'),
-        headBytesSkipped: stat.size - MAX_READ_BYTES + (firstNewline >= 0 ? firstNewline + 1 : usable.length),
+        headBytesSkipped: stat.size - maxBytes + (firstNewline >= 0 ? firstNewline + 1 : usable.length),
       };
     } finally {
       closeSync(fd);
@@ -364,6 +396,8 @@ export class ObserverService {
   private grantedPath: string | null = null;
   private grantedDisplay: string | null = null;
   private sessions = new Map<string, SessionRecord>();
+  /** 列表每 3 秒刷新；文件未变时复用有限元数据，避免反复读取所有会话尾部。 */
+  private inspections = new Map<string, SessionInspection>();
   /** 镜像槽：插入序即槽位序（先选的在左） */
   private watches = new Map<string, WatchState>();
 
@@ -419,6 +453,7 @@ export class ObserverService {
     this.grantedDisplay = null;
     this.sessions = new Map();
     this.watches = new Map();
+    this.inspections = new Map();
     if (emitState) this.emit({ kind: 'observer.state', state: this.status() });
   }
 
@@ -650,15 +685,35 @@ export class ObserverService {
       }
       const base = basename(path);
       const sessionId = `${vendor}:${relative(scanRoot, path)}`;
-      const provenance = sessionSourceFromRecords(vendor, readHeadRecords(path));
+      const cached = this.inspections.get(path);
+      const inspection =
+        cached && cached.sizeBytes === stat.size && cached.mtimeMs === stat.mtimeMs
+          ? cached
+          : (() => {
+              const provenance = sessionSourceFromRecords(vendor, readHeadRecords(path));
+              const tail = readTailLines(path, MAX_COMPLETION_BYTES);
+              const nextInspection: SessionInspection = {
+                sizeBytes: stat.size,
+                mtimeMs: stat.mtimeMs,
+                source: provenance.source,
+                sourceEvidence: provenance.evidence,
+                completion:
+                  tail === null
+                    ? { state: 'UNKNOWN', evidence: ['会话尾部读取失败'] }
+                    : completionFromLines(vendor, tail.lines),
+              };
+              this.inspections.set(path, nextInspection);
+              return nextInspection;
+            })();
       return {
         sessionId,
         vendor,
         label: base.replace(/\.jsonl$/, ''),
         updatedAt: new Date(stat.mtimeMs).toISOString(),
         sizeBytes: stat.size,
-        source: provenance.source,
-        sourceEvidence: provenance.evidence,
+        source: inspection.source,
+        sourceEvidence: inspection.sourceEvidence,
+        completion: inspection.completion,
         path,
       };
     };
@@ -705,6 +760,10 @@ export class ObserverService {
       }
     }
     this.sessions = next;
+    const retainedPaths = new Set([...next.values()].map((session) => session.path));
+    for (const path of this.inspections.keys()) {
+      if (!retainedPaths.has(path)) this.inspections.delete(path);
+    }
     if (pruned) this.emit({ kind: 'observer.state', state: this.status() });
 
     const sessions = [...next.values()]

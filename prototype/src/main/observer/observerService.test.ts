@@ -138,6 +138,41 @@ describe('授权与会话发现', () => {
     });
     expect(sessions.find((s) => s.label === 'claude-conflict')?.sourceEvidence).toContain('来源字段互相冲突');
   });
+
+  it('列表用有限尾部给出导航完成态；文件变化后缓存失效，后续 user 会把待输入降回运行中', () => {
+    writeClaudeSession(
+      'claude-ready.jsonl',
+      [j({ type: 'assistant', entrypoint: 'claude-desktop', message: { content: 'done', stop_reason: 'end_turn' } })],
+      1_000,
+    );
+    writeCodexRollout(
+      'rollout-ready.jsonl',
+      PROJECT,
+      [j({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: 'done' } })],
+      { originator: 'Codex Desktop', source: 'vscode' },
+    );
+
+    let sessions = service.enable(PROJECT, PROJECT).sessions;
+    expect(sessions.find((s) => s.label === 'claude-ready')?.completion).toEqual({
+      state: 'READY_TO_HANDOFF',
+      evidence: ['message.stop_reason=end_turn'],
+    });
+    expect(sessions.find((s) => s.label === 'rollout-ready')?.completion.state).toBe('READY_TO_HANDOFF');
+
+    writeClaudeSession(
+      'claude-ready.jsonl',
+      [
+        j({ type: 'assistant', entrypoint: 'claude-desktop', message: { content: 'done', stop_reason: 'end_turn' } }),
+        j({ type: 'user', message: { content: '再看一下' } }),
+      ],
+      2_000,
+    );
+    sessions = service.listSessions().sessions;
+    expect(sessions.find((s) => s.label === 'claude-ready')?.completion).toEqual({
+      state: 'RUNNING',
+      evidence: ['最后一个意图记录为 user'],
+    });
+  });
 });
 
 describe('监视与投影', () => {
