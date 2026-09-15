@@ -144,12 +144,22 @@ export async function runObserverSelftest(
       await capture(webContents, opts.captureDir, '03-observer-granted.png', passes);
 
       if (listed.sessions.length > 0) {
-        // 各家点一个：有两家就是"甲乙同屏对照"，只有一家就单镜像
+        /*
+         * 运行时取证优先选 Desktop 会话，否则“各家一个”可能实际拍成 Claude Desktop + Codex CLI，
+         * 无法证明 opt-in 的 Desktop 观察链。某家没有 Desktop 样本时再回退到该厂商任一会话。
+         */
+        const selectedSessions = (['CLAUDE_JOURNAL', 'CODEX_ROLLOUT'] as const).flatMap((vendor) => {
+          const candidates = listed.sessions.filter((session) => session.vendor === vendor);
+          const selected =
+            candidates.find((session) => session.source === 'DESKTOP_LOCAL_AGENT') ?? candidates[0];
+          return selected ? [selected] : [];
+        });
+        const selectedIds = selectedSessions.map((session) => session.sessionId);
         const picked = await js<number>(`(() => {
           const buttons = [...document.querySelectorAll('button')];
           let n = 0;
-          for (const vendor of ['CLAUDE_JOURNAL', 'CODEX_ROLLOUT']) {
-            const b = buttons.find(x => (x.title || '').startsWith(vendor + ':'));
+          for (const sessionId of ${JSON.stringify(selectedIds)}) {
+            const b = buttons.find(x => (x.title || '').startsWith(sessionId));
             if (b) { b.click(); n += 1; }
           }
           return n;
@@ -164,7 +174,17 @@ export async function runObserverSelftest(
           const summaries = await js<string[]>(
             `[...document.body.innerText.matchAll(/记录 \\d+[^\\n]*/g)].map(m => m[0])`,
           );
-          passes.push(`点选 ${picked} 个会话后投影到达并渲染（${summaries.length} 个镜像）：${summaries.join(' ｜ ')}`);
+          const selectedSources = selectedSessions
+            .map(
+              (session) =>
+                `${session.vendor === 'CLAUDE_JOURNAL' ? 'Claude' : 'Codex'} ${
+                  session.source === 'DESKTOP_LOCAL_AGENT' ? 'Desktop' : session.source
+                }`,
+            )
+            .join(' + ');
+          passes.push(
+            `点选 ${picked} 个会话（${selectedSources}）后投影到达并渲染（${summaries.length} 个镜像）：${summaries.join(' ｜ ')}`,
+          );
           // 截图要拍到断言所指的东西：把镜像区滚进视口，别让"文字过了、画面没有"再发生
           await js<void>(`(() => { const grid = document.querySelector('[aria-label="会话镜像"]'); if (grid) grid.scrollIntoView({ block: 'start' }); })()`);
         } else {
