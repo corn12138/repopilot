@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import type { MutationBlockReason, MutationOperation, MutationPlan, MutationResult } from '@shared/domain';
 import { newId } from '@shared/ids';
 import { applyMutationPlan, type MutationPolicy } from '../mutation';
-import { MaterializedWorkspace, PathViolation, isGeneratedPath } from '../workspace';
+import { MaterializedWorkspace, PathViolation } from '../workspace';
 import type { CandidateTreeSeal } from './author';
 
 /**
@@ -21,7 +21,7 @@ import type { CandidateTreeSeal } from './author';
  *   - ADDED    → CREATE_FILE（引擎会证明 ABSENT，已存在即 TARGET_EXISTS）。
  *   - DELETED  → **整个 candidate 拒绝**。删除是 P0 hard deny（DEC-012），
  *     不把删除降级成"留一个空文件"——那是撒谎。
- *   - 命令产物路径（dist/、coverage/ 等，见 isGeneratedPath）跳过但**报数**。
+ *   - 未导入、未显式编辑的约定输出路径跳过并报数；已有源码与锁文件保留。
  *   - 非 UTF-8 文件 → 整个 candidate 拒绝（原型 mutation 合同只有文本 operation）。
  *
  * 任何拒绝都发生在 applyMutationPlan **之前或之内**，主线零写入。
@@ -80,7 +80,7 @@ export function normalizeCandidate(
   const ops: MutationOperation[] = [];
 
   for (const change of seal.changes) {
-    if (isGeneratedPath(change.path)) {
+    if (ws.isGeneratedOutputPath(change.path)) {
       skippedGenerated.push(change.path);
       continue;
     }

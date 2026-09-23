@@ -136,7 +136,6 @@ import { compareVerification, runVerification, type CommandApprovalChecker } fro
 import {
   MaterializedWorkspace,
   fileDigestAt,
-  isGeneratedPath,
   listTree,
   resolveManaged,
 } from './workspace';
@@ -4025,8 +4024,9 @@ export class RunAuthority {
       ? new Map(listTree(baselineRoot).map((f) => [f.path, f.digest]))
       : null;
 
+    const workspace = runId === null ? null : this.runs.get(runId)?.workspace;
     const entries: FileTreeEntry[] = listTree(root)
-      .filter((f) => !isGeneratedPath(f.path))
+      .filter((f) => !workspace?.isGeneratedOutputPath(f.path))
       .map((f) => ({
         path: f.path,
         bytes: f.bytes,

@@ -322,26 +322,15 @@ function toWireMessages(m: ModelMessage): WireMessage[] {
   return out;
 }
 
-/*
- * `length` 必须先于内容推断判断。
- *
- * 下面那个短路有正当理由：部分 OpenAI 兼容端真的发了 tool_calls 却把 finish_reason 写成
- * `stop`，只信 reason 会把"要调工具"漏报成"话说完了"（adapters.test.ts 钉着这一条）。
- * 但同一个短路顺手把 `length` 也吃掉了 —— 截断的响应里只要凑巧解析出一个完整 tool call，
- * 就被报成 TOOL_USE，截断从停止原因里彻底消失。Anthropic 侧没有这个短路，同一物理事件
- * 如实报 MAX_TOKENS，于是只看 stopReason 的门禁在 OpenAI 这条 wire 上是瞎的。
- *
- * 两个方向的代价不对称：漏报 `stop` 只是少派一次工具，漏报 `length` 会让平台把半截输出
- * 当成模型的完整意图去执行。所以截断优先。
- */
+// 内容推断仅兼容已知的 stop + tool_calls；未知、缺失或截断的结束原因不能证明意图完整。
+// 保留解析出的工具供上层回填“未执行”，但不能因此把停止原因升级为可执行。
 function mapStop(reason: string | undefined, content: readonly ContentBlock[]): StopReason {
   if (reason === 'length') return 'MAX_TOKENS';
-  if (content.some((b) => b.type === 'tool_use')) return 'TOOL_USE';
   switch (reason) {
     case 'tool_calls':
       return 'TOOL_USE';
     case 'stop':
-      return 'END_TURN';
+      return content.some((b) => b.type === 'tool_use') ? 'TOOL_USE' : 'END_TURN';
     default:
       return 'OTHER';
   }

@@ -1,13 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { isGeneratedFile, isNoiseFile, isTestFile } from './classify';
 
-/**
- * 文件分类的判据与护栏。核心原则（对照 Claude mods/diff/classify，但用途相反）：
- *   - isGeneratedFile 用于**硬排除出补丁**，所以宁可漏判（多纳入 authored、可见）也不能误判
- *     （把用户真实改动静默挪进 excludedGeneratedFiles）；
- *   - 目录用整段匹配，`dist` 段任意深度都算构建产物，但 `dist-helper.ts` / `distribution/` 不算；
- *   - 偏离 Claude 的三处（不含 vendored 目录、不含 `.d.ts`、不含 `.snap`）都要有负向断言钉住。
- */
+// 展示分类可以折叠文件，交付完整性由 workspace/patch 的来源与字节断言守住。
 describe('isGeneratedFile', () => {
     it.each([
         // 顶层与 monorepo 嵌套的构建产物目录段（任意深度）
@@ -48,7 +42,7 @@ describe('isGeneratedFile', () => {
         ['src/dist-helper.ts', false],
         ['src/app.ts', false],
         ['src/output-format.ts', false],
-        // 偏离 Claude 之一：vendored 目录不硬排除（可能手工维护）
+        // 偏离 Claude 之一：vendored 目录不折叠（可能手工维护）
         ['vendor/lib/handwritten.ts', false],
         ['third_party/foo/bar.cc', false],
         ['src/external/foo.ts', false],
@@ -56,10 +50,10 @@ describe('isGeneratedFile', () => {
         // 偏离 Claude 之二：.d.ts 是源码（TS-first，手写 ambient 声明）
         ['types/global.d.ts', false],
         ['src/vite-env.d.ts', false],
-        // 偏离 Claude 之三：.snap 归测试，不做 generated 硬排除
+        // 偏离 Claude 之三：.snap 归测试，不做 generated 分类
         ['src/__snapshots__/a.snap', false],
         ['', false],
-    ])('护栏 %s → %s（必须 authored）', (path, expected) => {
+    ])('护栏 %s → %s（不作生成物折叠）', (path, expected) => {
         expect(isGeneratedFile(path)).toBe(expected);
     });
 });

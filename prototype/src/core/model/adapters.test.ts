@@ -599,6 +599,20 @@ describe('openAiWireAdapter: 响应解析', () => {
     });
   });
 
+  it.each([undefined, 'unknown_reason', 'content_filter'])('结束原因 %s 即使包含完整工具也保持 OTHER', async (reason) => {
+    stubFetchJson({ choices: [{
+      message: { content: null, tool_calls: [{
+        id: 'c1', function: { name: 'fs_read', arguments: '{"path":"a.ts"}' },
+      }] },
+      finish_reason: reason,
+    }] });
+    const response = await openAiWireAdapter.call(req, ctx());
+    expect(response.stopReason).toBe('OTHER');
+    expect(response.content).toContainEqual({
+      type: 'tool_use', id: 'c1', name: 'fs_read', input: { path: 'a.ts' },
+    });
+  });
+
   it('畸形 arguments 不 fallback 成 {}，而是原样上报 __malformed_arguments__', async () => {
     stubFetchJson({
       choices: [

@@ -587,6 +587,26 @@ async function createBrowsingRun(imported: ImportedFixture): Promise<RunView> {
  * 这些用例故意使用存在且内容兼容的快照与路径，避免 NOT_FOUND 偶然掩盖串线。
  */
 describe('authority e2e：文件读取 owner 与 generation 合同', () => {
+  it('快照和工作区文件树均保留已导入的锁文件与输出目录源码', async () => {
+    const repo = makeFixtureRepo();
+    // output 可被快照导入，但属于工作区约定输出路径；dist 则在导入层已排除。
+    mkdirSync(join(repo, 'output'));
+    writeFileSync(join(repo, 'output/maintained.js'), 'export const n = 1;\n');
+    writeFileSync(join(repo, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n');
+    execFileSync('git', ['add', 'output/maintained.js', 'pnpm-lock.yaml'], { cwd: repo });
+    const imported = await registerAndImport(repo);
+    const snapshot = await harness.call<ResponsePayload<'files.tree'>>('files.tree', {
+      snapshotId: imported.snapshotId,
+    });
+    const run = await createBrowsingRun(imported);
+    const workspace = await harness.call<ResponsePayload<'files.tree'>>('files.tree', {
+      snapshotId: imported.snapshotId, runId: run.runId,
+    });
+    for (const tree of [snapshot, workspace]) {
+      expect(tree.entries.map((file) => file.path)).toEqual(expect.arrayContaining(['output/maintained.js', 'pnpm-lock.yaml']));
+    }
+  });
+
   it('快照 null generation 与 Run 当前 generation 均返回可核对的 source/generation', async () => {
     const repo = makeFixtureRepo();
     const imported = await registerAndImport(repo);
@@ -2065,4 +2085,18 @@ describe('模型发起的 run_command 留下完整终局，而不是一个布尔
     expect(reads.length).toBeGreaterThan(0);
     for (const r of reads) expect(r.commandResult ?? null).toBeNull();
   });
+});
+
+
+it('审核实际 HTTP 请求包含 submit_review 的出站契约', async () => {
+  harness.script(IMPL, [() => planCall(), () => readApp(), mutateApp("export const STATUS = 'fixed';\n"), () => oaText('done')]);
+  harness.script(REVIEWER, [() => oaToolCall('submit_review', { verdict: 'PASS', findings: [] })]);
+  const {runId} = await harness.createRun({hostPath: makeFixtureRepo(), reviewerModelProfileId: 'profile_moonshot-cn', allowedPaths: ['src/**']});
+  await harness.approvePlan(runId);
+  await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+  const reviewCall = vi.mocked(fetch).mock.calls.find(([url]) => new URL(String(url)).host === REVIEWER);
+  expect(reviewCall).toBeDefined();
+  const body = JSON.parse(String(reviewCall?.[1]?.body));
+  const names = body.tools.map((tool: {function: {name: string}}) => tool.function.name);
+  expect(names).toContain('submit_review');
 });

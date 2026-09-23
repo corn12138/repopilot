@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
@@ -47,7 +47,7 @@ vi.mock('./paths', async () => {
 });
 
 import { applyMutationPlan } from './mutation';
-import { sealPatch } from './patch';
+import { applyPatchWithGit, sealPatch } from './patch';
 import { importSnapshot } from './repo';
 import { MaterializedWorkspace } from './workspace';
 import { PATHS, ensureDataRoot } from './paths';
@@ -632,5 +632,83 @@ describe('子包坐标系', () => {
     ]);
     expect(patch.unifiedDiff).not.toContain('apps/web');
     expect(patch.unifiedDiff).not.toContain(host);
+  });
+});
+
+// 验收交付字节，不把分类函数的预期值当作补丁完整性的证据。
+describe('交付完整性：展示分类不丢弃修改', () => {
+  it.each(['package-lock.json', 'packages/web/pnpm-lock.yaml', 'api/types.generated.ts'])('%s 的合法修改进入补丁并应用为相同字节', (path) => {
+    const before = 'version: before\n';
+    const after = 'version: after\n';
+    const { ws, runId, baseSha } = open({ [path]: before, 'src/app.ts': 'export {};\n' });
+    mutate(ws, runId, [{ kind: 'REPLACE_WHOLE_FILE', path, newText: after }]);
+    const patch = sealPatch(ws, runId, 'att', baseSha, null, null, []);
+    expect(patch.files.map((file) => file.path)).toEqual([path]);
+    expect(patch.excludedGeneratedFiles).toEqual([]);
+    const host = hosts.at(-1)!;
+    expect(readFileSync(join(host, path), 'utf8')).toBe(before);
+    expect(applyPatchWithGit(host, '', patch.unifiedDiff, join(PATHS.artifacts, 'delivery.diff'), [path]).ok).toBe(true);
+    expect(readFileSync(join(host, path))).toEqual(readFileSync(join(ws.activePath, path)));
+  });
+
+  it.each(['dist/intentional.ts', './dist/intentional.ts', 'dist//intentional.ts', 'dist/./intentional.ts'])('显式 CREATE_FILE %s 即使命中输出目录也不能从交付删除', (path) => {
+    const { ws, runId, baseSha } = open({ 'src/app.ts': 'export {};\n' });
+    mutate(ws, runId, [{ kind: 'CREATE_FILE', path, newText: 'export const x = 1;\n' }]);
+    writeIntoActive(ws, 'dist/bundle.js', 'build output');
+    const patch = sealPatch(ws, runId, 'att', baseSha, null, null, []);
+    expect(patch.files.map((file) => file.path)).toEqual(['dist/intentional.ts']);
+    expect(patch.excludedGeneratedFiles).toEqual(['dist/bundle.js']);
+  });
+
+  it('基线中的生成形状文件被命令删除时仍有可审查的删除记录', () => {
+    const { ws, runId, baseSha } = open({ 'api/types.generated.ts': 'export type X = string;\n' });
+    const staged = ws.stage();
+    expect(ws.commit(staged.generation, 0)).toBe(true);
+    rmSync(join(ws.activePath, 'api/types.generated.ts'));
+    const patch = sealPatch(ws, runId, 'att', baseSha, null, null, []);
+    expect(patch.files).toMatchObject([{ path: 'api/types.generated.ts', changeKind: 'DELETED' }]);
+    expect(patch.unifiedDiff).toContain('+++ /dev/null');
+  });
+
+  it('源文件与锁文件一起修改时，交付两份修改且宿主最终字节一致', () => {
+    const { ws, runId, baseSha } = open({ 'src/app.ts': 'export const n = 1;\n', 'pnpm-lock.yaml': 'version: 1\n' });
+    mutate(ws, runId, [
+      { kind: 'REPLACE_WHOLE_FILE', path: 'src/app.ts', newText: 'export const n = 2;\n' },
+      { kind: 'REPLACE_WHOLE_FILE', path: 'pnpm-lock.yaml', newText: 'version: 2\n' },
+    ]);
+    const patch = sealPatch(ws, runId, 'att', baseSha, null, null, []);
+    const paths = ['pnpm-lock.yaml', 'src/app.ts'];
+    expect(patch.files.map((file) => file.path)).toEqual(paths);
+    const host = hosts.at(-1)!;
+    expect(applyPatchWithGit(host, '', patch.unifiedDiff, join(PATHS.artifacts, 'mixed.diff'), paths).ok).toBe(true);
+    for (const path of paths) expect(readFileSync(join(host, path))).toEqual(readFileSync(join(ws.activePath, path)));
+  });
+
+  it('基线验证生成后又被删除的输出必须进入排除清单', () => {
+    const { ws, runId, baseSha } = open({ 'src/app.ts': 'export {};\n' });
+    // gen-0 可运行基线构建；它新增的产物不属于最初导入的仓库文件。
+    writeIntoActive(ws, 'dist/bundle.js', 'baseline build');
+    const staged = ws.stage();
+    expect(ws.commit(staged.generation, 0)).toBe(true);
+    rmSync(join(ws.activePath, 'dist/bundle.js'));
+    const patch = sealPatch(ws, runId, 'att', baseSha, null, null, []);
+    expect(patch.files).toEqual([]);
+    expect(patch.excludedGeneratedFiles).toEqual(['dist/bundle.js']);
+  });
+
+  it('失败事务既不写文件，也不把未提交的输出路径登记为显式修改', () => {
+    const { ws, runId } = open({ 'src/app.ts': 'export {};\n' });
+    const before = ws.treeDigest();
+    const result = applyMutationPlan(ws, {
+      planId: 'rejected', runId, inputGeneration: 0,
+      operations: [
+        { kind: 'CREATE_FILE', path: 'dist/intentional.ts', newText: 'export {};\n' },
+        { kind: 'CREATE_FILE', path: 'src/app.ts', newText: 'collision' },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    expect(ws.treeDigest()).toBe(before);
+    expect(ws.activeGeneration).toBe(0);
+    expect(ws.isGeneratedOutputPath('dist/intentional.ts')).toBe(true);
   });
 });

@@ -13,7 +13,7 @@ import {
   symlinkSync,
 } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
-import { isGeneratedFile } from './classify';
+import { isBuildOutputPath } from './classify';
 import { snapshotDir, workspaceDir } from './paths';
 
 const RECEIPT_TTL_MS = 15 * 60 * 1000;
@@ -33,6 +33,8 @@ const RECEIPT_TTL_MS = 15 * 60 * 1000;
 export class MaterializedWorkspace {
   private active = 0;
   private readonly receipts = new Map<string, MutationReadReceipt>();
+  private sourcePaths = new Set<string>();
+  private readonly authoredByGeneration = new Map<number, ReadonlySet<string>>();
 
   private constructor(
     readonly runId: string,
@@ -52,6 +54,8 @@ export class MaterializedWorkspace {
     mkdirSync(root, { recursive: true });
     const ws = new MaterializedWorkspace(runId, snapshotId, root, hostRepoPath);
     cloneTree(snapshotDir(snapshotId), ws.generationPath(0));
+    // gen-0 之后可能运行基线构建；来源只取导入快照，不能把构建产物误认成原有源码。
+    ws.sourcePaths = new Set(listTree(ws.activePath).map((file) => file.path));
     ws.linkDependencies(ws.generationPath(0));
     return ws;
   }
@@ -166,12 +170,17 @@ export class MaterializedWorkspace {
   }
 
   /** compare-and-swap：只有 active 仍等于 expected 才切换 */
-  commit(stagedGeneration: number, expectedActive: number): boolean {
+  commit(stagedGeneration: number, expectedActive: number, authoredPaths: readonly string[] = []): boolean {
     if (this.active !== expectedActive) return false;
     if (stagedGeneration !== expectedActive + 1) return false;
     // 代号算术对不代表目录还在：stage() → discard(n) → commit(n) 之前会把
     // active 切到一个已被删掉的目录，此后所有读写都在不存在的路径上
     if (!existsSync(this.generationPath(stagedGeneration))) return false;
+    // mutation 允许 ./ 或重复分隔符；来源键必须与 listTree 的实际相对路径一致。
+    const canonicalPaths = authoredPaths.map((path) => relative(this.activePath, resolve(this.activePath, path)));
+    this.authoredByGeneration.set(stagedGeneration, new Set([
+      ...(this.authoredByGeneration.get(expectedActive) ?? []), ...canonicalPaths,
+    ]));
     this.active = stagedGeneration;
     // 切代后此前的 receipt 全部作废：它们绑定的是旧 generation
     this.receipts.clear();
@@ -212,6 +221,8 @@ export class MaterializedWorkspace {
       // commit 的三个失败条件在单线程 Core 里都不该出现；出现即为内部不变式违规
       throw new Error(`恢复 gen-${sourceGen} 时 CAS 提交失败（active=${this.active}）`);
     }
+    // 恢复内容也恢复该代的编辑来源；被回滚的显式编辑不能影响未来产物分类。
+    this.authoredByGeneration.set(next, new Set(this.authoredByGeneration.get(sourceGen) ?? []));
     return { generation: next };
   }
 
@@ -221,11 +232,8 @@ export class MaterializedWorkspace {
   }
 
   /**
-   * 基线到当前代的差异，按"人写的"和"命令生成的"分开。
-   *
-   * 分开是必要的：验证命令（vite build / tsc）会在工作区里产出 dist、缓存等文件，
-   * 它们不是 Agent 的修改意图，不应进入 PatchArtifact。但也**不能静默丢掉** ——
-   * 生成文件的数量和路径会随补丁一起展示（PRD-DIFF-001：任何省略都要说明）。
+   * 交付保留导入文件与显式 mutation；仅排除其余约定输出目录中的文件。
+   * 排除的新增、修改、删除都报数，文件名像生成物本身不能成为漏交付的依据。
    */
   changedVsBaseline(): { authored: string[]; generated: string[]; deleted: string[] } {
     const base = listTree(this.generationPath(0));
@@ -238,18 +246,25 @@ export class MaterializedWorkspace {
 
     for (const f of now) {
       if (baseMap.get(f.path) === f.digest) continue;
-      (isGeneratedPath(f.path) ? generated : authored).push(f.path);
+      (this.isGeneratedOutputPath(f.path) ? generated : authored).push(f.path);
     }
     // 只遍历"当前存在"的文件会让被删掉的文件在补丁里彻底消失且无任何说明 ——
     // 那正是本文件和 patch.ts 都声明过不允许的"静默省略"
     for (const f of base) {
-      if (!nowSet.has(f.path) && !isGeneratedPath(f.path)) deleted.push(f.path);
+      if (!nowSet.has(f.path)) (this.isGeneratedOutputPath(f.path) ? generated : deleted).push(f.path);
     }
     return { authored: authored.sort(), generated: generated.sort(), deleted: deleted.sort() };
   }
 
   changedFilesVsBaseline(): string[] {
     return this.changedVsBaseline().authored;
+  }
+
+  /** 只有未导入、未显式编辑的约定输出路径才可排除；不是展示用的噪声分类。 */
+  isGeneratedOutputPath(path: string): boolean {
+    return isGeneratedPath(path)
+      && !this.sourcePaths.has(path)
+      && !this.authoredByGeneration.get(this.active)?.has(path);
   }
 
   /**
@@ -345,15 +360,9 @@ export function resolveManaged(root: string, relPath: string): string {
   return abs;
 }
 
-/**
- * 是否为构建产物 / 生成代码 / lockfile —— 这类**硬排除**出补丁正文（进 `excludedGeneratedFiles` 报数）。
- *
- * 判据在 `classify.ts`：目录整段匹配（任意深度，含 monorepo 嵌套 `packages/foo/dist/`）∪ lockfile
- * 精确文件名 ∪ 压缩/打包后缀 ∪ 生成代码文件名形状。刻意比 Claude 保守（不含 vendored 目录、
- * 不含 `.d.ts`、不含 `.snap`），因为这里是硬排除、误判即静默丢用户代码 —— 详见 classify.ts 文件头。
- */
+/** 约定输出目录候选；交付还须由工作区校验导入和显式编辑来源。 */
 export function isGeneratedPath(relPath: string): boolean {
-  return isGeneratedFile(relPath);
+  return isBuildOutputPath(relPath);
 }
 
 export class PathViolation extends Error {

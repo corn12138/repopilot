@@ -129,6 +129,36 @@ describe('exportCandidate / discardCandidate', () => {
 });
 
 describe('normalize：翻译规则', () => {
+  it('外部作者的锁文件和生成形状源码不按文件名跳过', () => {
+    const candidate = workspace.exportCandidate();
+    writeFileSync(join(candidate.path, 'pnpm-lock.yaml'), 'version: 2\n');
+    writeFileSync(join(candidate.path, 'src/types.generated.ts'), 'export type X = number;\n');
+    const result = applyCandidate(workspace, sealOf(candidate), candidate.path, runId, policy);
+    expect(result.kind).toBe('APPLIED');
+    expect(workspace.changedVsBaseline()).toEqual({
+      authored: ['pnpm-lock.yaml', 'src/types.generated.ts'], generated: [], deleted: [],
+    });
+  });
+
+  it.each(['modify', 'delete'])('外部作者 %s 已显式创建的输出路径不能静默跳过', (action) => {
+    expect(applyMutationPlan(workspace, {
+      planId: 'explicit', runId, inputGeneration: 0,
+      operations: [{ kind: 'CREATE_FILE', path: 'dist/intentional.ts', newText: 'before\n' }],
+    }, policy).ok).toBe(true);
+    const before = fingerprint();
+    const candidate = workspace.exportCandidate();
+    if (action === 'delete') unlinkSync(join(candidate.path, 'dist/intentional.ts'));
+    else writeFileSync(join(candidate.path, 'dist/intentional.ts'), 'after\n');
+    const result = applyCandidate(workspace, sealOf(candidate), candidate.path, runId, policy);
+    if (action === 'delete') {
+      expect(result).toMatchObject({ kind: 'REJECTED', reason: 'DELETE_NOT_EXPRESSIBLE' });
+      expect(fingerprint()).toBe(before);
+    } else {
+      expect(result.kind).toBe('APPLIED');
+      expect(readFileSync(join(workspace.activePath, 'dist/intentional.ts'), 'utf8')).toBe('after\n');
+    }
+  });
+
   it('MODIFIED → REPLACE_WHOLE_FILE + receipt；ADDED → CREATE_FILE；产物路径跳过但报数', () => {
     const c = workspace.exportCandidate();
     writeFileSync(join(c.path, 'src/app.ts'), 'export const total = 2;\n');

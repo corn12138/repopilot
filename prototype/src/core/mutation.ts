@@ -129,7 +129,7 @@ export function applyMutationPlan(
   }
 
   // ---- 阶段 3：CAS 提交 ----
-  if (!ws.commit(staged.generation, expectedActive)) {
+  if (!ws.commit(staged.generation, expectedActive, results.map((result) => result.path))) {
     ws.discard(staged.generation);
     return blocked(
       'STALE_GENERATION',

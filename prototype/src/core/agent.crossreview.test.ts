@@ -63,6 +63,9 @@ import {
   type ModelInvoker,
 } from './agent';
 import { EgressBlocked } from './model/gateway';
+import { anthropicAdapter } from './model/anthropic';
+import { openAiWireAdapter } from './model/openai-compatible';
+import { chatCompletionResponse } from './model/chatSse.testkit';
 import type { ContentBlock, ModelResponse } from './model/types';
 import { findWireViolation } from './model/types';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
@@ -286,9 +289,26 @@ beforeEach(() => {
   writeFileSync(join(dir, 'src/app.ts'), 'const a=2\n', 'utf8');
 });
 
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.unstubAllGlobals();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 describe('runReviewPass', () => {
+  it('审核请求声明只读工具和结构化提交工具，不能只靠替身凭空返回工具名', async () => {
+    const host = new ReviewHost();
+    const scripted = new ScriptedReviewer(() => toolUse('submit_review', { verdict: 'PASS', findings: [] }));
+    const requests: string[][] = [];
+    const gateway: ModelInvoker = { invoke: async (input) => {
+      requests.push(input.request.tools.map((tool) => tool.name).sort());
+      return scripted.invoke(input);
+    } };
+    await runReviewPass(makeDeps(gateway, host), {
+      reviewerResolution: RESOLUTION, patch: PATCH, finalVerification: VERIFICATION, round: 1,
+    });
+    expect(requests).toEqual([['fs_glob', 'fs_grep', 'fs_list', 'fs_read', 'submit_review']]);
+  });
+
   it('审核方直接提交发现 → 映射成 CrossReviewRound，fingerprint 由平台计算', async () => {
     const host = new ReviewHost();
     const gateway = new ScriptedReviewer(() =>
@@ -1105,5 +1125,72 @@ describe('审核响应被截断：结论不算结论', () => {
     expect(out.stopReason).toBe('REVIEWER_PASSED');
     expect(out.rounds).toHaveLength(1);
     expect(out.rounds[0]!.verdict).toBe('PASS');
+  });
+});
+
+// 走实际 SSE adapter；供应商替身只返回请求已声明的工具，防止测试凭空补上协议能力。
+describe.each(['anthropic', 'openai'] as const)('审核出站与回填：%s wire', (wire) => {
+  it.each(['VALID', 'MALFORMED', 'MAX_TOKENS', 'OTHER'] as const)('%s 提交保持 schema、只读与响应完整性边界', async (mode) => {
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const tools = body.tools as Array<{ name?: string; input_schema?: unknown; function?: { name: string; parameters: unknown } }>;
+      const names = tools.map((tool) => wire === 'anthropic' ? tool.name : tool.function?.name);
+      expect(names.sort()).toEqual(['fs_glob', 'fs_grep', 'fs_list', 'fs_read', 'submit_review']);
+      const submission = tools.find((tool) => (tool.name ?? tool.function?.name) === 'submit_review')!;
+      expect(wire === 'anthropic' ? submission.input_schema : submission.function?.parameters).toMatchObject({
+        type: 'object', required: ['verdict', 'findings'],
+        properties: {
+          verdict: { enum: ['PASS', 'CHANGES_REQUESTED', 'INCONCLUSIVE'] },
+          findings: { items: { required: ['severity', 'confidence', 'evidence', 'blocking'], properties: {
+            confidence: { minimum: 0, maximum: 1 }, evidence: { minLength: 1 }, startLine: { minimum: 1 },
+          } } },
+        },
+      });
+      const first = bodies.length === 1;
+      const malformed = first && mode === 'MALFORMED';
+      const incomplete = first && (mode === 'MAX_TOKENS' || mode === 'OTHER');
+      const calls = [
+        { id: `review_${bodies.length}`, name: 'submit_review', input: malformed
+          ? { verdict: 'PASS', findings: [{ severity: 'HIGH', confidence: 2, evidence: '', blocking: true }] }
+          : { verdict: first ? 'PASS' : 'CHANGES_REQUESTED', findings: [] } },
+        ...(incomplete ? [{ id: 'unexecuted_read', name: 'fs_read', input: { path: 'src/app.ts' } }] : []),
+      ];
+      if (wire === 'openai') {
+        return chatCompletionResponse({ choices: [{ message: { tool_calls: calls.map((call) => ({
+          id: call.id, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.input) },
+        })) }, finish_reason: incomplete ? mode === 'MAX_TOKENS' ? 'length' : 'unrecognized_reason' : 'tool_calls' }] });
+      }
+      const frames: unknown[] = [{ type: 'message_start', message: { usage: { input_tokens: 10 } } }];
+      calls.forEach((call, index) => frames.push(
+        { type: 'content_block_start', index, content_block: { type: 'tool_use', id: call.id, name: call.name } },
+        { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(call.input) } },
+        { type: 'content_block_stop', index },
+      ));
+      frames.push({ type: 'message_delta', delta: { stop_reason: incomplete
+        ? mode === 'MAX_TOKENS' ? 'max_tokens' : 'unrecognized_reason' : 'tool_use' }, usage: { output_tokens: 5 } },
+      { type: 'message_stop' });
+      return new Response(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(''), {
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    }));
+    const host = new ReviewHost();
+    const scripted = new ScriptedReviewer(() => toolUse('submit_review', { verdict: 'PASS', findings: [] }));
+    const gateway: ModelInvoker = { invoke: async (input) => {
+      const envelope = await scripted.invoke(input);
+      const adapter = wire === 'anthropic' ? anthropicAdapter : openAiWireAdapter;
+      const response = await adapter.stream(input.request, {
+        apiKey: 'fixture-key', modelId: 'fixture-model', baseUrl: 'https://example.invalid/v1', signal: input.signal,
+      }, () => {});
+      return { ...envelope, response };
+    } };
+    const round = await runReviewPass(makeDeps(gateway, host), {
+      reviewerResolution: RESOLUTION, patch: PATCH, finalVerification: VERIFICATION, round: 1,
+    });
+    expect(bodies).toHaveLength(mode === 'VALID' ? 1 : 2);
+    expect(round.verdict).toBe(mode === 'VALID' ? 'PASS' : 'CHANGES_REQUESTED');
+    expect(host.toolCalls).toEqual([]);
+    if (mode !== 'VALID') expect(JSON.stringify(bodies[1]!.messages)).toContain(mode === 'MALFORMED' ? 'schema 校验失败' : '未执行');
   });
 });

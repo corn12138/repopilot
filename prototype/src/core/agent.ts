@@ -1120,6 +1120,46 @@ const reviewSchema = z.object({
   resolvedFindingFingerprints: z.array(z.string().min(1)).optional().default([]),
 });
 
+const submitReview: ToolDefinition<typeof reviewSchema> = {
+  name: 'submit_review',
+  risk: 'R0',
+  description: '提交结构化审核结论与发现；PASS 仅表示审核意见，不批准补丁或决定任务成功。',
+  schema: reviewSchema,
+  jsonSchema: {
+    type: 'object',
+    properties: {
+      verdict: { type: 'string', enum: ['PASS', 'CHANGES_REQUESTED', 'INCONCLUSIVE'] },
+      findings: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            severity: { type: 'string', enum: ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'] },
+            confidence: { type: 'number', minimum: 0, maximum: 1 },
+            file: { type: ['string', 'null'] },
+            startLine: { type: ['integer', 'null'], minimum: 1 },
+            endLine: { type: ['integer', 'null'], minimum: 1 },
+            evidence: { type: 'string', minLength: 1 },
+            reproduction: { type: ['string', 'null'] },
+            suggestedRemediation: { type: ['string', 'null'] },
+            blocking: { type: 'boolean' },
+          },
+          required: ['severity', 'confidence', 'evidence', 'blocking'],
+          additionalProperties: false,
+        },
+      },
+      resolvedFindingFingerprints: { type: 'array', items: { type: 'string', minLength: 1 } },
+    },
+    required: ['verdict', 'findings'],
+    additionalProperties: false,
+  },
+  summarize: (submission) => `提交审核：${submission.verdict}`,
+  async execute() {
+    // 提交必须经过 runReviewPass 的完整性与 schema 门禁，不能通过通用工具分发接受。
+    throw new Error('submit_review must be handled by runReviewPass');
+  },
+};
+
 export interface ReviewPassInput {
   readonly reviewerResolution: ModelRouteResolution;
   readonly patch: PatchArtifact;
@@ -1146,7 +1186,7 @@ export async function runReviewPass(
 ): Promise<CrossReviewRound> {
   const startedAt = nowIso();
   const { host } = deps;
-  const reviewTools = TOOLS.filter((t) => t.risk === 'R0'); // 只读子集
+  const reviewTools = [...TOOLS.filter((t) => t.risk === 'R0'), submitReview];
   const system = reviewSystemPrompt(deps);
 
   const conversation: ModelMessage[] = [

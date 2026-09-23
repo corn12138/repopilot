@@ -702,8 +702,7 @@ describe('isGeneratedPath', () => {
     ['.turbo/log.txt', true],
     ['.next/static/x.js', true],
     ['node_modules/react/index.js', true],
-    // 名为 dist/build 的目录段在任意深度都是构建产物（含 monorepo 嵌套）——
-    // 整段匹配而非子串；仍逐条进 excludedGeneratedFiles 报数，不构成静默省略（不变式 8）
+    // 目录段只识别输出候选；实际是否排除还取决于导入和 mutation 来源。
     ['src/dist/bundle.js', true],
     ['packages/foo/dist/bundle.js', true],
     ['apps/web/build/main.js', true],
@@ -794,6 +793,35 @@ describe('宿主 node_modules 的只读复用', () => {
 });
 
 describe('工作区生命周期', () => {
+  it('导入的输出目录文件无论修改或删除都保留在交付中', () => {
+    const ws = newWorkspace({ 'dist/a.js': 'a', 'build/b.js': 'b' });
+    advanceGeneration(ws);
+    writeRaw(ws.activePath, 'dist/a.js', 'edited');
+    rmSync(join(ws.activePath, 'build/b.js'));
+    expect(ws.changedVsBaseline()).toEqual({ authored: ['dist/a.js'], generated: [], deleted: ['build/b.js'] });
+  });
+
+  it('恢复历史代时同时恢复显式编辑来源，丢弃后续代来源', () => {
+    const ws = newWorkspace();
+    const first = ws.stage();
+    writeRaw(first.path, 'dist/keep.ts', 'keep');
+    expect(ws.commit(first.generation, 0, ['dist/keep.ts'])).toBe(true);
+    const second = ws.stage();
+    writeRaw(second.path, 'dist/drop.ts', 'drop');
+    expect(ws.commit(second.generation, 1, ['dist/drop.ts'])).toBe(true);
+    ws.restoreGeneration(1);
+    writeRaw(ws.activePath, 'dist/drop.ts', 'rebuilt');
+    expect(ws.changedVsBaseline()).toEqual({ authored: ['dist/keep.ts'], generated: ['dist/drop.ts'], deleted: [] });
+  });
+
+  it('CAS 失败不登记显式编辑来源', () => {
+    const ws = newWorkspace();
+    const stage = ws.stage();
+    expect(ws.commit(stage.generation, 1, ['dist/not-committed.ts'])).toBe(false);
+    expect(ws.isGeneratedOutputPath('dist/not-committed.ts')).toBe(true);
+    expect(ws.activeGeneration).toBe(0);
+  });
+
   it('create 会清掉同名 runId 的残留目录（重跑不继承上一次的垃圾）', () => {
     const ws = newWorkspace();
     writeRaw(ws.activePath, 'garbage.ts', '上一轮留下的');
