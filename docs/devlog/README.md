@@ -235,3 +235,9 @@ YYYY-MM-DD-NN-短标题.md
 | [01](2026-09-18-01-把谁在等你答话做成一等状态.md) | 把「谁在等你答话」做成一等状态 | herdr 式 agent 状态 working/blocked/idle/done · 独立于连接态 · turn.waiting · 跨项目只读 summary · N pane 导航 · Codex never-approve 不产 blocked（负向钉住） · blocked 只呈现不代答 · 不读屏不 GUI 自动化 · 非 agent→agent 编排 |
 | [02](2026-09-18-02-分类用途不同护栏方向相反.md) | 同一套分类，用途不同，护栏方向就相反 | isGeneratedPath 顶层锚定→整段匹配 · monorepo 嵌套 dist · lockfile/minified/pb.go · Claude 折叠展示 vs RepoPilot 硬排除 · 不纳入 vendored/.d.ts/.snap · src/dist/bundle.js 有意识翻转 · 排除仍报数 |
 | [03](2026-09-18-03-引入AI协议先问它站在哪一边.md) | 引入 AI 协议，先问它站在哪一边 | 接协议先问它靠什么算完成 · A2A 自述 vs ACP 客户端有否决权 · MCP 撞唯一执行门仍拒 · Codex app-server 本就是方言 ACP · acpWire 纯翻译层不代答不落盘 · default 折成成功=说谎 · 思考原文不外泄 |
+
+### 2026-09-22
+
+| 篇 | 主题 | 关键词 |
+|---|---|---|
+| [01](2026-09-22-01-审核契约和补丁交付必须可验证.md) | 审核契约和补丁交付必须可验证 | submit_review 实际出站 · 双 wire 完整性 · 展示与交付分离 · generation 来源 · 锁文件应用字节 · 失败零写入 |

@@ -19,9 +19,11 @@
   但升格不追认任何技术决策：ADR 仍按真实状态逐份决议，种子里的取舍
   （如 node_modules 宿主 symlink）仍是记录在案的残余风险，不是推荐做法。
 
+9/22 复审确认审核计数、未结算恢复、整改即时计数、迟到会话快照和启动中断仍有缺口，尚未关闭。首批修复与验证边界见 [开发记录](../docs/devlog/2026-09-22-01-审核契约和补丁交付必须可验证.md)；双模型真实收发、角色交接与中断仍待验收。
+
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 83 个文件、1477 个测试通过（另有 3 个本机 probe 文件共 8 个默认跳过），其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 86 个文件、1551 个测试通过（另有 3 文件跳过，共 9 个测试默认跳过），其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -49,7 +51,8 @@
 | 修复后 `build` 真的 `EXIT_ZERO` | `agent.e2e.test.ts` |
 | 规划阶段没有产生任何 R1 副作用 | `agent.e2e.test.ts` |
 | 补丁 diff 里不含宿主绝对路径 | `agent.e2e.test.ts` |
-| `dist/` 等生成文件不进补丁，但被显式列出而非静默丢弃 | `agent.e2e.test.ts` |
+| 未导入、未显式 mutation 的约定输出路径可排除；新增、修改、删除均列出。锁文件、导入源码与显式编辑保留，真实 `git apply` 后逐字节对比 | `patch.test.ts` / `workspace.test.ts` / `external/normalize.test.ts` |
+| 审核实际 HTTP 声明 `submit_review`；两条 wire 覆盖正常、畸形、截断、未知结束原因及工具回填 | `agent.crossreview.test.ts` / `authority.e2e.test.ts` / `model/adapters.test.ts` |
 | **修复过程中宿主仓库全程 `git status` 干净** | `agent.e2e.test.ts` |
 | 补丁应用：干净场景真的改对宿主文件，且不 commit 不 stage | `apply.test.ts` |
 | 补丁应用：目标文件已漂移 → `--check` 拒绝，宿主逐字节不变 | `apply.test.ts` |

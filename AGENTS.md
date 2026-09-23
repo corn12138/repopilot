@@ -64,6 +64,7 @@
     否则截断被报成 `TOOL_USE`，这道门禁在整条 OpenAI wire 上失效。该缺陷真实存在过，成因是
     某次修 vendor bug（发了 tool_calls 却写 `finish_reason:'stop'`）时顺手过度 —— 也就是说
     它不是被恶意绕过的，是在做正确的适配工作时被无意拆掉的。
+    内容推断仅兼容已知 `stop`；缺失或未知 finish reason 即使带完整 tool call 也必须保持 `OTHER`。
 
 ## 工程诚实规则
 
@@ -91,7 +92,7 @@
 cd prototype
 pnpm install && pnpm rebuild electron   # 国内加 ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 pnpm dev        # 启动应用
-pnpm test       # 83 个文件 / 1477 个测试（3 个本机 probe 文件共 8 个默认跳过），含真实 tsc + vite build 的端到端链路
+pnpm test       # 86 个文件 / 1551 个测试通过（另有 3 文件跳过，共 9 个测试默认跳过），含真实 tsc + vite build 的端到端链路
 pnpm selftest   # 三进程 + IPC + Renderer 挂载自检；自动隔离到一次性 data root
 pnpm typecheck
 pnpm eval:spk010 --implementer <provider> --reviewer <provider> --dry-run
