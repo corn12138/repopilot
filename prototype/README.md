@@ -21,7 +21,7 @@
 
 ## 已经证明的（有机器证据）
 
-`pnpm test` — 73 个文件、1306 个测试（本机日志 probe 的 3 个默认跳过），其中 1 个是跑真实 `tsc + vite build` 的端到端链路
+`pnpm test` — 83 个文件、1477 个测试通过（另有 3 个本机 probe 文件共 8 个默认跳过），其中 1 个是跑真实 `tsc + vite build` 的端到端链路
 （`agent.e2e.test.ts`）。Renderer 测试跑在 jsdom + Testing Library 下，是真实 DOM 断言，
 不是快照比对。
 
@@ -81,6 +81,7 @@
 | **Slice H 权威层 e2e**：不带同意 → `CONSENT_REQUIRED` 不建 Run；错的 digest / 加了审核方+作者后的旧 digest → `CONSENT_STALE`；RUN_CREATED 带 egressConsent（目的地/通道/中转/数据类别/UNKNOWN）；基线 stderr 里的 AWS key 在**命令层**就被脱敏 —— 事件、请求体、外部作者简报都只见 `[REDACTED:…]`；任务描述里粘 key → task.create 直接拒绝且拒绝信息不含原文 | `authority.egress.e2e.test.ts` |
 | 外部 CLI 作者/审核方的 prompt 同样经 DLP：命中即 BLOCKED、子进程不起、原因不含原文 | `external/author.test.ts` |
 | 任务输入区：披露常驻输入框上方；不勾同意不能发；选了作者/审核方后 digest 变、同意自动作废；披露取不到显示原因且不能发 | `TaskForm.externalAuthor.test.tsx` |
+| **双 Agent 工作位与人工协作**：Claude/Codex 双栏使用独立 typed IPC；句柄按项目归属，live/replay 按 `eventSequence` 重建，duplicate/gap/旧 epoch/foreign project fail closed；手动模式在验证失败→自修复、实施→首审、发现→整改、整改→复审四个模型调用边界冻结带 digest 的交接工件。工作台展示 Core 角色、当前 2/1、Task 累计、自修复、未知用量并复用 RunDetail 动作；Authority e2e 证明未确认时下一角色零调用、派发预算落盘失败零发送、续期新 cycle、决定只消费一次、取消/晚到不能复活 | `workbenchService.test.ts` / `Workbench.test.tsx` / `collaboration/handoff.test.ts` / `authority.e2e.test.ts` / `RunDetail.test.tsx` |
 | 运行页「数据出站」面板：同意摘要 + 每次模型/CLI 出站一行，NOT_SENT 带阻断原因并列展示，token 未知不填 0 | `RunDetail.test.tsx` |
 | **Slice I-1 用户命令分级**：按可执行名 + 子命令白名单分 R1–R4；`git push/merge/reset/commit`、`npm publish`、`sudo/ssh/env/aws/kubectl` → R4，`rm/chmod/mv/dd` → R3，`install/add/ci/curl/wget/docker/未知二进制` → R2（fail-closed），只有 R1 能登记为验证命令；e2e：`git push origin main`/`rm -rf dist`/`npm install x`/`sh -c` 在 task.create 被拒且不执行、不建 Run，`node check.mjs` 照常 | `commandRisk.test.ts` / `authority.coverage.e2e.test.ts` |
 | **Slice K 一次性精确批准**：`cause` 把"已知危险"与"不认识它"分开 —— 只有 `UNKNOWN_BINARY` 可批；批准绑整条 argv（加一个参数即失效）、15 分钟 TTL、`maxBindings=1`（一张票只进一个 Run）、只对 BASELINE/VERIFICATION 生效；批准后 profile 里的 risk 仍是 R2，账本记的也是 R2；`command.classify` 只判级不签发，问多少次都不留票；`pnpm install`/`rm -rf`/`git push` 请求批准 → POLICY_DENIED 并说明下一步 | `commandRisk.test.ts` / `authority.commandApproval.e2e.test.ts` |
@@ -96,6 +97,9 @@
 | **仓库形态识别**（此前四种全是静默 fail-open）：LFS 指针按**内容**判定并排除（`.png` 下的指针归 `LFS_POINTER` 而不是 `BINARY` —— "二进制跳过了"会盖住"这个仓库用了 LFS"）；gitlink 归 `SUBMODULE` 而不是伪装成读取失败；索引有、工作区无归 `NOT_CHECKED_OUT` 而不是 `UNREADABLE`；仅大小写不同且同 inode 的整组归 `CASE_COLLISION`（不同 inode 不误伤） | `repo.test.ts` |
 | **宿主 LFS 指针的两道闸**：导入时不进快照（工作区里根本没有它）；即便补丁带同路径"新建文件"，`git apply --check` 整笔拒绝、宿主指针逐字节不变、`git status` 干净 | `apply.test.ts` |
 | 形态缺席对人对模型都说清楚：导入页每种形态一条横幅（LFS 用错误色并给 `git lfs pull`）、任务创建各发一条 NOTE、模型简报里点名"这些不在快照里，不要假设它们存在" | `repo.test.ts`（`summarizeShapes`）/ `App.tsx` / `agent.ts` |
+| **herdr 式 agent 状态**：working/blocked/idle/done 独立于连接态；waiting→BLOCKED 不清 activeRequestId、blocked 期间拒发新轮；finished COMPLETED→DONE / FAILED→ERROR / INTERRUPTED→IDLE；同项目多会话各自独立；summary 跨项目只回计数不回内容 | `workbenchService.test.ts` / `Workbench.test.tsx` |
+| **blocked 只呈现不代答 + 隔离没被放宽**：Claude 权限请求→waiting/APPROVAL（只映射不应答）；Codex never-approve+read-only 下正常轮次绝无 waiting，thread/start 隔离参数被钉住 | `claudeAdapter.test.ts` / `codexAdapter.test.ts` |
+| **文件分类整段匹配**（硬排除刻意比 Claude 保守）：monorepo 嵌套 dist/build、lockfile、minified、pb.go 归 excluded 且报数；dist-helper.ts / distribution / vendor / *.d.ts / *.snap 仍 authored | `classify.test.ts` / `workspace.test.ts` |
 
 ## 尚未证明的
 
@@ -211,7 +215,8 @@ pnpm selftest
 ```
 
 自检走**完全相同**的 Main → Core → IPC 通道，跑只读方法、造一个真实 Run、杀掉 Core
-再确认它能被读回来，最后确认 Renderer 真的挂载了（不是白屏）。
+再确认它能被读回来，最后确认 Renderer 真的挂载了（不是白屏）；同时检查 Workbench
+preload、白名单 IPC 与 Claude/Codex 双栏真实 DOM。能力探针仍不发送模型消息。
 
 它**永远不会写你的真实数据目录**：启动 Core 之前会先创建一次性 data root
 （`REPOPILOT_DATA_ROOT`），结束时无论成功、失败还是抛异常都在 `finally` 里删掉。
