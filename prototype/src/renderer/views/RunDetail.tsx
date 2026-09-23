@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
   ApprovalRequest,
+  CollaborationHandoff,
   CrossReviewRecord,
   PatchArtifact,
   PatchDecisionKind,
@@ -66,6 +67,13 @@ export function RunDetail({
   liveText?: string;
 }) {
   const [showRaw, setShowRaw] = useState(false);
+  const [handoffBusy, setHandoffBusy] = useState(false);
+  const [collaborationControlBusy, setCollaborationControlBusy] = useState(false);
+  const [handoffDetail, setHandoffDetail] = useState<{
+    handoffId: string | null;
+    data: CollaborationHandoff | null;
+    error: string | null;
+  }>({ handoffId: null, data: null, error: null });
   const active = !TERMINAL_RUN_STATUSES.includes(run.status);
 
   const crossReviewRequestsRef = useRef<LatestRequestGuard<string> | null>(null);
@@ -110,6 +118,30 @@ export function RunDetail({
   const crossReviewError =
     ownedCrossReviewState?.status === 'error' ? ownedCrossReviewState.error : null;
 
+  useEffect(() => {
+    const pending = run.pendingHandoff;
+    if (!pending || run.status !== 'AWAITING_HANDOFF') {
+      setHandoffDetail({ handoffId: null, data: null, error: null });
+      return;
+    }
+    let current = true;
+    setHandoffDetail({ handoffId: pending.handoffId, data: null, error: null });
+    void call('collaboration.getHandoff', { runId: run.runId })
+      .then(({ handoff }) => {
+        if (!current || handoff?.handoffId !== pending.handoffId || handoff.digest !== pending.digest) return;
+        setHandoffDetail({ handoffId: pending.handoffId, data: handoff, error: null });
+      })
+      .catch((error: unknown) => {
+        if (!current) return;
+        setHandoffDetail({
+          handoffId: pending.handoffId,
+          data: null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    return () => { current = false; };
+  }, [run.pendingHandoff?.handoffId, run.pendingHandoff?.digest, run.runId, run.status]);
+
   /*
    * 取消是一次有明确目标的危险动作，所以它的 busy 与失败必须留在按钮旁边，
    * 而不是只飞到页面顶部的通用错误条里 —— 长页面下用户根本看不到那里发生了什么。
@@ -133,6 +165,43 @@ export function RunDetail({
         message: err instanceof Error ? err.message : '取消请求失败',
       });
       onError(err);
+    }
+  };
+
+  const continueHandoff = async () => {
+    const handoff = run.pendingHandoff;
+    if (!handoff || handoffBusy) return;
+    setHandoffBusy(true);
+    try {
+      const result = await call('collaboration.continue', {
+        runId: run.runId,
+        handoffId: handoff.handoffId,
+        handoffDigest: handoff.digest,
+        decisionId: `decision_${Date.now().toString(36)}`,
+      });
+      if (!result.accepted) throw new Error(result.reason ?? '交接未被接受');
+      onRefresh();
+    } catch (error) {
+      onError(error);
+    } finally {
+      setHandoffBusy(false);
+    }
+  };
+
+  const updateCollaborationControl = async (input: {
+    mode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
+    stopAfterStep?: boolean;
+  }) => {
+    if (collaborationControlBusy) return;
+    setCollaborationControlBusy(true);
+    try {
+      const result = await call('collaboration.control', { runId: run.runId, ...input });
+      if (!result.accepted) throw new Error(result.reason ?? '协作控制未被接受');
+      onRefresh();
+    } catch (error) {
+      onError(error);
+    } finally {
+      setCollaborationControlBusy(false);
     }
   };
 
@@ -178,6 +247,95 @@ export function RunDetail({
           <div className="row wrap" style={{ marginBottom: 12 }}>
             <FailureClassBadge failureClass={run.failureClass} />
           </div>
+        )}
+
+        {active && run.collaborationControl && (
+          <div className="row wrap" style={{ marginBottom: 12 }}>
+            <span style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>协作方式</span>
+            <button
+              className={run.collaborationControl.mode === 'MANUAL_HANDOFF' ? 'primary' : ''}
+              disabled={collaborationControlBusy}
+              onClick={() => void updateCollaborationControl({ mode: 'MANUAL_HANDOFF' })}
+            >
+              逐步交接
+            </button>
+            <button
+              className={run.collaborationControl.mode === 'BOUNDED_AUTO' ? 'primary' : ''}
+              disabled={collaborationControlBusy}
+              onClick={() => void updateCollaborationControl({ mode: 'BOUNDED_AUTO' })}
+            >
+              有界自动
+            </button>
+            <button
+              disabled={
+                collaborationControlBusy
+                || run.collaborationControl.stopAfterStepRequested
+                || run.status === 'AWAITING_HANDOFF'
+              }
+              onClick={() => void updateCollaborationControl({ stopAfterStep: true })}
+            >
+              {run.collaborationControl.stopAfterStepRequested ? '已请求停靠' : '本步结束后暂停'}
+            </button>
+          </div>
+        )}
+
+        {run.status === 'AWAITING_HANDOFF' && run.pendingHandoff && (
+          <Banner tone="info">
+            <strong>下一步：交给{run.pendingHandoff.toRole === 'REVIEWER' ? '审核方' : '实施方'}</strong>
+            <div style={{ marginTop: 4 }}>
+              已冻结 {run.pendingHandoff.nextPhase} 工件；确认后才会启动下一次模型调用。
+            </div>
+            {handoffDetail.data && (
+              <dl className="facts" style={{ marginTop: 8 }}>
+                <dt>计划</dt>
+                <dd>revision {handoffDetail.data.plan.revision} · {handoffDetail.data.context.planSummary}</dd>
+                <dt>补丁 / 文件</dt>
+                <dd>
+                  {handoffDetail.data.patch?.patchId ?? '无补丁'} · {handoffDetail.data.changedPaths.length} 个变更路径
+                  {handoffDetail.data.changedPaths.length > 0 ? `：${handoffDetail.data.changedPaths.join(', ')}` : ''}
+                </dd>
+                <dt>验证</dt>
+                <dd>
+                  {handoffDetail.data.verificationIds.length > 0
+                    ? `${handoffDetail.data.verificationEligible ? '具备验证资格' : '不具备验证资格'} · ${handoffDetail.data.verificationIds.join(', ')}`
+                    : '没有验证记录'}
+                </dd>
+                <dt>审核问题</dt>
+                <dd>
+                  {handoffDetail.data.findings.length === 0
+                    ? '0 条'
+                    : handoffDetail.data.findings.map((finding) => `${finding.disposition}:${finding.fingerprint.slice(0, 12)}`).join('；')}
+                </dd>
+                <dt>预算</dt>
+                <dd>
+                  模型余 {handoffDetail.data.budget.modelTurnsRemaining} 轮 · 工具余 {handoffDetail.data.budget.toolCallsRemaining} 次 ·
+                  审核 {handoffDetail.data.budget.reviewerInvocations} 次 · 整改 {handoffDetail.data.budget.remediations} 次
+                </dd>
+                <dt>上下文统计</dt>
+                <dd>
+                  包含 {handoffDetail.data.counts.included} · 排除 {handoffDetail.data.counts.excluded} · 截断 {handoffDetail.data.counts.truncated}
+                  {handoffDetail.data.counts.reasons.length > 0 ? `（${handoffDetail.data.counts.reasons.join('；')}）` : ''}
+                </dd>
+                <dt>出站类别</dt>
+                <dd>{handoffDetail.data.dataClasses.join(', ') || '无'}</dd>
+              </dl>
+            )}
+            {handoffDetail.error && <div role="alert">交接工件读取失败：{handoffDetail.error}</div>}
+            {!handoffDetail.data && !handoffDetail.error && <div>正在读取完整交接工件…</div>}
+            <div className="row" style={{ marginTop: 8 }}>
+              <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                决定有效期至 {timeOf(run.pendingHandoff.expiresAt)}
+              </span>
+              <span className="spacer" />
+              <button
+                className="primary"
+                disabled={handoffBusy || handoffDetail.data?.handoffId !== run.pendingHandoff.handoffId}
+                onClick={() => void continueHandoff()}
+              >
+                {handoffBusy ? '交接中…' : '确认交接'}
+              </button>
+            </div>
+          </Banner>
         )}
 
         {run.evidence === 'DAMAGED' && (
@@ -278,6 +436,11 @@ export function RunDetail({
             canDecide={run.status === 'AWAITING_PATCH_REVIEW'}
             accepted={run.status === 'SUCCEEDED' || run.status === 'ACCEPTED_UNVERIFIED'}
             restored={run.restored}
+            unresolvedReviewFindings={
+              crossReview?.findingDispositions?.filter(
+                (finding) => finding.disposition === 'OPEN' || finding.disposition === 'REMEDIATED_PENDING_REVIEW',
+              ).length ?? 0
+            }
             salvage={
               run.status === 'FAILED' || run.status === 'BLOCKED' || run.status === 'CANCELLED'
             }
@@ -341,6 +504,7 @@ function PlanApproval({
   plan: PlanRevision;
   action: ApprovalActionController;
 }) {
+  const [revisionNote, setRevisionNote] = useState('');
   const busy = action.isPending(approval.approvalId);
   const pendingDecision = action.pending.find(
     (item) => item.approvalId === approval.approvalId,
@@ -405,6 +569,17 @@ function PlanApproval({
         </div>
       )}
 
+      <label className="field" style={{ marginTop: 12 }}>
+        <span>计划修改要求</span>
+        <textarea
+          value={revisionNote}
+          onChange={(event) => setRevisionNote(event.target.value)}
+          placeholder="例如：先补登录态负向测试，再修改按钮逻辑"
+          rows={3}
+          disabled={busy}
+        />
+      </label>
+
       <div className="row" style={{ marginTop: 14 }}>
         <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5, color: 'var(--text-tertiary)' }}>
           plan digest {plan.digest.slice(7, 27)}…
@@ -416,6 +591,12 @@ function PlanApproval({
           onClick={() => void action.decide(approval, 'REJECT')}
         >
           {pendingDecision === 'REJECT' ? '拒绝中…' : '拒绝'}
+        </button>
+        <button
+          disabled={busy || revisionNote.trim().length === 0}
+          onClick={() => void action.decide(approval, 'REVISE', revisionNote.trim())}
+        >
+          {pendingDecision === 'REVISE' ? '提交修改要求中…' : '要求修改计划'}
         </button>
         <button
           className="primary"
@@ -447,6 +628,7 @@ function PatchReview({
   accepted,
   salvage,
   restored = false,
+  unresolvedReviewFindings = 0,
   onError,
   onOpenDiff,
 }: {
@@ -455,6 +637,8 @@ function PatchReview({
   accepted: boolean;
   /** 恢复态的 Run 没有活的执行器：能接受/拒绝，但开不了新的尝试 */
   restored?: boolean;
+  /** 接受这些发现等于用户主动忽略；理由会与当前 patch digest 一起进权威记录。 */
+  unresolvedReviewFindings?: number;
   /** 失败/中止现场的挽救补丁：只能检视与导出，永远不能被接受 */
   salvage?: boolean;
   onError: (err: unknown) => void;
@@ -628,9 +812,15 @@ function PatchReview({
 
       {canDecide && (
         <>
+          {unresolvedReviewFindings > 0 && (
+            <Banner tone="warn">
+              仍有 <strong>{unresolvedReviewFindings} 条审核发现</strong>未被复审确认解决。
+              若仍接受补丁，必须填写忽略理由；Core 会把理由绑定到当前 patch digest。
+            </Banner>
+          )}
           <div className="field" style={{ marginTop: 14 }}>
-            <label>决定说明（拒绝或要求修改时建议填写）</label>
-            <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="可选" />
+            <label>决定说明{unresolvedReviewFindings > 0 ? '（接受未解决发现时必填）' : '（拒绝或要求修改时建议填写）'}</label>
+            <input value={note} onChange={(e) => setNote(e.target.value)} placeholder={unresolvedReviewFindings > 0 ? '说明为何接受这些未解决发现' : '可选'} />
           </div>
           <div className="row">
             <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
@@ -651,7 +841,11 @@ function PatchReview({
             >
               要求修改
             </button>
-            <button className="primary" disabled={busy} onClick={() => void decide('ACCEPT')}>
+            <button
+              className="primary"
+              disabled={busy || (unresolvedReviewFindings > 0 && note.trim().length === 0)}
+              onClick={() => void decide('ACCEPT')}
+            >
               接受补丁
             </button>
           </div>
@@ -837,6 +1031,7 @@ function CrossReviewContinueGate({
 
 function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
   const findings = record.rounds.flatMap((r) => r.findings);
+  const dispositions = new Map(record.findingDispositions?.map((item) => [item.fingerprint, item]) ?? []);
   const blocking = findings.filter((f) => f.blocking).length;
   const verdicts = record.rounds.map((r) => r.verdict).join(' → ') || '（无）';
   const multiRound = record.rounds.length > 1;
@@ -894,11 +1089,24 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
                 针对补丁 <code style={{ fontSize: 10.5 }}>{round.reviewedPatchDigest.slice(0, 18)}…</code>
               </div>
             )}
-            {round.findings.map((f, i) => (
+            {round.findings.map((f, i) => {
+              const disposition = dispositions.get(f.fingerprint);
+              return (
               <details key={i} className="toolcall" open={f.blocking && round.round === record.rounds.length}>
                 <summary>
                   <Badge tone={SEVERITY_TONE[f.severity]}>{f.severity}</Badge>
                   {f.blocking && <Badge tone="err">阻断</Badge>}
+                  {disposition && (
+                    <Badge tone={disposition.disposition === 'RESOLVED' ? 'ok' : disposition.disposition === 'USER_ACCEPTED' ? 'warn' : 'err'}>
+                      {disposition.disposition === 'RESOLVED'
+                        ? '已复审解决'
+                        : disposition.disposition === 'USER_ACCEPTED'
+                          ? '用户已接受风险'
+                          : disposition.disposition === 'REMEDIATED_PENDING_REVIEW'
+                            ? '整改后待复审'
+                            : '未解决'}
+                    </Badge>
+                  )}
                   <code style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
                     {f.file ?? '（无具体文件）'}
                     {f.range ? `:${f.range[0]}-${f.range[1]}` : ''}
@@ -918,9 +1126,15 @@ function CrossReviewPanel({ record }: { record: CrossReviewRecord }) {
                       建议：{f.suggestedRemediation}
                     </p>
                   )}
+                  {disposition?.disposition === 'USER_ACCEPTED' && (
+                    <p style={{ margin: '6px 0', color: 'var(--state-warning-fg)' }}>
+                      用户接受理由：{disposition.reason} · patch {disposition.patchDigest?.slice(0, 22)}…
+                    </p>
+                  )}
                 </div>
               </details>
-            ))}
+              );
+            })}
             {round.findings.length === 0 && multiRound && (
               <p style={{ color: 'var(--text-secondary)', margin: '4px 2px' }}>本轮没有发现。</p>
             )}

@@ -3,6 +3,7 @@ import type {
   CrossReviewRound,
   CrossReviewVerdict,
   CrossReviewStopReason,
+  ModelEgressManifest,
   ModelRouteResolution,
   PatchArtifact,
   PlanRevision,
@@ -37,12 +38,15 @@ import { PLANNING_TOOLS, TOOLS, TOOLS_BY_NAME, type ToolContext, type ToolDefini
 import { summarizeShapes } from './repo';
 import { compareVerification, runVerification, summarizeFailures, type CommandApprovalChecker } from './verify';
 import type { MaterializedWorkspace } from './workspace';
+import type { ModelDispatchAttempt } from './model/gateway';
 
 export interface AgentHost {
   emit(kind: RunEventKind, summary: string, payload?: Record<string, unknown>): void;
   setStatus(status: RunStatus, reason: string | null): void;
   /** 阻塞直到用户对该计划作出决定；被取消时抛出 */
-  awaitPlanApproval(plan: PlanRevision): Promise<'APPROVE' | 'REJECT'>;
+  awaitPlanApproval(plan: PlanRevision): Promise<
+    'APPROVE' | 'REJECT' | { readonly decision: 'REVISE'; readonly note: string }
+  >;
   beginToolCall(input: {
     toolName: string;
     risk: ToolRisk;
@@ -68,8 +72,10 @@ export interface AgentHost {
    * 有没有流不影响权威结果，只影响文本什么时候到界面。
    */
   streamText?(signal: StreamSignal): void;
-  /** token 传 null 表示 provider 未回报 —— 账本记"未知轮次"，绝不折算成 0 */
-  chargeModelTurn(inputTokens: number | null, outputTokens: number | null): void;
+  /** 在每次真实派发前持久化发送意图并消费一轮预算；失败必须阻止本次出站。 */
+  reserveModelTurn(attempt: ModelDispatchAttempt): void;
+  /** 为已经预留的派发补记 token；null 表示 provider 未回报，绝不折算成 0。 */
+  settleModelTurn(inputTokens: number | null, outputTokens: number | null): void;
   chargeToolCall(): void;
   chargeSelfFixRound(): void;
   budgetExceeded(): { exceeded: boolean; reason: string };
@@ -81,6 +87,13 @@ export interface AgentHost {
  * 对整条链路（规划→审批→工具→mutation→验证→封存）取机器证据。
  */
 export type ModelInvoker = Pick<ModelGateway, 'invoke'>;
+
+/** 出站前预算已经耗尽；与 provider/网络失败分开归因。 */
+export class ModelDispatchBudgetExceeded extends Error {
+  constructor(message: string, readonly modelInvocationDispatched = false) {
+    super(message);
+  }
+}
 
 /**
  * 外部作者（Codex / Claude CLI 当实现方）的编排接口。
@@ -119,6 +132,13 @@ export interface AgentDeps {
   readonly workspace: MaterializedWorkspace;
   readonly gateway: ModelInvoker;
   readonly resolution: ModelRouteResolution;
+  /** 独立规划 route；缺失保持旧任务由 implementer 规划的兼容语义。 */
+  readonly plannerResolution?: ModelRouteResolution;
+  /** 手动协作在失败验证之后、下一次实现方调用之前停靠。 */
+  readonly checkpointBeforeSelfFix?: (input: {
+    readonly round: number;
+    readonly verification: VerificationRun;
+  }) => Promise<void>;
   readonly mutationPolicy: MutationPolicy;
   readonly runId: string;
   readonly attemptId: string;
@@ -153,7 +173,14 @@ export interface AgentResult {
   readonly unverifiedItems: string[];
 }
 
-export class AgentCancelled extends Error {}
+export class AgentCancelled extends Error {
+  readonly modelInvocationDispatched: boolean;
+
+  constructor(messageOrDispatched: string | boolean = false) {
+    super(typeof messageOrDispatched === 'string' ? messageOrDispatched : 'Agent cancelled');
+    this.modelInvocationDispatched = typeof messageOrDispatched === 'boolean' && messageOrDispatched;
+  }
+}
 
 const planSchema = z.object({
   summary: z.string().min(1),
@@ -271,42 +298,72 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
 
   // ---- 1. 规划阶段：平台强制 read-only ----
   host.setStatus('PLANNING', null);
-  const conversation: ModelMessage[] = [
+  const planningConversation: ModelMessage[] = [
     {
       role: 'user',
       content: [{ type: 'text', text: buildTaskBrief(deps, baseline) }],
     },
   ];
 
-  const plan = await generatePlan(deps, conversation);
+  let plan = await generatePlan(deps, planningConversation);
   throwIfCancelled(signal);
   host.emit('PLAN_GENERATED', `计划已生成：${plan.summary}`, { plan });
 
   // ---- 2. 用户审批 ----
-  host.setStatus('AWAITING_PLAN_APPROVAL', null);
-  const decision = await host.awaitPlanApproval(plan);
-  host.emit('PLAN_DECISION', `用户${decision === 'APPROVE' ? '批准' : '拒绝'}了计划`, {
-    planId: plan.planId,
-    decision,
-  });
-  if (decision === 'REJECT') {
-    return {
-      kind: 'PLAN_REJECTED',
-      detail: '用户拒绝了计划，未产生任何副作用。',
-      baseline,
-      finalVerification: null,
-      unverifiedItems: [],
-    };
+  for (;;) {
+    host.setStatus('AWAITING_PLAN_APPROVAL', null);
+    const outcome = await host.awaitPlanApproval(plan);
+    const decision = typeof outcome === 'string' ? outcome : outcome.decision;
+    host.emit(
+      'PLAN_DECISION',
+      `用户${decision === 'APPROVE' ? '批准' : decision === 'REVISE' ? '要求修改' : '拒绝'}了计划`,
+      {
+        planId: plan.planId,
+        revision: plan.revision,
+        decision,
+        ...(typeof outcome === 'string' ? {} : { note: outcome.note }),
+      },
+    );
+    if (decision === 'REJECT') {
+      return {
+        kind: 'PLAN_REJECTED',
+        detail: '用户拒绝了计划，未产生任何副作用。',
+        baseline,
+        finalVerification: null,
+        unverifiedItems: [],
+      };
+    }
+    if (decision === 'APPROVE') break;
+
+    const revisionNote = typeof outcome === 'string' ? '' : outcome.note.trim();
+    pushUser(planningConversation, [{
+      type: 'text',
+      text: `用户要求修改上一版计划（revision ${plan.revision}）：${revisionNote}\n请重新检查并调用 submit_plan 提交修订版。`,
+    }]);
+    const previous = plan;
+    host.setStatus('PLANNING', `正在按用户说明修订计划 revision ${previous.revision}`);
+    plan = await generatePlan(deps, planningConversation, previous);
+    throwIfCancelled(signal);
+    host.emit('PLAN_GENERATED', `计划已修订为 revision ${plan.revision}：${plan.summary}`, {
+      plan,
+      parentPlanId: previous.planId,
+    });
   }
 
   // ---- 3. 执行 + 有界自修复 ----
   host.setStatus('EXECUTING', null);
+  /*
+   * 规划方的聊天、探索结果和 receipt 都属于它的只读执行上下文。实施方从一份
+   * 新会话开始，只接收用户批准的计划与任务事实；否则角色虽然换了 route，
+   * 写者仍能直接复用规划方的读取授权，角色隔离只是界面标签。
+   */
+  const executionConversation: ModelMessage[] = [];
   if (!deps.externalAuthor) {
-    // 规划期末尾刚回填过 tool_result（也是 user），必须合并而不是新起一条 —— 见 pushUser
-    pushUser(conversation, [
+    pushUser(executionConversation, [
       {
         type: 'text',
         text:
+          `${buildTaskBrief(deps, baseline)}\n\n` +
           `用户已批准以下计划，现在开始执行。\n\n${renderPlan(plan)}\n\n` +
           `执行规则：\n` +
           `- 修改现有文件前必须先用 fs_read 取得 receiptId。\n` +
@@ -341,7 +398,7 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
     phase: 'IMPLEMENT' | 'SELF_FIX',
     failureSummary: string | null,
   ): Promise<{ end: ExecutionEnd } | { stop: AgentResult }> => {
-    if (!deps.externalAuthor) return { end: await executionTurns(deps, conversation) };
+    if (!deps.externalAuthor) return { end: await executionTurns(deps, executionConversation) };
     const outcome = await deps.externalAuthor({
       phase,
       brief: renderExternalAuthorBrief(deps, plan, baseline, failureSummary),
@@ -473,14 +530,17 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
       };
     }
 
-    round += 1;
+    const nextRound = round + 1;
+    await deps.checkpointBeforeSelfFix?.({ round: nextRound, verification: finalVerification });
+    throwIfCancelled(signal);
+    round = nextRound;
     host.chargeSelfFixRound();
     // 验证跑完、要回去改代码了 —— 相位得跟着回到执行，否则会一直停在"验证中"
     host.setStatus('EXECUTING', `第 ${round}/${maxRounds} 轮自修复`);
     host.emit('SELF_FIX_ROUND', `进入第 ${round}/${maxRounds} 轮自修复`, { round });
     if (!deps.externalAuthor) {
       // 上一轮若以 BUDGET_EXHAUSTED 提前返回，末尾可能仍是 user —— 用 pushUser 合并
-      pushUser(conversation, [
+      pushUser(executionConversation, [
         {
           type: 'text',
           text:
@@ -514,7 +574,11 @@ export async function runAgent(deps: AgentDeps): Promise<AgentResult> {
 // 规划
 // ---------------------------------------------------------------------------
 
-async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Promise<PlanRevision> {
+async function generatePlan(
+  deps: AgentDeps,
+  conversation: ModelMessage[],
+  previous: PlanRevision | null = null,
+): Promise<PlanRevision> {
   const { host } = deps;
   const tools = [...PLANNING_TOOLS, submitPlan as unknown as ToolDefinition];
   /*
@@ -567,12 +631,23 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
       pushUser(conversation, [{ type: 'text', text: finalPlanTurnDirective(maxPlanTurns) }]);
     }
 
-    const response = await callModel(
-      deps,
-      conversation,
-      isFinalTurn ? [submitPlan as unknown as ToolDefinition] : tools,
-      'PLANNING',
-    );
+    let invocation: Awaited<ReturnType<typeof callModel>>;
+    try {
+      invocation = await callModel(
+        deps,
+        conversation,
+        isFinalTurn ? [submitPlan as unknown as ToolDefinition] : tools,
+        'PLANNING',
+        deps.plannerResolution,
+      );
+    } catch (error) {
+      if (error instanceof ModelDispatchBudgetExceeded) {
+        emitPlanningDigest(host, { turns: turnsRun, calls, spokenTurns });
+        throw new PlanningFailed(`预算耗尽：${error.message}`);
+      }
+      throw error;
+    }
+    const { response } = invocation;
     const uses = toolUsesOf(response.content);
     turnsRun += 1;
     // 规划期模型的思考同样进时间线：之前这一段被原样吞掉，用户只看得见最后那份计划
@@ -623,8 +698,8 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
      * 本轮 submit_plan 解析出的计划。
      *
      * 拿到之后**不能立刻 return** —— 必须先把本轮全部 tool_use 的 tool_result 写回历史。
-     * 这个 conversation 会被执行阶段继续复用，一条带 tool_use 却没有对应 tool_result 的
-     * assistant 消息会让 Anthropic 与 OpenAI 兼容端都以 400 拒绝整个请求。
+     * 同一规划会话的下一轮仍要求每个 tool_use 都有 tool_result；不能因为已经拿到
+     * 结构化计划，就留下一个会被两家 wire 拒绝的孤儿调用。
      */
     let submitted: PlanRevision | null = null;
 
@@ -657,18 +732,23 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
           toolNames: ['fs_read', 'workspace_mutate', 'run_command'],
           expectedEffect: s.expectedEffect,
         }));
+        const revision = (previous?.revision ?? 0) + 1;
+        const parentPlanId = previous?.planId ?? null;
         const core = {
           runId: deps.runId,
           snapshotId: deps.snapshot.snapshotId,
+          revision,
+          parentPlanId,
           summary: parsed.data.summary,
           steps,
           risks: parsed.data.risks,
+          verificationCommandIds: deps.task.verificationCommandIds,
         };
         submitted = {
           planId: newId('plan'),
           runId: deps.runId,
-          revision: 1,
-          parentPlanId: null,
+          revision,
+          parentPlanId,
           snapshotId: deps.snapshot.snapshotId,
           summary: parsed.data.summary,
           steps,
@@ -676,9 +756,9 @@ async function generatePlan(deps: AgentDeps, conversation: ModelMessage[]): Prom
           verificationCommandIds: deps.task.verificationCommandIds,
           digest: digestOf(core),
           generatedBy: {
-            invocationId: newId('inv'),
+            invocationId: invocation.invocationId,
             purpose: 'PLANNING',
-            resolutionId: deps.resolution.resolutionId,
+            resolutionId: invocation.manifest.resolutionId,
           },
           createdAt: nowIso(),
         };
@@ -1019,15 +1099,25 @@ export function normalizeFindings(
 export function parseExternalSubmission(
   verdict: CrossReviewVerdict,
   rawFindings: readonly Record<string, unknown>[],
-): { verdict: CrossReviewVerdict; findings: ReviewFinding[] } | null {
-  const parsed = reviewSchema.safeParse({ verdict, findings: rawFindings });
+  resolvedFindingFingerprints: readonly string[] = [],
+): {
+  verdict: CrossReviewVerdict;
+  findings: ReviewFinding[];
+  resolvedFindingFingerprints: readonly string[];
+} | null {
+  const parsed = reviewSchema.safeParse({ verdict, findings: rawFindings, resolvedFindingFingerprints });
   if (!parsed.success) return null;
-  return { verdict: parsed.data.verdict, findings: normalizeFindings(parsed.data.findings) };
+  return {
+    verdict: parsed.data.verdict,
+    findings: normalizeFindings(parsed.data.findings),
+    resolvedFindingFingerprints: parsed.data.resolvedFindingFingerprints,
+  };
 }
 
 const reviewSchema = z.object({
   verdict: z.enum(['PASS', 'CHANGES_REQUESTED', 'INCONCLUSIVE']),
   findings: z.array(reviewFindingSchema),
+  resolvedFindingFingerprints: z.array(z.string().min(1)).optional().default([]),
 });
 
 export interface ReviewPassInput {
@@ -1036,6 +1126,7 @@ export interface ReviewPassInput {
   readonly finalVerification: VerificationRun | null;
   /** 第几次 reviewer invocation（1-based），用于日志与记录 */
   readonly round: number;
+  readonly priorFindings?: readonly ReviewFinding[];
 }
 
 /**
@@ -1061,14 +1152,17 @@ export async function runReviewPass(
   const conversation: ModelMessage[] = [
     {
       role: 'user',
-      content: [{ type: 'text', text: renderReviewBrief(deps.task, input.patch, input.finalVerification) }],
+      content: [{
+        type: 'text',
+        text: renderReviewBrief(deps.task, input.patch, input.finalVerification, input.priorFindings ?? []),
+      }],
     },
   ];
 
   const maxReviewTurns = 8;
   for (let turn = 0; turn < maxReviewTurns; turn += 1) {
     throwIfCancelled(deps.signal);
-    const response = await callModel(
+    const { response } = await callModel(
       deps,
       conversation,
       reviewTools,
@@ -1186,6 +1280,7 @@ export async function runReviewPass(
         reviewerResolutionId: input.reviewerResolution.resolutionId,
         verdict: submitted.verdict,
         findings,
+        resolvedFindingFingerprints: submitted.resolvedFindingFingerprints,
         startedAt,
         finishedAt: nowIso(),
       };
@@ -1220,6 +1315,7 @@ export function renderReviewBrief(
   task: TaskSpec,
   patch: PatchArtifact,
   verification: VerificationRun | null,
+  priorFindings: readonly ReviewFinding[] = [],
 ): string {
   const verifyLine = verification
     ? `验证结果：${verification.passed ? '通过' : '未通过'}（${verification.commands.map((c) => `${c.commandId}=${c.outcome}`).join(' ')}）`
@@ -1246,10 +1342,15 @@ ${patch.unifiedDiff.slice(0, 24_000)}
 \`\`\`
 ${patch.unifiedDiff.length > 24_000 ? '（diff 过长已截断，可用 fs_read 读取完整文件核对）' : ''}
 
+${priorFindings.length > 0
+  ? `上一轮待复核问题：\n${priorFindings.map((finding) => `- ${finding.fingerprint}：${finding.evidence}`).join('\n')}\n复审时，只有你逐项确认已解决的问题才能把 fingerprint 放进 resolvedFindingFingerprints；没有再提及不等于已解决。`
+  : ''}
+
 请核对：正确性、是否真的满足验收、有没有范围蔓延、安全与边界、以及验证覆盖不到的地方。
 需要时用只读工具读取补丁后的文件。核对完调用 submit_review 提交：
 - verdict：PASS（无阻断发现）/ CHANGES_REQUESTED（有阻断发现）/ INCONCLUSIVE（信息不足下结论）
 - findings：每条给 severity/confidence/file/range/evidence/blocking，尽量给 reproduction 与 suggestedRemediation。
+- resolvedFindingFingerprints：复审时逐项列出已确认修复的上一轮 finding 指纹；首审传空数组。
 不要臆造发现；没有阻断问题就如实 PASS。`;
 }
 
@@ -1374,6 +1475,7 @@ export type ReviewPassRunner = (input: {
   readonly patch: PatchArtifact;
   readonly finalVerification: VerificationRun | null;
   readonly round: number;
+  readonly priorFindings?: readonly ReviewFinding[];
 }) => Promise<CrossReviewRound>;
 
 export interface CrossReviewCycleInput {
@@ -1381,6 +1483,8 @@ export interface CrossReviewCycleInput {
   readonly review: ReviewPassRunner;
   readonly patch: PatchArtifact;
   readonly finalVerification: VerificationRun | null;
+  /** 上一循环仍未关闭的发现；续期首审必须逐项复核。 */
+  readonly priorFindings?: readonly ReviewFinding[];
 }
 
 /**
@@ -1397,10 +1501,20 @@ export interface CrossReviewCycleHooks {
   readonly adoptPatch: (patch: PatchArtifact) => void;
   /** 把工作区内容恢复到进入循环时的那一代（整改失败/中断时保证补丁与工作区一致） */
   readonly restoreWorkspace: () => void;
+  readonly checkpoint?: (input: {
+    phase: 'REMEDIATE' | 'SECOND_REVIEW';
+    patch: PatchArtifact;
+    findings: readonly ReviewFinding[];
+    reviewerInvocations: number;
+    remediations: number;
+    reviewId: string;
+  }) => Promise<void>;
 }
 
 export interface CrossReviewCycleOutcome {
   readonly rounds: readonly CrossReviewRound[];
+  /** 已进入派发的审核调用数；失败/取消/未知也占用，预检拒绝不占用。 */
+  readonly reviewerInvocations: number;
   readonly remediations: number;
   readonly stopReason: CrossReviewStopReason;
 }
@@ -1453,9 +1567,11 @@ export async function runCrossReviewCycle(
 ): Promise<CrossReviewCycleOutcome> {
   const { host } = deps;
   const rounds: CrossReviewRound[] = [];
+  let reviewerInvocations = 0;
   let remediations = 0;
   const done = (stopReason: CrossReviewStopReason): CrossReviewCycleOutcome => ({
     rounds: [...rounds],
+    reviewerInvocations,
     remediations,
     stopReason,
   });
@@ -1467,14 +1583,51 @@ export async function runCrossReviewCycle(
       patch: input.patch,
       finalVerification: input.finalVerification,
       round: 1,
+      priorFindings: input.priorFindings ?? [],
     });
+    reviewerInvocations += 1;
   } catch (err) {
+    if (reviewAttemptWasDispatched(err)) reviewerInvocations += 1;
     return done(mapReviewFailure(err, host, deps.signal));
   }
   rounds.push(round1);
+  const priorFindingFingerprints = new Set(
+    (input.priorFindings ?? []).map((finding) => finding.fingerprint),
+  );
+  const repeatedPriorFingerprints = new Set(
+    round1.findings
+      .filter((finding) => priorFindingFingerprints.has(finding.fingerprint))
+      .map((finding) => finding.fingerprint),
+  );
+  const explicitlyResolvedPrior = new Set(round1.resolvedFindingFingerprints ?? []);
+  const unconfirmedPrior = (input.priorFindings ?? []).filter(
+    (finding) =>
+      !repeatedPriorFingerprints.has(finding.fingerprint) &&
+      !explicitlyResolvedPrior.has(finding.fingerprint),
+  );
+  if (unconfirmedPrior.length > 0) {
+    host.emit(
+      'NOTE',
+      `续期首审未逐项确认 ${unconfirmedPrior.length} 条既有问题，保持待复核并转人工`,
+      { unconfirmedFindingFingerprints: unconfirmedPrior.map((finding) => finding.fingerprint) },
+    );
+    return done('REVIEWER_INCONCLUSIVE');
+  }
   const blocking1 = round1.findings.filter((f) => f.blocking);
   const outcome1 = verdictOutcome(round1, blocking1);
   if (outcome1 !== 'REMEDIATE') return done(outcome1);
+  try {
+    await hooks.checkpoint?.({
+      phase: 'REMEDIATE',
+      patch: input.patch,
+      findings: blocking1,
+      reviewerInvocations,
+      remediations,
+      reviewId: round1.reviewId ?? `${round1.cycleId ?? 'legacy'}:review:${round1.round}`,
+    });
+  } catch (err) {
+    return done(mapCheckpointFailure(err, host, deps.signal));
+  }
 
   // ---- 整改（1/1）----
   if (remediations >= CROSS_REVIEW_LIMITS.maxRemediations) return done('COUNTER_EXHAUSTED');
@@ -1544,9 +1697,21 @@ export async function runCrossReviewCycle(
     return done('NO_DELTA');
   }
   hooks.adoptPatch(resealed);
+  try {
+    await hooks.checkpoint?.({
+      phase: 'SECOND_REVIEW',
+      patch: resealed,
+      findings: blocking1,
+      reviewerInvocations,
+      remediations,
+      reviewId: round1.reviewId ?? `${round1.cycleId ?? 'legacy'}:review:${round1.round}`,
+    });
+  } catch (err) {
+    return done(mapCheckpointFailure(err, host, deps.signal));
+  }
 
   // ---- 第 2 轮审核（2/2）----
-  if (rounds.length >= CROSS_REVIEW_LIMITS.maxReviewerInvocations) return done('COUNTER_EXHAUSTED');
+  if (reviewerInvocations >= CROSS_REVIEW_LIMITS.maxReviewerInvocations) return done('COUNTER_EXHAUSTED');
   {
     const b = host.budgetExceeded();
     if (b.exceeded) {
@@ -1561,14 +1726,32 @@ export async function runCrossReviewCycle(
       patch: resealed,
       finalVerification: nextVerification,
       round: 2,
+      priorFindings: blocking1,
     });
+    reviewerInvocations += 1;
   } catch (err) {
+    if (reviewAttemptWasDispatched(err)) reviewerInvocations += 1;
     return done(mapReviewFailure(err, host, deps.signal));
   }
   rounds.push(round2);
   const blocking2 = round2.findings.filter((f) => f.blocking);
+  const repeatedFingerprints = new Set(blocking2.map((finding) => finding.fingerprint));
+  const resolvedFingerprints = new Set(round2.resolvedFindingFingerprints ?? []);
+  const unconfirmed = blocking1.filter(
+    (finding) => !repeatedFingerprints.has(finding.fingerprint) && !resolvedFingerprints.has(finding.fingerprint),
+  );
   const outcome2 = verdictOutcome(round2, blocking2);
-  if (outcome2 !== 'REMEDIATE') return done(outcome2);
+  if (outcome2 !== 'REMEDIATE') {
+    if (unconfirmed.length > 0) {
+      host.emit(
+        'NOTE',
+        `复审未逐项确认 ${unconfirmed.length} 条首审阻断问题，保持待复核并转人工`,
+        { unconfirmedFindingFingerprints: unconfirmed.map((finding) => finding.fingerprint) },
+      );
+      return done('REVIEWER_INCONCLUSIVE');
+    }
+    return done(outcome2);
+  }
 
   // 进展判定用平台算的指纹，不用模型的自我评价
   const seen = new Set(blocking1.map((f) => f.fingerprint));
@@ -1585,6 +1768,10 @@ export async function runCrossReviewCycle(
 
 /** 审核调用失败的归因：审核方 route 出不去 ≠ 泛化的 ERROR，要能对症排查 */
 function mapReviewFailure(err: unknown, host: AgentHost, signal: AbortSignal): CrossReviewStopReason {
+  if (err instanceof ModelDispatchBudgetExceeded) {
+    host.emit('BUDGET_EXHAUSTED', err.message);
+    return 'BUDGET_EXHAUSTED';
+  }
   if (err instanceof AgentCancelled || signal.aborted) return 'CANCELLED';
   if (err instanceof EgressBlocked) {
     host.emit('NOTE', `审核方出站被阻断：${err.reason}`);
@@ -1595,6 +1782,22 @@ function mapReviewFailure(err: unknown, host: AgentHost, signal: AbortSignal): C
     return 'REVIEWER_UNAVAILABLE';
   }
   host.emit('NOTE', `交叉审核异常：${(err as Error).message}`);
+  return 'ERROR';
+}
+
+function reviewAttemptWasDispatched(err: unknown): boolean {
+  if (err instanceof InvocationFailed) return true;
+  if (err instanceof ModelDispatchBudgetExceeded) return err.modelInvocationDispatched;
+  return err instanceof AgentCancelled && err.modelInvocationDispatched;
+}
+
+/**
+ * 交接等待属于 Core 编排，不是审核方调用。它失败时仍须返回已经完成的 rounds，
+ * 但不能把持久化、过期或取消错误误报成“审核方不可用”。
+ */
+function mapCheckpointFailure(err: unknown, host: AgentHost, signal: AbortSignal): CrossReviewStopReason {
+  if (err instanceof AgentCancelled || signal.aborted) return 'CANCELLED';
+  host.emit('NOTE', `交接等待失败：${(err as Error).message}`);
   return 'ERROR';
 }
 
@@ -1679,7 +1882,16 @@ async function executionTurns(
       return { kind: 'BUDGET_EXHAUSTED', reason: budget.reason };
     }
 
-    const response = await callModel(deps, conversation, tools, 'EXECUTION');
+    let response: ModelResponse;
+    try {
+      ({ response } = await callModel(deps, conversation, tools, 'EXECUTION'));
+    } catch (error) {
+      if (error instanceof ModelDispatchBudgetExceeded) {
+        host.emit('BUDGET_EXHAUSTED', error.message);
+        return { kind: 'BUDGET_EXHAUSTED', reason: error.message };
+      }
+      throw error;
+    }
     const uses = toolUsesOf(response.content);
     conversation.push({ role: 'assistant', content: response.content });
 
@@ -1908,15 +2120,38 @@ async function callModel(
   /** 交叉审核走审核方的 route，其余走 implementer 的 route */
   resolutionOverride?: ModelRouteResolution,
   systemOverride?: string,
-) {
+): Promise<{ response: ModelResponse; invocationId: string; manifest: ModelEgressManifest }> {
   const schemas: ToolSchema[] = tools.map((t) => ({
     name: t.name,
     description: t.description,
     parameters: t.jsonSchema,
   }));
+  const unsettledDispatches: ModelDispatchAttempt[] = [];
+  const settleDispatches = (
+    finalUsage: { inputTokens: number | null; outputTokens: number | null } | null,
+  ): void => {
+    while (unsettledDispatches.length > 0) {
+      const attempt = unsettledDispatches.shift()!;
+      const isFinalSuccessfulAttempt = finalUsage !== null && unsettledDispatches.length === 0;
+      deps.host.settleModelTurn(
+        isFinalSuccessfulAttempt ? finalUsage.inputTokens : null,
+        isFinalSuccessfulAttempt ? finalUsage.outputTokens : null,
+      );
+      deps.host.emit(
+        'MODEL_INVOCATION',
+        `${purpose} 第 ${attempt.sendAttempt} 次派发已结算（in=${isFinalSuccessfulAttempt ? finalUsage.inputTokens ?? '?' : '?'} out=${isFinalSuccessfulAttempt ? finalUsage.outputTokens ?? '?' : '?'}）`,
+        {
+          phase: 'DISPATCH_SETTLED',
+          invocationId: attempt.invocationId,
+          sendAttempt: attempt.sendAttempt,
+          usageKnown: isFinalSuccessfulAttempt && finalUsage.inputTokens !== null && finalUsage.outputTokens !== null,
+        },
+      );
+    }
+  };
 
   try {
-    const { response, manifest } = await deps.gateway.invoke({
+    const { response, manifest, invocationId } = await deps.gateway.invoke({
       runId: deps.runId,
       attemptId: deps.attemptId,
       purpose,
@@ -1930,6 +2165,23 @@ async function callModel(
       },
       contextFileRefs: [],
       signal: deps.signal,
+      onDispatch: (attempt) => {
+        const budget = deps.host.budgetExceeded();
+        if (budget.exceeded) {
+          throw new ModelDispatchBudgetExceeded(budget.reason, unsettledDispatches.length > 0);
+        }
+        /*
+         * 先写派发意图，再把预算预留进 Run 快照。两份证据都成功后才进入 adapter；
+         * 任一步失败都不会发请求，也不会把未派发的尝试计进预算。
+         */
+        deps.host.emit(
+          'MODEL_INVOCATION',
+          `${purpose} 第 ${attempt.sendAttempt} 次调用准备派发 ${attempt.modelId}`,
+          { phase: 'DISPATCH_INTENT', ...attempt },
+        );
+        deps.host.reserveModelTurn(attempt);
+        unsettledDispatches.push(attempt);
+      },
       /*
        * 有人接增量才走流式。host 不实现 streamText（老的测试替身、headless 场景）
        * 就退回一次性请求 —— 有没有流不影响权威结果，只影响文本什么时候到界面。
@@ -1937,15 +2189,18 @@ async function callModel(
       ...(deps.host.streamText ? { onStream: (sig: StreamSignal) => deps.host.streamText!(sig) } : {}),
     });
 
-    // null 原样传递：?? 0 会把"provider 没回报"伪装成"零消耗"，账本层负责区分
-    deps.host.chargeModelTurn(manifest.inputTokens, manifest.outputTokens);
+    settleDispatches({
+      inputTokens: manifest.inputTokens,
+      outputTokens: manifest.outputTokens,
+    });
     deps.host.emit(
       'MODEL_INVOCATION',
       `${purpose} 调用 ${manifest.modelId}（in=${manifest.inputTokens ?? '?'} out=${manifest.outputTokens ?? '?'}）`,
       { manifest },
     );
-    return response;
+    return { response, invocationId, manifest };
   } catch (err) {
+    settleDispatches(null);
     if (err instanceof EgressBlocked) {
       deps.host.emit('MODEL_INVOCATION', `模型出站被阻断：${err.reason}`, { manifest: err.manifest });
       throw err;
@@ -1954,9 +2209,10 @@ async function callModel(
       deps.host.emit('MODEL_INVOCATION', `模型调用失败：${err.cause.kind} ${err.message}`, {
         manifest: err.manifest,
       });
-      if (err.cause.kind === 'CANCELLED') throw new AgentCancelled();
+      if (err.cause.kind === 'CANCELLED') throw new AgentCancelled(true);
       throw err;
     }
+    if (err instanceof ModelDispatchBudgetExceeded) throw err;
     throw err;
   }
 }

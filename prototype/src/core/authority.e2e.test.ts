@@ -45,8 +45,19 @@ vi.mock('./paths', async () => {
   };
 });
 
-import type { ApprovalRequest, PatchArtifact, RunEvent, RunView, ToolCallView } from '@shared/domain';
+import type {
+  ApprovalRequest,
+  CollaborationHandoff,
+  CrossReviewRecord,
+  PatchArtifact,
+  PlanRevision,
+  RunEvent,
+  RunView,
+  ToolCallView,
+  VerificationRun,
+} from '@shared/domain';
 import type { PushEvent, ResponsePayload } from '@shared/protocol';
+import { digestOf } from '@shared/ids';
 import { RunAuthority } from './authority';
 import { PATHS } from './paths';
 import { chatCompletionResponse } from './model/chatSse.testkit';
@@ -73,6 +84,21 @@ let callSeq = 0;
 const USAGE = { prompt_tokens: 120, completion_tokens: 45 };
 
 type WireUsage = { prompt_tokens: number; completion_tokens: number } | undefined;
+
+function findingFingerprint(input: {
+  severity: string;
+  file?: string;
+  startLine?: number;
+  endLine?: number;
+  evidence: string;
+}): string {
+  return digestOf({
+    severity: input.severity,
+    file: input.file ?? null,
+    range: input.startLine != null && input.endLine != null ? [input.startLine, input.endLine] : null,
+    evidence: input.evidence.trim().slice(0, 400),
+  });
+}
 
 function oaToolCall(name: string, input: unknown, usage: WireUsage = USAGE): unknown {
   callSeq += 1;
@@ -112,7 +138,7 @@ function lastReceipt(bodyText: string): string {
   return last;
 }
 
-type Responder = (bodyText: string) => unknown;
+type Responder = (bodyText: string) => unknown | Promise<unknown>;
 
 // ---------------------------------------------------------------------------
 // 夹具与线束
@@ -166,7 +192,7 @@ class Harness {
         if (!queue || queue.length === 0) {
           throw new Error(`${host} 的模型脚本已耗尽。最后请求：${bodyText.slice(-600)}`);
         }
-        const wire = queue.shift()!(bodyText);
+        const wire = await queue.shift()!(bodyText);
         // Agent Loop 默认走流式，所以线束也必须发 SSE —— 否则这些 e2e 覆盖的
         // 是一条生产里不存在的路径（见 chatSse.testkit.ts 顶部）
         return chatCompletionResponse(wire);
@@ -206,9 +232,35 @@ class Harness {
     }
   }
 
+  async waitForHandoff(
+    runId: string,
+    previousHandoffId: string | null = null,
+    timeoutMs = 20_000,
+  ): Promise<RunView> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const view = this.latestRun(runId);
+      if (
+        view?.status === 'AWAITING_HANDOFF' &&
+        view.pendingHandoff &&
+        view.pendingHandoff.handoffId !== previousHandoffId
+      ) {
+        return view;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(
+          `等待新交接超时，当前 ${view?.status}，handoff=${view?.pendingHandoff?.handoffId ?? 'null'}`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
   /** register → import → task.create，返回 runId。所有用例的公共开场 */
   async createRun(input: {
     hostPath: string;
+    plannerModelProfileId?: string;
+    collaborationMode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
     reviewerModelProfileId?: string;
     /** 缺省 []：零配置路径 —— 用户什么都没设置时不允许有任何暗中收窄 */
     allowedPaths?: string[];
@@ -230,6 +282,8 @@ class Harness {
     const { disclosure } = await this.call<{ disclosure: { digest: string } }>('egress.disclosure', {
       snapshotId: imported.snapshot.snapshotId,
       modelProfileId: 'profile_deepseek',
+      ...(input.plannerModelProfileId ? { plannerModelProfileId: input.plannerModelProfileId } : {}),
+      ...(input.collaborationMode ? { collaborationMode: input.collaborationMode } : {}),
       ...(input.reviewerModelProfileId ? { reviewerModelProfileId: input.reviewerModelProfileId } : {}),
     });
     const { run } = await this.call<{ run: RunView }>('task.create', {
@@ -237,6 +291,8 @@ class Harness {
       snapshotId: imported.snapshot.snapshotId,
       profileId: imported.profile.profileId,
       modelProfileId: 'profile_deepseek',
+      ...(input.plannerModelProfileId ? { plannerModelProfileId: input.plannerModelProfileId } : {}),
+      ...(input.collaborationMode ? { collaborationMode: input.collaborationMode } : {}),
       egressConsentDigest: disclosure.digest,
       goal: '修复 node check.mjs 失败：src/app.js 的 STATUS 仍是 broken',
       taskClass: imported.profile.supportedTaskClasses[0] ?? 'BUILD_FAILURE_FIX',
@@ -734,6 +790,33 @@ describe('authority e2e：文件读取 owner 与 generation 合同', () => {
 
 describe('authority e2e：从注册到终态的完整权威层链路', () => {
   it(
+    '模型派发预算落盘失败时零发送，并回滚未派发的轮次',
+    async () => {
+      harness.script(IMPL, [() => planCall()]);
+      type Persist = (record: unknown, required?: boolean) => void;
+      const authority = harness.authority as unknown as { persist: Persist };
+      const persist = authority.persist.bind(authority);
+      const persistSpy = vi.spyOn(authority, 'persist').mockImplementation((record, required = false) => {
+        if (required) throw new Error('injected state persistence failure');
+        persist(record, required);
+      });
+
+      const { runId } = await harness.createRun({ hostPath: makeFixtureRepo() });
+      const failed = await harness.waitForStatus(runId, ['FAILED', 'BLOCKED']);
+      persistSpy.mockRestore();
+
+      expect(failed.ledger.modelTurns).toBe(0);
+      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+      const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+      expect(events).toContainEqual(expect.objectContaining({
+        kind: 'MODEL_INVOCATION',
+        payload: expect.objectContaining({ phase: 'DISPATCH_INTENT', sendAttempt: 1 }),
+      }));
+    },
+    20_000,
+  );
+
+  it(
     '黄金路径：导入 → 审批 → 修复 → 真验证通过 → 接受 → SUCCEEDED；账本与用量未知轮如实',
     async () => {
       harness.script(IMPL, [
@@ -936,7 +1019,17 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
               },
             ],
           }),
-        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+        () => oaToolCall('submit_review', {
+          verdict: 'PASS',
+          findings: [],
+          resolvedFindingFingerprints: [findingFingerprint({
+            severity: 'HIGH',
+            file: APP_FILE,
+            startLine: 1,
+            endLine: 1,
+            evidence: '修复缺少说明注释，无法审计意图',
+          })],
+        }),
       ]);
 
       const { runId } = await harness.createRun({
@@ -1014,6 +1107,488 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
       expect(cont.reason).toContain('REVIEWER_PASSED');
     },
     40_000,
+  );
+
+  it(
+    '规划方的读取 receipt 不会进入实施方上下文，实施方未自行读取时修改被拒绝',
+    async () => {
+      let implementerFirstRequest = '';
+      harness.script(REVIEWER, [
+        () => readApp(),
+        () => planCall(),
+      ]);
+      harness.script(IMPL, [
+        (body) => {
+          implementerFirstRequest = body;
+          return mutateApp("export const STATUS = 'fixed';\n")(body);
+        },
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        plannerModelProfileId: 'profile_moonshot-cn',
+        reviewerModelProfileId: 'profile_moonshot-cn',
+        collaborationMode: 'MANUAL_HANDOFF',
+      });
+      await harness.approvePlan(runId);
+
+      const failed = await harness.waitForStatus(runId, ['FAILED']);
+      expect(implementerFirstRequest).not.toContain('receiptId=');
+      expect(failed.pendingHandoff ?? null).toBeNull();
+      const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+      expect(events.some((event) => event.kind === 'PATCH_SEALED')).toBe(false);
+    },
+    30_000,
+  );
+
+  it(
+    '用户要求修改计划后生成新 revision，旧审批失效，实施方只执行新批准',
+    async () => {
+      let revisionRequest = '';
+      harness.script(REVIEWER, [
+        () => planCall(),
+        (body) => {
+          revisionRequest = body;
+          return oaToolCall('submit_plan', {
+            summary: '先确认 src/app.js 当前值，再把 STATUS 改成 fixed。',
+            steps: [{
+              intent: '读取后修改 STATUS',
+              targetPaths: [APP_FILE],
+              expectedEffect: 'node check.mjs 退出 0',
+            }],
+            risks: ['必须使用实施方自己取得的读取 receipt'],
+          });
+        },
+        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+      ]);
+      harness.script(IMPL, [
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('修复完成。'),
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        plannerModelProfileId: 'profile_moonshot-cn',
+        reviewerModelProfileId: 'profile_moonshot-cn',
+        collaborationMode: 'BOUNDED_AUTO',
+      });
+      await harness.waitForStatus(runId, ['AWAITING_PLAN_APPROVAL']);
+      const firstApprovals = await harness.call<{ approvals: ApprovalRequest[] }>('approval.pending', { runId });
+      const first = firstApprovals.approvals[0]!;
+      const revised = await harness.call<{ accepted: boolean; reason: string | null }>('approval.decide', {
+        approvalId: first.approvalId,
+        decision: 'REVISE',
+        subjectDigest: first.subjectDigest,
+        note: '先读取文件，明确不能复用规划阶段 receipt',
+      });
+      expect(revised).toEqual({ accepted: true, reason: null });
+
+      let second: ApprovalRequest | undefined;
+      const deadline = Date.now() + 10_000;
+      while (!second && Date.now() < deadline) {
+        const pending = await harness.call<{ approvals: ApprovalRequest[] }>('approval.pending', { runId });
+        second = pending.approvals.find((approval) => approval.approvalId !== first.approvalId);
+        if (!second) await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(second).toBeDefined();
+      const { plan } = await harness.call<{ plan: PlanRevision | null }>('plan.get', { runId });
+      expect(plan).toMatchObject({ revision: 2 });
+      expect(plan!.parentPlanId).not.toBeNull();
+      expect(plan!.digest).not.toBe(first.subjectDigest);
+      expect(second!.subjectDigest).not.toBe(first.subjectDigest);
+      expect(revisionRequest).toContain('先读取文件，明确不能复用规划阶段 receipt');
+
+      const stale = await harness.call<{ accepted: boolean; reason: string | null }>('approval.decide', {
+        approvalId: first.approvalId,
+        decision: 'APPROVE',
+        subjectDigest: first.subjectDigest,
+        note: '',
+      });
+      expect(stale.accepted).toBe(false);
+      await harness.call('approval.decide', {
+        approvalId: second!.approvalId,
+        decision: 'APPROVE',
+        subjectDigest: second!.subjectDigest,
+        note: '',
+      });
+      await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+      const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+      expect(events.filter((event) => event.kind === 'HANDOFF_CREATED')).toHaveLength(1);
+      expect(events.filter((event) => event.kind === 'HANDOFF_DECIDED')).toHaveLength(1);
+      expect(events.find((event) => event.kind === 'HANDOFF_DECIDED')?.payload.automatic).toBe(true);
+    },
+    30_000,
+  );
+
+  it(
+    '有界自动执行中请求本步结束后暂停，会在审核派发前留下同一份受校验 handoff',
+    async () => {
+      let releaseRead!: () => void;
+      const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+      harness.script(IMPL, [
+        () => planCall(),
+        async () => {
+          await readGate;
+          return readApp();
+        },
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('修复完成。'),
+      ]);
+      harness.script(REVIEWER, [
+        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        plannerModelProfileId: 'profile_deepseek',
+        reviewerModelProfileId: 'profile_moonshot-cn',
+        collaborationMode: 'BOUNDED_AUTO',
+      });
+      await harness.approvePlan(runId);
+      await harness.waitForStatus(runId, ['EXECUTING']);
+      const control = await harness.call<{ run: RunView; accepted: boolean; reason: string | null }>(
+        'collaboration.control',
+        { runId, stopAfterStep: true },
+      );
+      expect(control.accepted).toBe(true);
+      expect(control.run.collaborationControl).toEqual({
+        mode: 'BOUNDED_AUTO',
+        stopAfterStepRequested: true,
+      });
+      releaseRead();
+
+      const paused = await harness.waitForHandoff(runId);
+      expect(paused.collaborationControl).toEqual({
+        mode: 'BOUNDED_AUTO',
+        stopAfterStepRequested: false,
+      });
+      expect(vi.mocked(fetch).mock.calls.filter(([url]) => new URL(String(url)).host === REVIEWER)).toHaveLength(0);
+      const { handoff } = await harness.call<{ handoff: CollaborationHandoff | null }>(
+        'collaboration.getHandoff',
+        { runId },
+      );
+      expect(handoff?.nextPhase).toBe('FIRST_REVIEW');
+      const continued = await harness.call<{ accepted: boolean }>('collaboration.continue', {
+        runId,
+        handoffId: handoff!.handoffId,
+        handoffDigest: handoff!.digest,
+        decisionId: 'decision-stop-after-step',
+      });
+      expect(continued.accepted).toBe(true);
+      await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+    },
+    30_000,
+  );
+
+  it(
+    '人工协作在三次交接前冻结下一角色，决定只消费一次且最终进入补丁审查',
+    async () => {
+      harness.script(IMPL, [
+        () => planCall(),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('修复完成。'),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed'; // reviewed\n"),
+        () => oaText('整改完成。'),
+      ]);
+      harness.script(REVIEWER, [
+        () =>
+          oaToolCall('submit_review', {
+            verdict: 'CHANGES_REQUESTED',
+            findings: [
+              {
+                severity: 'HIGH',
+                confidence: 0.9,
+                file: APP_FILE,
+                startLine: 1,
+                endLine: 1,
+                evidence: '需要补充可审计的整改标记',
+                blocking: true,
+              },
+            ],
+          }),
+        () => oaToolCall('submit_review', {
+          verdict: 'PASS',
+          findings: [],
+          resolvedFindingFingerprints: [findingFingerprint({
+            severity: 'HIGH',
+            file: APP_FILE,
+            startLine: 1,
+            endLine: 1,
+            evidence: '需要补充可审计的整改标记',
+          })],
+        }),
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        plannerModelProfileId: 'profile_deepseek',
+        reviewerModelProfileId: 'profile_moonshot-cn',
+        collaborationMode: 'MANUAL_HANDOFF',
+        allowedPaths: ['src/**'],
+      });
+      await harness.approvePlan(runId);
+
+      const reviewerCalls = () =>
+        vi.mocked(fetch).mock.calls.filter(([url]) => new URL(String(url)).host === REVIEWER).length;
+      const getHandoff = async () => {
+        const result = await harness.call<{ handoff: CollaborationHandoff | null }>(
+          'collaboration.getHandoff',
+          { runId },
+        );
+        expect(result.handoff).not.toBeNull();
+        return result.handoff!;
+      };
+      const continueHandoff = (handoff: CollaborationHandoff, decisionId: string) =>
+        harness.call<{ accepted: boolean; reason: string | null }>('collaboration.continue', {
+          runId,
+          handoffId: handoff.handoffId,
+          handoffDigest: handoff.digest,
+          decisionId,
+        });
+
+      const firstView = await harness.waitForHandoff(runId);
+      const first = await getHandoff();
+      expect(first).toMatchObject({ fromRole: 'IMPLEMENTER', toRole: 'REVIEWER', nextPhase: 'FIRST_REVIEW' });
+      expect(reviewerCalls()).toBe(0);
+      expect((await continueHandoff(first, 'decision-first')).accepted).toBe(true);
+      const replay = await continueHandoff(first, 'decision-first-replay');
+      expect(replay.accepted).toBe(false);
+
+      const secondView = await harness.waitForHandoff(runId, first.handoffId);
+      const second = await getHandoff();
+      expect(second).toMatchObject({ fromRole: 'REVIEWER', toRole: 'IMPLEMENTER', nextPhase: 'REMEDIATE' });
+      expect(second.cycleId).toBe(first.cycleId);
+      expect(second.findings).toHaveLength(1);
+      expect(second.findings[0]?.reviewId).toBe(`${first.cycleId}:review:1`);
+      expect(reviewerCalls()).toBe(1);
+      expect(firstView.ledger.elapsedMs).toBeLessThanOrEqual(secondView.ledger.elapsedMs);
+      expect((await continueHandoff(second, 'decision-second')).accepted).toBe(true);
+
+      const thirdView = await harness.waitForHandoff(runId, second.handoffId);
+      const third = await getHandoff();
+      expect(third).toMatchObject({ fromRole: 'IMPLEMENTER', toRole: 'REVIEWER', nextPhase: 'SECOND_REVIEW' });
+      expect(third.cycleId).toBe(first.cycleId);
+      expect(reviewerCalls()).toBe(1);
+      expect(secondView.ledger.elapsedMs).toBeLessThanOrEqual(thirdView.ledger.elapsedMs);
+      expect((await continueHandoff(third, 'decision-third')).accepted).toBe(true);
+
+      const completed = await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+      expect(completed.pendingHandoff).toBeNull();
+      expect(reviewerCalls()).toBe(2);
+      const { crossReview } = await harness.call<{
+        crossReview: { reviewerInvocations: number; remediations: number; stopReason: string } | null;
+      }>('crossreview.get', { runId });
+      expect(crossReview).toMatchObject({
+        reviewerInvocations: 2,
+        remediations: 1,
+        stopReason: 'REVIEWER_PASSED',
+      });
+
+      const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
+      expect(events.filter((event) => event.kind === 'HANDOFF_CREATED')).toHaveLength(3);
+      expect(events.filter((event) => event.kind === 'HANDOFF_DECIDED')).toHaveLength(3);
+    },
+    40_000,
+  );
+
+  it(
+    '人工交接等待中取消后不调用审核方，晚到的继续决定被拒绝',
+    async () => {
+      harness.script(IMPL, [
+        () => planCall(),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('修复完成。'),
+      ]);
+      harness.script(REVIEWER, [
+        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        plannerModelProfileId: 'profile_deepseek',
+        reviewerModelProfileId: 'profile_moonshot-cn',
+        collaborationMode: 'MANUAL_HANDOFF',
+      });
+      await harness.approvePlan(runId);
+      await harness.waitForHandoff(runId);
+      const { handoff } = await harness.call<{ handoff: CollaborationHandoff | null }>(
+        'collaboration.getHandoff',
+        { runId },
+      );
+      expect(handoff).not.toBeNull();
+
+      await harness.call('run.cancel', { runId, reason: '人工交接取消测试' });
+      const cancelled = await harness.waitForStatus(runId, ['CANCELLED']);
+      expect(cancelled.pendingHandoff).toBeNull();
+      const late = await harness.call<{ accepted: boolean; reason: string | null }>(
+        'collaboration.continue',
+        {
+          runId,
+          handoffId: handoff!.handoffId,
+          handoffDigest: handoff!.digest,
+          decisionId: 'decision-after-cancel',
+        },
+      );
+      expect(late.accepted).toBe(false);
+      expect(
+        vi.mocked(fetch).mock.calls.filter(([url]) => new URL(String(url)).host === REVIEWER),
+      ).toHaveLength(0);
+    },
+    30_000,
+  );
+
+  it(
+    '验证失败后先停靠再调用实施方自修复，并在通过后进入首审交接',
+    async () => {
+      harness.script(IMPL, [
+        () => planCall(),
+        () => readApp(),
+        mutateApp("export const STATUS = 'wrong';\n"),
+        () => oaText('第一版修改完成。'),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('自修复完成。'),
+      ]);
+      harness.script(REVIEWER, [
+        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        plannerModelProfileId: 'profile_deepseek',
+        reviewerModelProfileId: 'profile_moonshot-cn',
+        collaborationMode: 'MANUAL_HANDOFF',
+      });
+      await harness.approvePlan(runId);
+
+      const callsFor = (host: string) =>
+        vi.mocked(fetch).mock.calls.filter(([url]) => new URL(String(url)).host === host).length;
+      await harness.waitForHandoff(runId);
+      const { handoff: selfFix } = await harness.call<{ handoff: CollaborationHandoff | null }>(
+        'collaboration.getHandoff',
+        { runId },
+      );
+      expect(selfFix).toMatchObject({
+        fromRole: 'IMPLEMENTER',
+        toRole: 'IMPLEMENTER',
+        nextPhase: 'SELF_FIX',
+        patch: null,
+      });
+      expect(selfFix!.verificationIds).toHaveLength(1);
+      expect(callsFor(IMPL)).toBe(4);
+      expect(callsFor(REVIEWER)).toBe(0);
+
+      const continued = await harness.call<{ accepted: boolean }>('collaboration.continue', {
+        runId,
+        handoffId: selfFix!.handoffId,
+        handoffDigest: selfFix!.digest,
+        decisionId: 'decision-self-fix',
+      });
+      expect(continued.accepted).toBe(true);
+
+      await harness.waitForHandoff(runId, selfFix!.handoffId);
+      const { handoff: firstReview } = await harness.call<{ handoff: CollaborationHandoff | null }>(
+        'collaboration.getHandoff',
+        { runId },
+      );
+      expect(firstReview).toMatchObject({
+        fromRole: 'IMPLEMENTER',
+        toRole: 'REVIEWER',
+        nextPhase: 'FIRST_REVIEW',
+      });
+      expect(callsFor(IMPL)).toBe(7);
+      expect(callsFor(REVIEWER)).toBe(0);
+
+      const { verifications } = await harness.call<{ verifications: VerificationRun[] }>(
+        'verification.list',
+        { runId },
+      );
+      expect(verifications.filter((item) => item.phase === 'POST_MUTATION').map((item) => item.passed))
+        .toEqual([false, true]);
+
+      await harness.call('run.cancel', { runId, reason: '自修复交接测试收尾' });
+      await harness.waitForStatus(runId, ['CANCELLED']);
+    },
+    30_000,
+  );
+
+  it(
+    '交接决定事件落盘失败时保留待交接边界且不调用下一角色',
+    async () => {
+      harness.script(IMPL, [
+        () => planCall(),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('修复完成。'),
+      ]);
+      harness.script(REVIEWER, [
+        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        plannerModelProfileId: 'profile_deepseek',
+        reviewerModelProfileId: 'profile_moonshot-cn',
+        collaborationMode: 'MANUAL_HANDOFF',
+      });
+      await harness.approvePlan(runId);
+      await harness.waitForHandoff(runId);
+      const { handoff } = await harness.call<{ handoff: CollaborationHandoff | null }>(
+        'collaboration.getHandoff',
+        { runId },
+      );
+      expect(handoff).not.toBeNull();
+
+      type EventAppend = (
+        attemptId: string,
+        kind: RunEvent['kind'],
+        summary: string,
+        payload?: Record<string, unknown>,
+      ) => RunEvent;
+      const record = (
+        harness.authority as unknown as {
+          runs: Map<string, { events: { append: EventAppend } }>;
+        }
+      ).runs.get(runId)!;
+      const append = record.events.append.bind(record.events);
+      const appendSpy = vi.spyOn(record.events, 'append').mockImplementation(
+        (attemptId, kind, summary, payload) => {
+          if (kind === 'HANDOFF_DECIDED') throw new Error('injected event append failure');
+          return append(attemptId, kind, summary, payload);
+        },
+      );
+
+      await expect(
+        harness.call('collaboration.continue', {
+          runId,
+          handoffId: handoff!.handoffId,
+          handoffDigest: handoff!.digest,
+          decisionId: 'decision-persist-failure',
+        }),
+      ).rejects.toThrow('injected event append failure');
+      appendSpy.mockRestore();
+
+      const afterFailure = await harness.call<{ handoff: CollaborationHandoff | null }>(
+        'collaboration.getHandoff',
+        { runId },
+      );
+      expect(afterFailure.handoff?.handoffId).toBe(handoff!.handoffId);
+      expect(harness.latestRun(runId)).toMatchObject({
+        status: 'AWAITING_HANDOFF',
+        pendingHandoff: { handoffId: handoff!.handoffId },
+      });
+      expect(
+        vi.mocked(fetch).mock.calls.filter(([url]) => new URL(String(url)).host === REVIEWER),
+      ).toHaveLength(0);
+
+      await harness.call('run.cancel', { runId, reason: '故障注入测试收尾' });
+      await harness.waitForStatus(runId, ['CANCELLED']);
+    },
+    30_000,
   );
 
   it(
@@ -1096,25 +1671,34 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
         evidence,
         blocking: true,
       });
+      const firstCycleA = blockingFinding(1, '缺少意图注释');
+      const firstCycleB = blockingFinding(1, '缺少变更说明');
+      const firstCycleC = blockingFinding(2, 'v2 注释仍未说明为什么');
+      const secondCycleA = blockingFinding(3, '还差文档化说明');
       harness.script(REVIEWER, [
         // 循环 1：两轮都有阻断，但阻断数 2→1 且指纹不同 = 有进展 → COUNTER_EXHAUSTED
         () =>
           oaToolCall('submit_review', {
             verdict: 'CHANGES_REQUESTED',
-            findings: [blockingFinding(1, '缺少意图注释'), blockingFinding(1, '缺少变更说明')],
+            findings: [firstCycleA, firstCycleB],
           }),
         () =>
           oaToolCall('submit_review', {
             verdict: 'CHANGES_REQUESTED',
-            findings: [blockingFinding(2, 'v2 注释仍未说明为什么')],
+            findings: [firstCycleC],
           }),
         // 循环 2（用户续期）：一条阻断 → 整改 → 通过
         () =>
           oaToolCall('submit_review', {
             verdict: 'CHANGES_REQUESTED',
-            findings: [blockingFinding(3, '还差文档化说明')],
+            findings: [secondCycleA],
+            resolvedFindingFingerprints: [firstCycleA, firstCycleB, firstCycleC].map(findingFingerprint),
           }),
-        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+        () => oaToolCall('submit_review', {
+          verdict: 'PASS',
+          findings: [],
+          resolvedFindingFingerprints: [findingFingerprint(secondCycleA)],
+        }),
       ]);
 
       const { runId } = await harness.createRun({
@@ -1145,7 +1729,7 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
           reviewerInvocations: number;
           remediations: number;
           userContinuations?: number;
-          rounds: Array<{ round: number }>;
+          rounds: Array<{ round: number; cycleId?: string; reviewId?: string }>;
         } | null;
       }>('crossreview.get', { runId });
 
@@ -1155,6 +1739,13 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
       expect(crossReview?.remediations).toBe(2);
       expect(crossReview?.userContinuations).toBe(1);
       expect(crossReview?.rounds.map((r) => r.round)).toEqual([1, 2, 3, 4]);
+      const firstCycle = crossReview?.rounds[0]?.cycleId;
+      const secondCycle = crossReview?.rounds[2]?.cycleId;
+      expect(firstCycle).toBeTruthy();
+      expect(secondCycle).toBeTruthy();
+      expect(secondCycle).not.toBe(firstCycle);
+      expect(new Set(crossReview?.rounds.map((r) => r.reviewId)).size).toBe(4);
+      expect(crossReview?.rounds[2]?.reviewId).toBe(`${secondCycle}:review:1`);
 
       // 授权事件落账；终态补丁是续期整改后的那份
       const { events } = await harness.call<{ events: RunEvent[] }>('run.events', { runId, afterSeq: 0 });
@@ -1163,6 +1754,75 @@ describe('authority e2e：从注册到终态的完整权威层链路', () => {
       expect(patch.unifiedDiff).toContain('v3 documented');
     },
     40_000,
+  );
+
+  it(
+    '用户接受未解决 finding 必须写理由，处置记录绑定当前 patch digest',
+    async () => {
+      const finding = {
+        severity: 'HIGH',
+        confidence: 0.9,
+        file: APP_FILE,
+        startLine: 1,
+        endLine: 1,
+        evidence: '边界分支仍未覆盖',
+        blocking: true,
+      };
+      harness.script(IMPL, [
+        () => planCall(),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed';\n"),
+        () => oaText('修复完成。'),
+        () => readApp(),
+        mutateApp("export const STATUS = 'fixed'; // reviewed\n"),
+        () => oaText('整改完成。'),
+      ]);
+      harness.script(REVIEWER, [
+        () => oaToolCall('submit_review', { verdict: 'CHANGES_REQUESTED', findings: [finding] }),
+        () => oaToolCall('submit_review', { verdict: 'CHANGES_REQUESTED', findings: [finding] }),
+      ]);
+
+      const { runId } = await harness.createRun({
+        hostPath: makeFixtureRepo(),
+        reviewerModelProfileId: 'profile_moonshot-cn',
+      });
+      await harness.approvePlan(runId);
+      await harness.waitForStatus(runId, ['AWAITING_PATCH_REVIEW']);
+      const { patch } = await harness.call<{ patch: PatchArtifact }>('patch.get', { runId });
+
+      const missingReason = await harness.call<{ run: RunView; reason: string | null }>('patch.decide', {
+        runId,
+        patchId: patch.patchId,
+        patchDigest: patch.digest,
+        decision: 'ACCEPT',
+        note: '',
+      });
+      expect(missingReason.reason).toContain('必须填写理由');
+      expect(missingReason.run.status).toBe('AWAITING_PATCH_REVIEW');
+
+      const accepted = await harness.call<{ run: RunView; reason: string | null }>('patch.decide', {
+        runId,
+        patchId: patch.patchId,
+        patchDigest: patch.digest,
+        decision: 'ACCEPT',
+        note: '该分支不在本次发布范围，已人工核对',
+      });
+      expect(accepted.reason).toBeNull();
+      expect(['SUCCEEDED', 'ACCEPTED_UNVERIFIED']).toContain(accepted.run.status);
+
+      const { crossReview } = await harness.call<{ crossReview: CrossReviewRecord | null }>(
+        'crossreview.get',
+        { runId },
+      );
+      expect(crossReview?.findingDispositions).toEqual([
+        expect.objectContaining({
+          disposition: 'USER_ACCEPTED',
+          reason: '该分支不在本次发布范围，已人工核对',
+          patchDigest: patch.digest,
+        }),
+      ]);
+    },
+    30_000,
   );
 });
 

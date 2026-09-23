@@ -16,7 +16,8 @@
     "dist:mac:x64": "npm run build && electron-builder --mac --x64 --config electron-builder.yml",
     "eval:spk010": "vite build --config eval.vite.config.ts && node eval-out/.build/run-experiment.js",
     "probe:journals": "REPOPILOT_PROBE_JOURNALS=${REPOPILOT_PROBE_JOURNALS:-1} vitest run src/main/observer/journalShape.probe.test.ts",
-    "probe:desktop": "REPOPILOT_PROBE_DESKTOP=${REPOPILOT_PROBE_DESKTOP:-1} vitest run src/main/observer/desktopProbe.probe.test.ts"
+    "probe:desktop": "REPOPILOT_PROBE_DESKTOP=${REPOPILOT_PROBE_DESKTOP:-1} vitest run src/main/observer/desktopProbe.probe.test.ts",
+    "probe:workbench": "REPOPILOT_PROBE_WORKBENCH=${REPOPILOT_PROBE_WORKBENCH:-1} vitest run src/main/workbench/codexAdapter.probe.test.ts"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.2",
@@ -33,6 +34,7 @@
     "vitest": "^2.1.8"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.260",
     "@codemirror/lang-css": "^6.3.1",
     "@codemirror/lang-html": "^6.4.12",
     "@codemirror/lang-javascript": "^6.2.5",
@@ -45,11 +47,5 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "zod": "^3.24.1"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "electron",
-      "esbuild"
-    ]
   }
 }

@@ -33,6 +33,7 @@ const SESSION = {
   source: 'DESKTOP_LOCAL_AGENT' as const,
   sourceEvidence: ['entrypoint=claude-desktop'],
   completion: { state: 'READY_TO_HANDOFF' as const, evidence: ['message.stop_reason=end_turn'] },
+  attentionEventId: 'sha256:completion-1',
 };
 const COUNTS = {
   claudeMatched: 1,
@@ -67,6 +68,7 @@ const push = (e: ObserverPushEvent): void => {
 };
 
 beforeEach(() => {
+  window.localStorage.clear();
   pushHandlers = [];
   observerCallMock.mockReset();
   clipboardWriteMock.mockReset().mockResolvedValue(undefined);
@@ -81,9 +83,55 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  window.localStorage.clear();
+});
 
 describe('观察面板', () => {
+  it('本地别名优先展示并只写 Renderer 本地存储', async () => {
+    observerCallMock.mockImplementation(async (method: string) => {
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
+      if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
+      if (method === 'observer.unwatch') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+    render(<ObserverView />);
+
+    const input = await screen.findByRole('textbox', { name: 'abc 的本地别名' });
+    fireEvent.change(input, { target: { value: '登录修复复核' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存别名' }));
+
+    const list = screen.getByLabelText('可观察的会话列表');
+    expect(within(list).getByText(/Claude · 登录修复复核/)).toBeTruthy();
+    expect(within(list).getByText(/标题来源 LOCAL_ALIAS/)).toBeTruthy();
+    const stored = window.localStorage.getItem('repopilot.observer.aliases.v1');
+    expect(stored).toContain('登录修复复核');
+    expect(stored).toContain('~/demo:CLAUDE_JOURNAL:abc.jsonl');
+    expect(observerCallMock).not.toHaveBeenCalledWith(expect.stringMatching(/alias/i), expect.anything());
+  });
+
+  it('别名与注意处置按授权项目隔离，同名 sessionId 不跨项目复用', async () => {
+    window.localStorage.setItem('repopilot.observer.aliases.v1', JSON.stringify({
+      '~/other:CLAUDE_JOURNAL:abc.jsonl': '另一个项目的别名',
+    }));
+    window.localStorage.setItem('repopilot.observer.attention.v1', JSON.stringify({
+      '~/other:CLAUDE_JOURNAL:abc.jsonl:sha256:completion-1': 'SEEN',
+    }));
+    observerCallMock.mockImplementation(async (method: string) => {
+      if (method === 'observer.status') return { granted: '~/demo', watching: [] };
+      if (method === 'observer.listSessions') return { sessions: [SESSION], counts: COUNTS };
+      if (method === 'observer.unwatch') return { ok: true };
+      throw new Error(`unexpected ${method}`);
+    });
+
+    render(<ObserverView />);
+
+    expect((await screen.findByRole('textbox', { name: 'abc 的本地别名' }) as HTMLInputElement).value).toBe('');
+    expect(within(screen.getByRole('region', { name: '会话注意队列' })).getByText('Claude / abc')).toBeTruthy();
+    expect(screen.queryByText('另一个项目的别名')).toBeNull();
+  });
+
   it('未授权：显示启用入口与信任边界文案；授权取消时不建立任何状态', async () => {
     observerCallMock.mockImplementation(async (method: string) => {
       if (method === 'observer.status') return { granted: null, watching: [] };
@@ -196,7 +244,7 @@ describe('观察面板', () => {
     });
 
     expect(screen.queryByText(/Claude · abc/)).toBeNull();
-    expect(screen.queryByRole('region', { name: '待你输入队列' })).toBeNull();
+    expect(screen.queryByRole('region', { name: '会话注意队列' })).toBeNull();
   });
 
   it('授权来自 Main 侧推送（非本视图发起）时也会去拉会话列表 —— selftest 截图抓到的空档', async () => {
@@ -326,7 +374,7 @@ describe('观察面板', () => {
     expect(onUse).toHaveBeenCalledWith(artifact);
   });
 
-  it('待你输入队列只收机器结束会话；点击只打开镜像，UNKNOWN 数量单独披露', async () => {
+  it('注意队列只收机器结束会话；点击只打开镜像，UNKNOWN 数量单独披露', async () => {
     const running = {
       ...SESSION,
       sessionId: 'CLAUDE_JOURNAL:running.jsonl',
@@ -340,17 +388,24 @@ describe('观察面板', () => {
       label: 'unknown',
       completion: { state: 'UNKNOWN' as const, evidence: ['有限尾部没有发现机器结束字段'] },
     };
+    const later = {
+      ...SESSION,
+      sessionId: 'CLAUDE_JOURNAL:later.jsonl',
+      label: 'later',
+    };
     observerCallMock.mockImplementation(async (method: string) => {
       if (method === 'observer.status') return { granted: '~/demo', watching: [] };
-      if (method === 'observer.listSessions') return { sessions: [SESSION, running, unknown], counts: COUNTS };
+      if (method === 'observer.listSessions') return { sessions: [SESSION, later, running, unknown], counts: COUNTS };
       if (method === 'observer.watch') return { ok: true };
       if (method === 'observer.unwatch') return { ok: true };
       throw new Error(`unexpected ${method}`);
     });
     render(<ObserverView />);
 
-    const queue = await screen.findByRole('region', { name: '待你输入队列' });
+    const queue = await screen.findByRole('region', { name: '会话注意队列' });
+    expect(within(queue).getByText(/明确待答 0 · 待批准 0/)).toBeTruthy();
     expect(within(queue).getByText('Claude / abc')).toBeTruthy();
+    expect(within(queue).getByText('Claude / later')).toBeTruthy();
     expect(within(queue).queryByText(/running/)).toBeNull();
     expect(within(queue).getByText(/另有 1 个会话结束状态未知/)).toBeTruthy();
 
@@ -360,7 +415,12 @@ describe('观察面板', () => {
     );
     push({ kind: 'observer.state', state: { granted: '~/demo', watching: [SESSION.sessionId] } });
     push({ kind: 'observer.projection', projection: projection() });
-    expect(await within(queue).findByText(/镜像中/)).toBeTruthy();
+    await waitFor(() => expect(within(queue).queryByText('Claude / abc')).toBeNull());
+    expect(within(queue).getByText(/已看过 1 个/)).toBeTruthy();
     expect(screen.getByText(/你好，这是镜像正文/)).toBeTruthy();
+
+    fireEvent.click(within(queue).getByText('暂缓'));
+    expect(within(queue).queryByText('Claude / later')).toBeNull();
+    expect(within(queue).getByText(/暂缓 1 个/)).toBeTruthy();
   });
 });

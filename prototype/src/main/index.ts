@@ -33,6 +33,8 @@ import { DATA_ROOT_ENV, isIsolatedDataRoot, resolveDataRoot } from '@shared/data
 import { CoreRequestBroker } from './coreChannel';
 import { registerObserverIpc } from './observer/observerIpc';
 import { runObserverSelftest } from './observer/observerSelftest';
+import { registerWorkbenchIpc } from './workbench/workbenchIpc';
+import { runWorkbenchSelftest } from './workbench/workbenchSelftest';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -54,6 +56,7 @@ let core: UtilityProcess | null = null;
 let coreReady = false;
 /** 退出中标记：区分"Core 意外崩溃需重启"和"应用正在退出" */
 let quitting = false;
+let workbenchDrained = false;
 
 /**
  * Core 实例代次。每次 Core 就绪自增一次。
@@ -74,6 +77,10 @@ const broker = new CoreRequestBroker({
 
 // 观察通道（用户能力面，Renderer ⇄ Main 直连，不经 Core）—— TD-DEC-022 (a)
 const observer = registerObserverIpc(() => mainWindow);
+const workbench = registerWorkbenchIpc(
+  () => mainWindow,
+  (vendor) => credentials.getAll()[vendor === 'CLAUDE' ? 'anthropic' : 'openai'] ?? null,
+);
 
 // ---------------------------------------------------------------------------
 // Core 监督
@@ -461,7 +468,7 @@ function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 940,
-    minWidth: 1080,
+    minWidth: 720,
     minHeight: 700,
     title: 'RepoPilot Prototype',
     titleBarStyle: 'hiddenInset',
@@ -983,6 +990,14 @@ async function selfTest(): Promise<void> {
     for (const pass of observerReport.passes) console.log(`[selftest] PASS 观察面板 · ${pass}`);
     for (const failure of observerReport.failures) console.error(`[selftest] FAIL 观察面板 · ${failure}`);
     failures += observerReport.failures.length;
+
+    const workbenchReport = await runWorkbenchSelftest(
+      mainWindow!,
+      process.env.REPOPILOT_SELFTEST_CAPTURE_DIR?.trim() || null,
+    );
+    for (const pass of workbenchReport.passes) console.log(`[selftest] PASS 双 Agent 工作台 · ${pass}`);
+    for (const failure of workbenchReport.failures) console.error(`[selftest] FAIL 双 Agent 工作台 · ${failure}`);
+    failures += workbenchReport.failures.length;
   } else {
     console.error('[selftest] FAIL renderer 未能完成加载');
     failures += 1;
@@ -1103,9 +1118,16 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   quitting = true;
   core?.kill();
+  if (workbenchDrained) return;
+  event.preventDefault();
+  // Main 只等待自己创建的工作位进程；disposeAll 不会触碰用户已有的 Desktop 进程。
+  void workbench.disposeAll().finally(() => {
+    workbenchDrained = true;
+    app.quit();
+  });
 });
 
 app.on('window-all-closed', () => {

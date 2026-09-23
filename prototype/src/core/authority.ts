@@ -17,6 +17,8 @@ import type {
   CrossReviewRecord,
   CrossReviewRound,
   CrossReviewStopReason,
+  CollaborationHandoff,
+  CollaborationHandoffDecision,
   DoctorCheck,
   FileTreeEntry,
   ModelRouteResolution,
@@ -54,6 +56,7 @@ import type {
 import { digestOf, newId, nowIso } from '@shared/ids';
 import {
   AgentCancelled,
+  ModelDispatchBudgetExceeded,
   PlanningFailed,
   composeUnverifiedItems,
   parseExternalSubmission,
@@ -103,6 +106,13 @@ import { commandArgvDigest, isApprovableCause, classifyUserCommand, userCommandA
 import { buildDisclosure, consentedResolutionDigests, type DisclosureInput } from './egress';
 import { buildEvidenceSummary, readEgressLog } from './evidence';
 import { applyCandidate } from './external/normalize';
+import {
+  HANDOFF_DECISION_TTL_MS,
+  HandoffConsumeError,
+  HandoffLedger,
+  sealHandoff,
+} from './collaboration/handoff';
+import { deriveFindingDispositions } from './collaboration/findingLifecycle';
 import { EventStore, readJson, writeJsonAtomic } from './store';
 import {
   RUN_STATE_SCHEMA_VERSION,
@@ -145,7 +155,7 @@ interface ProjectRecord {
 interface PendingApproval {
   readonly request: ApprovalRequest;
   /** 兑现审批：内部会清理超时定时器、abort 监听，并恢复墙钟 deadline */
-  readonly resolve: (decision: ApprovalDecisionKind) => void;
+  readonly resolve: (decision: ApprovalDecisionKind, note?: string) => void;
 }
 
 /**
@@ -322,8 +332,17 @@ interface RunRecord {
   consent: DataEgressConsent | null;
   /** 交叉审核聚合记录；跑过才有 */
   crossReview: CrossReviewRecord | null;
+  pendingHandoff: CollaborationHandoff | null;
+  handoffContinuation: { handoffId: string; resolve: () => void } | null;
+  /** 交接等待独立于暂停的任务墙钟；每个 Run 同时最多一个。 */
+  handoffExpiryTimer: ReturnType<typeof setTimeout> | null;
+  collaborationMode: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO' | null;
+  /** 同一 Attempt 的自修复、首审、整改和复审共享一个循环身份。 */
+  collaborationCycleId: string | null;
+  stopAfterStepRequested: boolean;
   /** 实现方冻结路由 + 执行起点。交叉审核续期（crossreview.continue）复用；恢复态没有 */
   implementerResolution?: ModelRouteResolution | null;
+  plannerResolution?: ModelRouteResolution | null;
   executionStartedAt?: number | null;
 }
 
@@ -411,6 +430,8 @@ export class RunAuthority {
   private readonly profiles = new Map<string, RepositoryHarnessProfile>();
   private readonly runs = new Map<string, RunRecord>();
   private readonly gateway = new ModelGateway();
+  private readonly handoffs = new HandoffLedger();
+  private readonly coreEpoch = Date.now();
 
   private readonly backgroundRetention: boolean;
 
@@ -464,7 +485,7 @@ export class RunAuthority {
    */
   private readonly commandApprovals = new Map<string, CommandApproval>();
 
-  private persist(record: RunRecord): void {
+  private persist(record: RunRecord, required = false): void {
     try {
       writeRunState({
         schemaVersion: RUN_STATE_SCHEMA_VERSION,
@@ -482,8 +503,9 @@ export class RunAuthority {
         persistedAt: nowIso(),
       });
     } catch (err) {
-      // 写盘失败不能让运行中的 Run 崩掉，但必须留痕 —— 否则就成了静默的证据丢失
+      // 普通快照失败留痕并继续；出站预留失败必须同步抛出，让调用在网络边界前停下。
       console.error('[core] 持久化 Run 状态失败', record.view.runId, err);
+      if (required) throw err;
     }
   }
 
@@ -511,6 +533,21 @@ export class RunAuthority {
       }
 
       const s = loaded.state;
+      const collaborationProjection = s.view.collaborationProjection ?? (s.task.collaboration
+        ? {
+            roles: [
+              s.task.collaboration.planner,
+              s.task.collaboration.implementer,
+              s.task.collaboration.reviewer,
+            ].map(({ role, executionKind, label }) => ({ role, executionKind, label })),
+            cycleId: null,
+            currentCycle: { reviewerInvocations: 0, remediations: 0 },
+            taskTotals: {
+              reviewerInvocations: s.crossReview?.reviewerInvocations ?? 0,
+              remediations: s.crossReview?.remediations ?? 0,
+            },
+          }
+        : null);
       // 事件比状态新 = 崩溃发生在两次写之间。如实标注，不假装一致
       const eventsAhead = events.lastSeq() > s.eventHighWatermark;
       /*
@@ -528,6 +565,8 @@ export class RunAuthority {
            * "不可知"与"旧格式"混成一种表现。
            */
           snapshotId: s.view.snapshotId ?? s.snapshot?.snapshotId ?? null,
+          collaborationProjection,
+          pendingHandoff: null,
           restored: true,
           evidence: logDamage ? 'DAMAGED' : eventsAhead ? 'EVENTS_AHEAD' : 'INTACT',
           evidenceDetail: logDamage
@@ -557,6 +596,13 @@ export class RunAuthority {
         author: null,
         consent: null,
         crossReview: s.crossReview ?? null,
+        pendingHandoff: null,
+        handoffContinuation: null,
+        handoffExpiryTimer: null,
+        collaborationMode: s.view.collaborationControl?.mode ?? s.task.collaboration?.mode ?? null,
+        collaborationCycleId: null,
+        stopAfterStepRequested: false,
+        plannerResolution: null,
       };
 
       this.runs.set(runId, record);
@@ -666,6 +712,12 @@ export class RunAuthority {
       author: null,
       consent: null,
       crossReview: null,
+      pendingHandoff: null,
+      handoffContinuation: null,
+      handoffExpiryTimer: null,
+      collaborationMode: null,
+      collaborationCycleId: null,
+      stopAfterStepRequested: false,
     };
   }
 
@@ -807,6 +859,15 @@ export class RunAuthority {
 
       case 'crossreview.continue':
         return this.continueCrossReview(String(payload.runId));
+
+      case 'collaboration.getHandoff':
+        return { handoff: this.runs.get(String(payload.runId))?.pendingHandoff ?? null };
+
+      case 'collaboration.continue':
+        return this.continueCollaboration(payload as never);
+
+      case 'collaboration.control':
+        return this.updateCollaborationControl(payload as never);
 
       case 'patch.decide':
         return this.decidePatch(payload as never);
@@ -1149,6 +1210,8 @@ export class RunAuthority {
     snapshotId: string;
     profileId: string;
     modelProfileId: string;
+    plannerModelProfileId?: string;
+    collaborationMode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
     goal: string;
     taskClass: TaskSpec['taskClass'];
     allowedPaths: string[];
@@ -1258,6 +1321,9 @@ export class RunAuthority {
     this.profiles.set(effectiveProfile.profileId, effectiveProfile);
 
     const resolution = this.gateway.freezeRoute(input.modelProfileId);
+    const plannerResolution = input.plannerModelProfileId
+      ? this.gateway.freezeRoute(input.plannerModelProfileId)
+      : null;
 
     // 交叉审核方 route：每任务显式勾选，凭据缺失时降级为不审核，
     // 绝不回落到 implementer 的 route（那就成了自审）。
@@ -1327,6 +1393,9 @@ export class RunAuthority {
       snapshotId: snapshot.snapshotId,
       snapshotFileCount: snapshot.fileCount,
       implementer: { profile: this.requireProfile(input.modelProfileId), resolution },
+      planner: plannerResolution
+        ? { profile: this.requireProfile(plannerResolution.profileId), resolution: plannerResolution }
+        : null,
       reviewer:
         reviewer === null
           ? null
@@ -1358,6 +1427,85 @@ export class RunAuthority {
       acceptedAt: nowIso(),
     };
 
+    if (input.collaborationMode) {
+      if (!plannerResolution) {
+        throw platformError('BAD_REQUEST', '双 Agent 协作任务必须明确选择计划方');
+      }
+      if (!reviewer || reviewer.parity.kind !== 'HETEROGENEOUS') {
+        throw platformError(
+          'BAD_REQUEST',
+          '双 Agent 协作要求实施方与审核方可证明异构',
+          reviewer?.parity.detail ?? reviewerDegradeNote ?? '没有可用审核方',
+        );
+      }
+      if (author && !author.connector.identityDigest) {
+        throw platformError('BAD_REQUEST', '外部实施方身份无法冻结，不能进入双 Agent 协作');
+      }
+      if (reviewer.kind === 'EXTERNAL_CLI' && !reviewer.connector.identityDigest) {
+        throw platformError('BAD_REQUEST', '外部审核方身份无法冻结，不能进入双 Agent 协作');
+      }
+      if (author || reviewer.kind === 'EXTERNAL_CLI') {
+        throw platformError(
+          'BAD_REQUEST',
+          '原生引擎自动角色尚未通过 Core 工具治理准入',
+          '当前外部 CLI 只具备一次性候选副本边界，尚无逐工具权限、命令分级和逐次账本证据；请改用已治理的模型 API 角色',
+        );
+      }
+    }
+    const collaboration = input.collaborationMode && plannerResolution && reviewer
+      ? (() => {
+          const planner = {
+            role: 'PLANNER' as const,
+            executionKind: 'MODEL_API' as const,
+            profileId: plannerResolution.profileId,
+            connectorId: null,
+            identityDigest: plannerResolution.digest,
+            label: `${plannerResolution.providerId}/${plannerResolution.modelId}`,
+          };
+          const implementer = author
+            ? {
+                role: 'IMPLEMENTER' as const,
+                executionKind: 'MANAGED_ENGINE' as const,
+                profileId: null,
+                connectorId: author.connector.connectorId,
+                identityDigest: author.connector.identityDigest!,
+                label: author.label,
+              }
+            : {
+                role: 'IMPLEMENTER' as const,
+                executionKind: 'MODEL_API' as const,
+                profileId: resolution.profileId,
+                connectorId: null,
+                identityDigest: resolution.digest,
+                label: `${resolution.providerId}/${resolution.modelId}`,
+              };
+          const review = reviewer.kind === 'MODEL_API'
+            ? {
+                role: 'REVIEWER' as const,
+                executionKind: 'MODEL_API' as const,
+                profileId: reviewer.resolution.profileId,
+                connectorId: null,
+                identityDigest: reviewer.resolution.digest,
+                label: reviewer.label,
+              }
+            : {
+                role: 'REVIEWER' as const,
+                executionKind: 'MANAGED_ENGINE' as const,
+                profileId: null,
+                connectorId: reviewer.connector.connectorId,
+                identityDigest: reviewer.connector.identityDigest!,
+                label: reviewer.label,
+              };
+          return {
+            mode: input.collaborationMode!,
+            planner,
+            implementer,
+            reviewer: review,
+            roleBindingDigest: digestOf({ planner, implementer, reviewer: review }),
+          };
+        })()
+      : undefined;
+
     const task: TaskSpec = {
       taskId: newId('task'),
       projectId: input.projectId,
@@ -1365,6 +1513,7 @@ export class RunAuthority {
       profileId: effectiveProfile.profileId,
       goal: effectiveGoal,
       ...(input.handoffDigest ? { handoffDigest: input.handoffDigest } : {}),
+      ...(collaboration ? { collaboration } : {}),
       taskClass: input.taskClass,
       // 不再默认收窄到 src/**：用户信任的是整个项目
       allowedPaths: input.allowedPaths.length ? input.allowedPaths : ['**'],
@@ -1406,6 +1555,7 @@ export class RunAuthority {
     const depsRoot = snapshot.subPath ? join(project.hostPath, snapshot.subPath) : project.hostPath;
     const workspace = MaterializedWorkspace.create(runId, snapshot.snapshotId, depsRoot);
 
+    const collaborationCycleId = task.collaboration ? newId('cycle') : null;
     const view: RunView = {
       runId,
       taskId: task.taskId,
@@ -1422,6 +1572,21 @@ export class RunAuthority {
       createdAt: nowIso(),
       updatedAt: nowIso(),
       terminalFacts: null,
+      collaborationControl: task.collaboration
+        ? { mode: task.collaboration.mode, stopAfterStepRequested: false }
+        : null,
+      collaborationProjection: task.collaboration
+        ? {
+            roles: [
+              task.collaboration.planner,
+              task.collaboration.implementer,
+              task.collaboration.reviewer,
+            ].map(({ role, executionKind, label }) => ({ role, executionKind, label })),
+            cycleId: collaborationCycleId,
+            currentCycle: { reviewerInvocations: 0, remediations: 0 },
+            taskTotals: { reviewerInvocations: 0, remediations: 0 },
+          }
+        : null,
       restored: false,
       evidence: 'INTACT',
       evidenceDetail: null,
@@ -1448,6 +1613,13 @@ export class RunAuthority {
       author,
       consent,
       crossReview: null,
+      pendingHandoff: null,
+      handoffContinuation: null,
+      handoffExpiryTimer: null,
+      collaborationMode: task.collaboration?.mode ?? null,
+      collaborationCycleId,
+      stopAfterStepRequested: false,
+      plannerResolution,
     };
     this.runs.set(runId, record);
 
@@ -1455,6 +1627,9 @@ export class RunAuthority {
       taskId: task.taskId,
       snapshotId: snapshot.snapshotId,
       route: { providerId: resolution.providerId, modelId: resolution.modelId, origin: resolution.origin },
+      ...(plannerResolution
+        ? { plannerRoute: { providerId: plannerResolution.providerId, modelId: plannerResolution.modelId, origin: plannerResolution.origin } }
+        : {}),
       // 越过默认门禁的事实必须留在事件里，不能只存在于当时那次点击
       baseKind: snapshot.baseKind,
       dirtyFileCount: snapshot.dirtyFileCount,
@@ -1659,12 +1834,45 @@ export class RunAuthority {
         workspace,
         gateway: this.consentBoundGateway(record),
         resolution,
+        ...(record.plannerResolution ? { plannerResolution: record.plannerResolution } : {}),
         mutationPolicy,
         runId: record.view.runId,
         attemptId: record.view.attemptId,
         signal: record.abort.signal,
         host: this.hostFor(record, deadline),
         commandApprovals: this.approvalCheckerFor(record),
+        ...(record.task.collaboration
+          ? {
+              checkpointBeforeSelfFix: async (checkpoint: {
+                round: number;
+                verification: VerificationRun;
+              }) => {
+                if (!record.verifications.some(
+                  (item) => item.verificationRunId === checkpoint.verification.verificationRunId,
+                )) {
+                  record.verifications.push(checkpoint.verification);
+                }
+                this.createCollaborationHandoff(
+                  record,
+                  workspace,
+                  null,
+                  checkpoint.verification,
+                  {
+                    fromRole: 'IMPLEMENTER',
+                    toRole: 'IMPLEMENTER',
+                    nextPhase: 'SELF_FIX',
+                  },
+                );
+                await this.awaitCollaborationBoundary(
+                  record,
+                  deadline,
+                  `验证失败，等待你确认开始第 ${checkpoint.round}/${record.task.budget.maxSelfFixRounds} 轮自修复`,
+                  'EXECUTING',
+                  `用户已确认，实施方开始第 ${checkpoint.round}/${record.task.budget.maxSelfFixRounds} 轮自修复`,
+                );
+              },
+            }
+          : {}),
         ...(record.author
           ? { externalAuthor: this.authorRunnerFor(record, record.author, workspace, mutationPolicy, deadline) }
           : {}),
@@ -1705,6 +1913,16 @@ export class RunAuthority {
           // 有阻断发现时由实现方 route 自动整改一次（重验 + 重封存），再审一轮。
           // 审核结论只是给人的第二意见，绝不改变"接受与否"仍由人决定这件事。
           if (record.reviewer) {
+            if (record.task.collaboration) {
+              this.createCollaborationHandoff(record, workspace, patch, result.finalVerification);
+              await this.awaitCollaborationBoundary(
+                record,
+                deadline,
+                '实现阶段完成，等待你确认交给审核方',
+                'CROSS_REVIEWING',
+                '交接已确认，审核方开始只读审核',
+              );
+            }
             await this.runCrossReview(
               record,
               workspace,
@@ -1973,6 +2191,8 @@ export class RunAuthority {
   private disclosureFor(input: {
     snapshotId: string;
     modelProfileId: string;
+    plannerModelProfileId?: string;
+    collaborationMode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
     reviewerModelProfileId?: string;
     reviewerConnectorId?: string;
     authorConnectorId?: string;
@@ -1981,6 +2201,9 @@ export class RunAuthority {
     const snapshot = this.snapshots.get(input.snapshotId);
     if (!snapshot) throw platformError('NOT_FOUND', `快照不存在：${input.snapshotId}`);
     const implementer = { profile: this.requireProfile(input.modelProfileId), resolution: this.gateway.freezeRoute(input.modelProfileId) };
+    const planner = input.plannerModelProfileId
+      ? { profile: this.requireProfile(input.plannerModelProfileId), resolution: this.gateway.freezeRoute(input.plannerModelProfileId) }
+      : null;
     let reviewer: DisclosureInput['reviewer'] = null;
     if (input.reviewerConnectorId) {
       const d = descriptorOfConnector(input.reviewerConnectorId);
@@ -2033,6 +2256,7 @@ export class RunAuthority {
       snapshotId: snapshot.snapshotId,
       snapshotFileCount: snapshot.fileCount,
       implementer,
+      planner,
       reviewer,
       reviewerParity,
       author,
@@ -2162,6 +2386,15 @@ export class RunAuthority {
         // 作者超时受任务墙钟收口：剩余时间不够 15 分钟就只给剩余时间（至少 30s 让它能诚实失败）
         const remaining = record.task.budget.maxWallClockMs - deadline.elapsedMs();
         const timeoutMs = Math.max(30_000, Math.min(EXTERNAL_AUTHOR_TIMEOUT_MS, remaining));
+        const budget = this.modelBudgetExceeded(record, deadline);
+        if (budget.exceeded) throw new ModelDispatchBudgetExceeded(budget.reason);
+        this.emit(
+          record,
+          'MODEL_INVOCATION',
+          `${i.phase} 外部 CLI 作者调用准备派发给 ${author.label}`,
+          { phase: 'DISPATCH_INTENT', connectorId: author.connector.connectorId },
+        );
+        this.charge(record, deadline, { modelTurns: 1, inputTokens: null, outputTokens: null }, true);
         const result = await runExternalCliAuthor({
           connector: author.connector,
           apiKey: author.apiKey,
@@ -2173,7 +2406,7 @@ export class RunAuthority {
           signal: record.abort.signal,
           candidate,
         });
-        // 与 reviewer 同样平行落账：外部 CLI 调用不伪装成模型 API 出站；token 未知 → 账本记未知轮次
+        // 与 reviewer 同样平行记录终态：外部 CLI 调用不伪装成模型 API 出站
         this.emit(
           record,
           'MODEL_INVOCATION',
@@ -2182,8 +2415,6 @@ export class RunAuthority {
           }${result.manifest.changedCount !== null ? ` changed=${result.manifest.changedCount}` : ''}）`,
           { externalInvocation: result.manifest },
         );
-        this.charge(record, deadline, { modelTurns: 1, inputTokens: null, outputTokens: null });
-
         if (result.manifest.state === 'CANCELLED') return { kind: 'CANCELLED' };
         if (result.manifest.state !== 'SEALED' || !result.seal) {
           return { kind: 'FAILED', detail: result.manifest.failureDetail ?? result.manifest.state };
@@ -2250,17 +2481,35 @@ export class RunAuthority {
     record: RunRecord,
     reviewer: ReviewerBinding,
     deps: AgentDeps,
+    deadline: PausableDeadline,
   ): ReviewPassRunner {
+    const cycleId = record.collaborationCycleId ?? record.view.attemptId;
+    const identifyRound = (round: CrossReviewRound): CrossReviewRound => ({
+      ...round,
+      cycleId,
+      reviewId: `${cycleId}:review:${round.round}`,
+    });
     if (reviewer.kind === 'MODEL_API') {
-      return (i) => runReviewPass(deps, { ...i, reviewerResolution: reviewer.resolution });
+      return async (i) => identifyRound(
+        await runReviewPass(deps, { ...i, reviewerResolution: reviewer.resolution }),
+      );
     }
     return async (i) => {
       this.assertExternalEgressConsent(record, reviewer.connector, 'REVIEWER');
       const startedAt = nowIso();
+      const budget = this.modelBudgetExceeded(record, deadline);
+      if (budget.exceeded) throw new ModelDispatchBudgetExceeded(budget.reason);
+      this.emit(
+        record,
+        'MODEL_INVOCATION',
+        `CROSS_REVIEW 外部 CLI 审核调用准备派发给 ${reviewer.label}`,
+        { phase: 'DISPATCH_INTENT', connectorId: reviewer.connector.connectorId },
+      );
+      this.charge(record, deadline, { modelTurns: 1, inputTokens: null, outputTokens: null }, true);
       const result = await runExternalCliReview({
         connector: reviewer.connector,
         apiKey: reviewer.apiKey,
-        brief: renderReviewBrief(record.task, i.patch, i.finalVerification),
+        brief: renderReviewBrief(record.task, i.patch, i.finalVerification, i.priorFindings ?? []),
         runId: record.view.runId,
         attemptId: record.view.attemptId,
         timeoutMs: EXTERNAL_REVIEW_TIMEOUT_MS,
@@ -2295,15 +2544,16 @@ export class RunAuthority {
           'NOTE',
           `外部审核方未产出可用结论（${result.manifest.failureDetail ?? result.manifest.state}）：本轮记为 INCONCLUSIVE`,
         );
-        return { ...round, verdict: 'INCONCLUSIVE' as const, findings: [] };
+        return identifyRound({ ...round, verdict: 'INCONCLUSIVE' as const, findings: [] });
       }
       const normalized = parseExternalSubmission(
         result.submission.verdict,
         result.submission.findings,
+        result.submission.resolvedFindingFingerprints,
       );
       if (!normalized) {
         this.emit(record, 'NOTE', '外部审核方的结论未通过 schema 校验：本轮记为 INCONCLUSIVE');
-        return { ...round, verdict: 'INCONCLUSIVE' as const, findings: [] };
+        return identifyRound({ ...round, verdict: 'INCONCLUSIVE' as const, findings: [] });
       }
       this.emit(
         record,
@@ -2312,7 +2562,12 @@ export class RunAuthority {
           `（阻断 ${normalized.findings.filter((f) => f.blocking).length}）`,
         { round: i.round, verdict: normalized.verdict, findingCount: normalized.findings.length },
       );
-      return { ...round, verdict: normalized.verdict, findings: normalized.findings };
+      return identifyRound({
+        ...round,
+        verdict: normalized.verdict,
+        findings: normalized.findings,
+        resolvedFindingFingerprints: normalized.resolvedFindingFingerprints,
+      });
     };
   }
 
@@ -2331,6 +2586,20 @@ export class RunAuthority {
     if (!reviewer) return;
 
     const prior = record.crossReview;
+    if (record.view.collaborationProjection) {
+      record.view = {
+        ...record.view,
+        collaborationProjection: {
+          ...record.view.collaborationProjection,
+          cycleId: record.collaborationCycleId,
+          currentCycle: { reviewerInvocations: 0, remediations: 0 },
+          taskTotals: {
+            reviewerInvocations: prior?.reviewerInvocations ?? 0,
+            remediations: prior?.remediations ?? 0,
+          },
+        },
+      };
+    }
     this.setStatus(
       record,
       'CROSS_REVIEWING',
@@ -2376,12 +2645,32 @@ export class RunAuthority {
     const verificationEnabled = record.task.verificationCommandIds.length > 0;
 
     let rounds: readonly CrossReviewRound[] = [];
+    let reviewerInvocations = 0;
     let remediations = 0;
     let stopReason: CrossReviewStopReason;
     try {
+      const unresolvedPriorFindings = isContinuation
+        ? (prior?.findingDispositions ?? [])
+            .filter(
+              (finding) =>
+                finding.disposition !== 'RESOLVED' && finding.disposition !== 'USER_ACCEPTED',
+            )
+            .map((finding) =>
+              [...(prior?.rounds ?? [])]
+                .reverse()
+                .flatMap((round) => round.findings)
+                .find((candidate) => candidate.fingerprint === finding.fingerprint),
+            )
+            .filter((finding): finding is import('@shared/domain').ReviewFinding => Boolean(finding))
+        : [];
       const outcome = await runCrossReviewCycle(
         deps,
-        { review: this.reviewerRunnerFor(record, reviewer, deps), patch, finalVerification },
+        {
+          review: this.reviewerRunnerFor(record, reviewer, deps, deadline),
+          patch,
+          finalVerification,
+          priorFindings: unresolvedPriorFindings,
+        },
         {
           reverify: verificationEnabled
             ? async () => {
@@ -2441,9 +2730,60 @@ export class RunAuthority {
               `工作区已恢复：gen-${r.generation} 复制自整改前的 gen-${preGen}，封存补丁与文件树重新一致`,
             );
           },
+          ...(record.task.collaboration
+            ? {
+                checkpoint: async (checkpoint: {
+                  phase: 'REMEDIATE' | 'SECOND_REVIEW';
+                  patch: PatchArtifact;
+                  findings: readonly import('@shared/domain').ReviewFinding[];
+                  reviewerInvocations: number;
+                  remediations: number;
+                  reviewId: string;
+                }) => {
+                  if (record.view.collaborationProjection) {
+                    record.view = {
+                      ...record.view,
+                      collaborationProjection: {
+                        ...record.view.collaborationProjection,
+                        currentCycle: {
+                          reviewerInvocations: checkpoint.reviewerInvocations,
+                          remediations: checkpoint.remediations,
+                        },
+                        taskTotals: {
+                          reviewerInvocations: (prior?.reviewerInvocations ?? 0) + checkpoint.reviewerInvocations,
+                          remediations: (prior?.remediations ?? 0) + checkpoint.remediations,
+                        },
+                      },
+                    };
+                  }
+                  const verification = [...record.verifications].reverse().find((item) => item.phase === 'POST_MUTATION') ?? null;
+                  this.createCollaborationHandoff(record, workspace, checkpoint.patch, verification, {
+                    fromRole: checkpoint.phase === 'REMEDIATE' ? 'REVIEWER' : 'IMPLEMENTER',
+                    toRole: checkpoint.phase === 'REMEDIATE' ? 'IMPLEMENTER' : 'REVIEWER',
+                    nextPhase: checkpoint.phase,
+                    findings: checkpoint.findings,
+                    reviewerInvocations: checkpoint.reviewerInvocations,
+                    remediations: checkpoint.remediations,
+                    reviewId: checkpoint.reviewId,
+                  });
+                  await this.awaitCollaborationBoundary(
+                    record,
+                    deadline,
+                    checkpoint.phase === 'REMEDIATE'
+                      ? '审核发现已冻结，等待你交给实施方整改'
+                      : '整改工件已冻结，等待你交给审核方复审',
+                    'CROSS_REVIEWING',
+                    checkpoint.phase === 'REMEDIATE'
+                      ? '交接已确认，实施方正在整改'
+                      : '交接已确认，审核方正在复审',
+                  );
+                },
+              }
+            : {}),
         },
       );
       rounds = outcome.rounds;
+      reviewerInvocations = outcome.reviewerInvocations;
       remediations = outcome.remediations;
       stopReason = outcome.stopReason;
     } catch (err) {
@@ -2464,21 +2804,40 @@ export class RunAuthority {
       reviewer.kind === 'MODEL_API'
         ? { kind: 'MODEL_API', profileId: reviewer.resolution.profileId }
         : { kind: 'EXTERNAL_CLI', connectorId: reviewer.connector.connectorId };
+    const allRounds = [...priorRounds, ...renumbered];
+    const findingDispositions = deriveFindingDispositions(
+      allRounds,
+      record.collaborationCycleId ?? record.view.attemptId,
+    );
     const cr: CrossReviewRecord = {
       enabled: true,
       reviewerIdentity,
       reviewerProfileId: legacyReviewerProfileId(reviewerIdentity),
       heterogeneous: reviewer.parity.kind === 'HETEROGENEOUS',
       vendorParity: reviewer.parity,
-      rounds: [...priorRounds, ...renumbered],
-      reviewerInvocations: (prior?.reviewerInvocations ?? 0) + rounds.length,
+      rounds: allRounds,
+      reviewerInvocations: (prior?.reviewerInvocations ?? 0) + reviewerInvocations,
       remediations: (prior?.remediations ?? 0) + remediations,
+      findingDispositions,
       userContinuations: (prior?.userContinuations ?? 0) + (isContinuation ? 1 : 0),
       stopReason,
       startedAt: prior?.startedAt ?? crStart,
       finishedAt: nowIso(),
     };
     record.crossReview = cr;
+    if (record.view.collaborationProjection) {
+      record.view = {
+        ...record.view,
+        collaborationProjection: {
+          ...record.view.collaborationProjection,
+          currentCycle: { reviewerInvocations, remediations },
+          taskTotals: {
+            reviewerInvocations: cr.reviewerInvocations,
+            remediations: cr.remediations,
+          },
+        },
+      };
+    }
 
     const blockingTotal = cr.rounds.flatMap((r) => r.findings).filter((f) => f.blocking).length;
     const findingTotal = cr.rounds.flatMap((r) => r.findings).length;
@@ -2526,8 +2885,23 @@ export class RunAuthority {
 
       setStatus: (status: RunStatus, reason: string | null) => this.setStatus(record, status, reason),
 
-      awaitPlanApproval: (plan: PlanRevision): Promise<ApprovalDecisionKind> => {
+      awaitPlanApproval: (
+        plan: PlanRevision,
+      ): Promise<'APPROVE' | 'REJECT' | { decision: 'REVISE'; note: string }> => {
         record.plan = plan;
+        const approvalSubjectDigest = digestOf({
+          runId: record.view.runId,
+          attemptId: record.view.attemptId,
+          projectId: record.task.projectId,
+          snapshotId: record.task.snapshotId,
+          planDigest: plan.digest,
+          roleBindingDigest: record.task.collaboration?.roleBindingDigest ?? null,
+          collaborationMode: record.task.collaboration?.mode ?? null,
+          budget: record.task.budget,
+          allowedPaths: record.task.allowedPaths,
+          protectedPaths: record.task.protectedPaths,
+          verificationCommandIds: record.task.verificationCommandIds,
+        });
         const request: ApprovalRequest = {
           approvalId: newId('appr'),
           runId: record.view.runId,
@@ -2546,8 +2920,9 @@ export class RunAuthority {
                 ? '整个仓库（未限定路径；仅受保护路径除外）'
                 : record.task.allowedPaths.join(', ')
             }；受保护路径：${record.task.protectedPaths.join(', ') || '（无）'}` +
+            `\n协作模式：${record.task.collaboration?.mode ?? '普通任务'}；预算：模型 ${record.task.budget.maxModelTurns} 轮 / 工具 ${record.task.budget.maxToolCalls} 次 / 自修复 ${record.task.budget.maxSelfFixRounds} 轮` +
             (record.author ? `\n实现方：外部 CLI ${record.author.label}（只在一次性副本里改，差异归一化后进主线）` : ''),
-          subjectDigest: plan.digest,
+          subjectDigest: approvalSubjectDigest,
           requestedAt: nowIso(),
           expiresAt: new Date(Date.now() + APPROVAL_TTL_MS).toISOString(),
         };
@@ -2555,7 +2930,7 @@ export class RunAuthority {
         // 人工审批不消耗计算预算：暂停墙钟，用户决定后再恢复。
         deadline.pause();
 
-        return new Promise<ApprovalDecisionKind>((resolve, reject) => {
+        return new Promise<'APPROVE' | 'REJECT' | { decision: 'REVISE'; note: string }>((resolve, reject) => {
           // 已被取消就别挂起了，否则 runAgent 永远等不到（addEventListener 对已 abort
           // 的 signal 不会再触发）。正常路径上 runAgent 在调用本函数前刚 throwIfCancelled 过。
           if (record.abort.signal.aborted) {
@@ -2590,10 +2965,10 @@ export class RunAuthority {
 
           record.approvals.set(request.approvalId, {
             request,
-            resolve: (decision: ApprovalDecisionKind) => {
+            resolve: (decision: ApprovalDecisionKind, note = '') => {
               cleanup();
               deadline.resume(); // 决定完成，计算预算继续计时
-              resolve(decision);
+              resolve(decision === 'REVISE' ? { decision, note } : decision);
             },
           });
           record.abort.signal.addEventListener('abort', onAbort, { once: true });
@@ -2692,33 +3067,42 @@ export class RunAuthority {
         });
       },
 
-      chargeModelTurn: (inputTokens: number | null, outputTokens: number | null) =>
-        this.charge(record, deadline, {
-          modelTurns: 1,
-          inputTokens,
-          outputTokens,
-        }),
+      reserveModelTurn: () => this.charge(record, deadline, { modelTurns: 1 }, true),
+
+      settleModelTurn: (inputTokens: number | null, outputTokens: number | null) =>
+        this.charge(record, deadline, { inputTokens, outputTokens }),
 
       chargeToolCall: () => this.charge(record, deadline, { toolCalls: 1 }),
 
       chargeSelfFixRound: () => this.charge(record, deadline, { selfFixRounds: 1 }),
 
-      budgetExceeded: () => {
-        const l = record.view.ledger;
-        const lim = record.task.budget;
-        if (l.modelTurns >= lim.maxModelTurns) return { exceeded: true, reason: `模型轮次达上限 ${lim.maxModelTurns}` };
-        if (l.toolCalls >= lim.maxToolCalls) return { exceeded: true, reason: `工具调用达上限 ${lim.maxToolCalls}` };
-        if (l.inputTokens + l.outputTokens >= lim.maxTotalTokens) {
-          return { exceeded: true, reason: `token 达上限 ${lim.maxTotalTokens}` };
-        }
-        if (deadline.elapsedMs() >= lim.maxWallClockMs) return { exceeded: true, reason: '超过时间预算' };
-        return { exceeded: false, reason: '' };
-      },
+      budgetExceeded: () => this.modelBudgetExceeded(record, deadline),
     };
   }
 
+  private modelBudgetExceeded(
+    record: RunRecord,
+    deadline: PausableDeadline,
+  ): { exceeded: boolean; reason: string } {
+    const l = record.view.ledger;
+    const lim = record.task.budget;
+    if (l.modelTurns >= lim.maxModelTurns) return { exceeded: true, reason: `模型轮次达上限 ${lim.maxModelTurns}` };
+    if (l.toolCalls >= lim.maxToolCalls) return { exceeded: true, reason: `工具调用达上限 ${lim.maxToolCalls}` };
+    if (l.inputTokens + l.outputTokens >= lim.maxTotalTokens) {
+      return { exceeded: true, reason: `token 达上限 ${lim.maxTotalTokens}` };
+    }
+    if (deadline.elapsedMs() >= lim.maxWallClockMs) return { exceeded: true, reason: '超过时间预算' };
+    return { exceeded: false, reason: '' };
+  }
+
   /** 账本只增不减 —— retry / deny / cancel 都不回退已消耗量 */
-  private charge(record: RunRecord, deadline: PausableDeadline, delta: LedgerCharge): void {
+  private charge(
+    record: RunRecord,
+    deadline: PausableDeadline,
+    delta: LedgerCharge,
+    requirePersistence = false,
+  ): void {
+    const previousView = record.view;
     record.view = {
       ...record.view,
       // null/undefined 的三态语义在 applyLedgerCharge：null 计入未知轮次，不折算成 0
@@ -2727,6 +3111,13 @@ export class RunAuthority {
       workspaceGeneration: record.workspace?.activeGeneration ?? record.view.workspaceGeneration,
       updatedAt: nowIso(),
     };
+    // 模型派发预留依赖这次同步持久化；写失败会在 gateway 进入 adapter 前抛出。
+    try {
+      this.persist(record, requirePersistence);
+    } catch (error) {
+      record.view = previousView;
+      throw error;
+    }
     this.push({ type: 'run.updated', run: record.view });
   }
 
@@ -2766,8 +3157,15 @@ export class RunAuthority {
         return { accepted: false, reason: '审批已过期' };
       }
 
+      if (input.decision === 'REVISE' && pending.request.kind !== 'PLAN') {
+        return { accepted: false, reason: '只有计划审批可以要求修订' };
+      }
+      if (input.decision === 'REVISE' && input.note.trim().length === 0) {
+        return { accepted: false, reason: '请填写计划修改要求' };
+      }
+
       // pending.resolve 内部会清理定时器/监听、恢复墙钟、并从 map 删除
-      pending.resolve(input.decision);
+      pending.resolve(input.decision, input.note);
       return { accepted: true, reason: null };
     }
     return { accepted: false, reason: '审批请求不存在或已被处理' };
@@ -2843,12 +3241,40 @@ export class RunAuthority {
     if (remainingMs <= 0) return deny('任务时间预算已耗尽，无法续期');
 
     const continuation = (cr.userContinuations ?? 0) + 1;
-    this.emit(
-      record,
-      'NOTE',
-      `用户授权继续交叉审核循环（第 ${continuation} 次续期）：再跑最多 ${CROSS_REVIEW_LIMITS.maxReviewerInvocations} 轮审核 + ${CROSS_REVIEW_LIMITS.maxRemediations} 次整改`,
-      { kind: 'CROSS_REVIEW_CONTINUATION', continuation },
-    );
+    const previousCycleId = record.collaborationCycleId;
+    const previousProjection = record.view.collaborationProjection;
+    record.collaborationCycleId = newId('cycle');
+    if (record.view.collaborationProjection) {
+      record.view = {
+        ...record.view,
+        collaborationProjection: {
+          ...record.view.collaborationProjection,
+          cycleId: record.collaborationCycleId,
+          currentCycle: { reviewerInvocations: 0, remediations: 0 },
+          taskTotals: {
+            reviewerInvocations: cr.reviewerInvocations,
+            remediations: cr.remediations,
+          },
+        },
+      };
+    }
+    try {
+      this.emit(
+        record,
+        'NOTE',
+        `用户授权继续交叉审核循环（第 ${continuation} 次续期）：再跑最多 ${CROSS_REVIEW_LIMITS.maxReviewerInvocations} 轮审核 + ${CROSS_REVIEW_LIMITS.maxRemediations} 次整改`,
+        {
+          kind: 'CROSS_REVIEW_CONTINUATION',
+          continuation,
+          previousCycleId,
+          cycleId: record.collaborationCycleId,
+        },
+      );
+    } catch (error) {
+      record.collaborationCycleId = previousCycleId;
+      record.view = { ...record.view, collaborationProjection: previousProjection };
+      throw error;
+    }
 
     const workspace = record.workspace;
     const patch = record.patch;
@@ -2856,13 +3282,13 @@ export class RunAuthority {
     const finalVerification =
       [...record.verifications].reverse().find((v) => v.phase === 'POST_MUTATION') ?? null;
 
-    const deadline = new PausableDeadline(remainingMs, () => {
+    const deadline = new PausableDeadline(record.task.budget.maxWallClockMs, () => {
       if (!isTerminal(record.view.status)) {
         record.abort.abort();
         this.cleanupPendingApprovals(record);
         this.setStatus(record, 'TIMED_OUT', '超过任务时间预算', 'TIMEOUT');
       }
-    });
+    }, record.view.ledger.elapsedMs);
     record.deadline = deadline;
 
     // 与 execute 的收尾同构：循环语义全函数，出错折叠进 stopReason，终点仍是人工审查
@@ -2895,6 +3321,405 @@ export class RunAuthority {
 
     // runCrossReview 的开头在 spawn 的同步段里已把状态置为 CROSS_REVIEWING
     return { run: record.view, accepted: true, reason: null };
+  }
+
+  private createCollaborationHandoff(
+    record: RunRecord,
+    workspace: MaterializedWorkspace,
+    patch: PatchArtifact | null,
+    verification: VerificationRun | null,
+    stage: {
+      fromRole: 'IMPLEMENTER' | 'REVIEWER';
+      toRole: 'IMPLEMENTER' | 'REVIEWER';
+      nextPhase: 'SELF_FIX' | 'FIRST_REVIEW' | 'REMEDIATE' | 'SECOND_REVIEW';
+      findings?: readonly import('@shared/domain').ReviewFinding[];
+      reviewerInvocations?: number;
+      remediations?: number;
+      reviewId?: string;
+    } = { fromRole: 'IMPLEMENTER', toRole: 'REVIEWER', nextPhase: 'FIRST_REVIEW' },
+  ): void {
+    const collaboration = record.task.collaboration;
+    const plan = record.plan;
+    const cycleId = record.collaborationCycleId;
+    if (!collaboration || !plan || !record.consent || !cycleId) {
+      throw new Error('协作交接缺少已冻结的计划、角色或披露事实');
+    }
+    const now = Date.now();
+    const handoff = sealHandoff({
+      schemaVersion: 1,
+      handoffId: newId('handoff'),
+      taskId: record.task.taskId,
+      runId: record.view.runId,
+      attemptId: record.view.attemptId,
+      cycleId,
+      fromRole: stage.fromRole,
+      toRole: stage.toRole,
+      nextPhase: stage.nextPhase,
+      plan: { planId: plan.planId, revision: plan.revision, digest: plan.digest },
+      snapshotId: record.snapshot.snapshotId,
+      baseTreeDigest: record.snapshot.treeDigest,
+      generation: workspace.activeGeneration,
+      treeDigest: workspace.treeDigest(),
+      roleBindingDigest: collaboration.roleBindingDigest,
+      patch: patch ? { patchId: patch.patchId, digest: patch.digest } : null,
+      changedPaths: patch
+        ? patch.files.map((file) => file.path)
+        : workspace.changedFilesVsBaseline(),
+      verificationIds: verification ? [verification.verificationRunId] : [],
+      /*
+       * treeDigest 已绑定本代全部文件内容；再把冻结命令定义和本次验证引用纳入摘要，
+       * 才能表达“这次验证究竟基于什么”。被触碰的文件名列表只描述覆盖弱化，
+       * 不能冒充验证输入内容摘要。
+       */
+      verificationInputDigest: verification
+        ? digestOf({
+            treeDigest: workspace.treeDigest(),
+            verificationRunId: verification.verificationRunId,
+            commands: record.task.verificationCommandIds.map((commandId) => ({
+              commandId,
+              definition: record.profile.commands[commandId] ?? null,
+            })),
+          })
+        : null,
+      verificationEligible: Boolean(
+        verification?.passed &&
+        (!patch || patch.verificationRunId === verification.verificationRunId) &&
+        !(patch?.verificationInputsTouched?.length),
+      ),
+      findings: (stage.findings ?? []).map((finding) => ({
+        findingId: finding.fingerprint,
+        fingerprint: finding.fingerprint,
+        reviewId: stage.reviewId ?? `${cycleId}:review:${stage.reviewerInvocations ?? 1}`,
+        blocking: finding.blocking,
+        evidenceRefs: finding.file ? [finding.file] : [],
+        disposition: stage.nextPhase === 'SECOND_REVIEW'
+          ? 'REMEDIATED_PENDING_REVIEW' as const
+          : 'OPEN' as const,
+      })),
+      context: {
+        goal: record.task.goal,
+        acceptance: record.task.acceptance,
+        allowedPaths: record.task.allowedPaths,
+        planSummary: plan.summary,
+        provenance: [
+          record.snapshot.snapshotId,
+          ...(patch ? [patch.patchId] : []),
+          ...(verification ? [verification.verificationRunId] : []),
+        ],
+      },
+      disclosureDigest: record.consent.disclosureDigest,
+      recipientIdentityDigest: stage.toRole === 'REVIEWER'
+        ? collaboration.reviewer.identityDigest
+        : collaboration.implementer.identityDigest,
+      dataClasses: [
+        'TASK_TEXT',
+        ...(patch ? ['PATCH_DIFF' as const] : []),
+        ...(verification ? ['COMMAND_OUTPUT' as const] : []),
+        ...(stage.findings?.length ? ['REVIEW_FINDINGS' as const] : []),
+      ],
+      counts: {
+        included: 2 + (patch?.files.length ?? 0) + (verification ? 1 : 0) + (stage.findings?.length ?? 0),
+        excluded: 0,
+        truncated: patch?.files.filter((file) => file.diffTruncated).length ?? 0,
+        reasons: ['included 按 goal、plan、patch file、verification summary、finding 条目计数'],
+      },
+      budget: {
+        modelTurnsRemaining: Math.max(0, record.task.budget.maxModelTurns - record.view.ledger.modelTurns),
+        toolCallsRemaining: Math.max(0, record.task.budget.maxToolCalls - record.view.ledger.toolCalls),
+        reviewerInvocations: stage.reviewerInvocations ?? record.crossReview?.reviewerInvocations ?? 0,
+        remediations: stage.remediations ?? record.crossReview?.remediations ?? 0,
+      },
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + HANDOFF_DECISION_TTL_MS).toISOString(),
+      coreEpoch: this.coreEpoch,
+    });
+    record.pendingHandoff = handoff;
+    this.clearHandoffExpiry(record);
+    const expiryDelay = Math.max(0, Date.parse(handoff.expiresAt) - Date.now());
+    record.handoffExpiryTimer = setTimeout(() => {
+      this.expireCollaborationHandoff(record, handoff, '交接决定已过期（超过 30 分钟未处理）');
+    }, expiryDelay);
+    record.handoffExpiryTimer.unref?.();
+    record.view = {
+      ...record.view,
+      pendingHandoff: {
+        handoffId: handoff.handoffId,
+        digest: handoff.digest,
+        nextPhase: handoff.nextPhase,
+        toRole: handoff.toRole,
+        expiresAt: handoff.expiresAt,
+      },
+    };
+    this.emit(
+      record,
+      'HANDOFF_CREATED',
+      `${stage.fromRole === 'REVIEWER' ? '审核发现' : stage.nextPhase === 'SECOND_REVIEW' ? '整改工件' : stage.nextPhase === 'SELF_FIX' ? '失败验证与当前工作区' : '实施工件'}已冻结，等待人工交给${stage.toRole === 'REVIEWER' ? '审核方' : '实施方'}`,
+      {
+      handoffId: handoff.handoffId,
+      digest: handoff.digest,
+      nextPhase: handoff.nextPhase,
+      expiresAt: handoff.expiresAt,
+      },
+    );
+  }
+
+  private async awaitCollaborationBoundary(
+    record: RunRecord,
+    deadline: PausableDeadline,
+    waitingReason: string,
+    resumeStatus: 'EXECUTING' | 'CROSS_REVIEWING',
+    resumeReason: string,
+  ): Promise<void> {
+    const handoff = record.pendingHandoff;
+    if (!handoff) throw new Error('协作边界缺少已冻结的交接工件');
+    const requiresUser = record.collaborationMode === 'MANUAL_HANDOFF' || record.stopAfterStepRequested;
+    if (record.stopAfterStepRequested) {
+      record.stopAfterStepRequested = false;
+      record.view = {
+        ...record.view,
+        collaborationControl: record.collaborationMode
+          ? { mode: record.collaborationMode, stopAfterStepRequested: false }
+          : null,
+      };
+    }
+
+    this.setStatus(
+      record,
+      'AWAITING_HANDOFF',
+      requiresUser ? waitingReason : '有界自动正在校验并消费已冻结交接工件',
+    );
+    deadline.pause();
+    const wait = new Promise<void>((resolve) => {
+      record.handoffContinuation = { handoffId: handoff.handoffId, resolve };
+    });
+
+    if (!requiresUser) {
+      try {
+        const result = this.continueCollaboration({
+          runId: record.view.runId,
+          handoffId: handoff.handoffId,
+          handoffDigest: handoff.digest,
+          decisionId: `auto_${newId('decision')}`,
+        });
+        if (!result.accepted) {
+          this.emit(record, 'NOTE', `自动交接未被消费，已停留给用户处理：${result.reason ?? '未知原因'}`);
+        }
+      } catch (error) {
+        this.emit(record, 'NOTE', `自动交接落账失败，已停留给用户处理：${(error as Error).message}`);
+      }
+    }
+
+    await wait;
+    record.handoffContinuation = null;
+    if (record.abort.signal.aborted) throw new AgentCancelled();
+    deadline.resume();
+    this.setStatus(record, resumeStatus, resumeReason);
+  }
+
+  private continueCollaboration(input: {
+    runId: string;
+    handoffId: string;
+    handoffDigest: string;
+    decisionId: string;
+  }): { run: RunView; accepted: boolean; reason: string | null } {
+    const record = this.require(input.runId);
+    const deny = (reason: string) => ({ run: record.view, accepted: false, reason });
+    const handoff = record.pendingHandoff;
+    const collaboration = record.task.collaboration;
+    const workspace = record.workspace;
+    if (record.view.status !== 'AWAITING_HANDOFF' || !handoff || !collaboration || !workspace) {
+      return deny('当前 Run 没有可消费的活跃交接工件');
+    }
+    const resolution = record.implementerResolution;
+    const startedAt = record.executionStartedAt;
+    const continuation = record.handoffContinuation;
+    const resumesWaitingPhase = continuation?.handoffId === handoff.handoffId;
+    if (!resolution || startedAt == null || (!resumesWaitingPhase && !record.patch)) {
+      return deny('执行上下文已失效，无法继续协作阶段');
+    }
+    const decision: CollaborationHandoffDecision = {
+      decisionId: input.decisionId,
+      handoffId: input.handoffId,
+      handoffDigest: input.handoffDigest,
+      action: 'CONTINUE',
+      decidedAt: nowIso(),
+    };
+    const verification = handoff.verificationIds.length === 1
+      ? record.verifications.find((item) => item.verificationRunId === handoff.verificationIds[0]) ?? null
+      : null;
+    const verificationInputDigest = verification
+      ? digestOf({
+          treeDigest: workspace.treeDigest(),
+          verificationRunId: verification.verificationRunId,
+          commands: record.task.verificationCommandIds.map((commandId) => ({
+            commandId,
+            definition: record.profile.commands[commandId] ?? null,
+          })),
+        })
+      : null;
+    const recipientIdentityDigest = handoff.toRole === 'REVIEWER'
+      ? collaboration.reviewer.identityDigest
+      : collaboration.implementer.identityDigest;
+    try {
+      this.handoffs.consume(handoff, decision, {
+        runId: record.view.runId,
+        attemptId: record.view.attemptId,
+        coreEpoch: this.coreEpoch,
+        generation: workspace.activeGeneration,
+        roleBindingDigest: collaboration.roleBindingDigest,
+        planDigest: record.plan?.digest ?? '',
+        snapshotId: record.snapshot.snapshotId,
+        baseTreeDigest: record.snapshot.treeDigest,
+        treeDigest: workspace.treeDigest(),
+        patchDigest: record.patch?.digest ?? null,
+        verificationInputDigest,
+        verificationEligible: Boolean(
+          verification?.passed &&
+          (!record.patch || record.patch.verificationRunId === verification.verificationRunId) &&
+          !(record.patch?.verificationInputsTouched?.length),
+        ),
+        disclosureDigest: record.consent?.disclosureDigest ?? '',
+        recipientIdentityDigest,
+        contextDigest: digestOf({
+          goal: record.task.goal,
+          acceptance: record.task.acceptance,
+          allowedPaths: record.task.allowedPaths,
+          planSummary: record.plan?.summary ?? '',
+          provenance: [
+            record.snapshot.snapshotId,
+            ...(record.patch ? [record.patch.patchId] : []),
+            ...(verification ? [verification.verificationRunId] : []),
+          ],
+        }),
+        nowMs: Date.now(),
+      });
+    } catch (error) {
+      if (error instanceof HandoffConsumeError && error.code === 'HANDOFF_EXPIRED') {
+        this.expireCollaborationHandoff(record, handoff, error.message);
+      }
+      return deny((error as Error).message);
+    }
+    record.pendingHandoff = null;
+    record.view = { ...record.view, pendingHandoff: null };
+    try {
+      const automatic = decision.decisionId.startsWith('auto_');
+      this.emit(record, 'HANDOFF_DECIDED', `${automatic ? 'Core 自动确认' : '用户确认'}交给${handoff.toRole === 'REVIEWER' ? '审核方' : '实施方'}`, {
+        decisionId: decision.decisionId,
+        handoffId: decision.handoffId,
+        handoffDigest: decision.handoffDigest,
+        automatic,
+      });
+      this.clearHandoffExpiry(record);
+    } catch (error) {
+      // 决定没有进入持久化事件流时，保留原交接边界，不能唤醒下一角色。
+      this.handoffs.rollback(decision);
+      record.pendingHandoff = handoff;
+      record.view = {
+        ...record.view,
+        pendingHandoff: {
+          handoffId: handoff.handoffId,
+          digest: handoff.digest,
+          nextPhase: handoff.nextPhase,
+          toRole: handoff.toRole,
+          expiresAt: handoff.expiresAt,
+        },
+      };
+      throw error;
+    }
+
+    if (resumesWaitingPhase) {
+      continuation.resolve();
+      return { run: record.view, accepted: true, reason: null };
+    }
+
+    const deadline = record.deadline ?? new PausableDeadline(
+      record.task.budget.maxWallClockMs,
+      () => record.abort.abort(),
+      record.view.ledger.elapsedMs,
+    );
+    record.deadline = deadline;
+    void (async () => {
+      try {
+        const finalVerification = [...record.verifications].reverse().find((item) => item.phase === 'POST_MUTATION') ?? null;
+        const baseline = record.verifications.find((item) => item.phase === 'BASELINE') ?? null;
+        await this.runCrossReview(record, workspace, startedAt, deadline, record.patch!, finalVerification, baseline, resolution);
+        if (!isTerminal(record.view.status)) this.setStatus(record, 'AWAITING_PATCH_REVIEW', '交叉审核已结束，等待你审查补丁');
+      } catch (error) {
+        this.emit(record, 'NOTE', `交叉审核异常（补丁不受影响）：${(error as Error).message}`);
+        if (!isTerminal(record.view.status)) this.setStatus(record, 'AWAITING_PATCH_REVIEW', '交叉审核异常结束，补丁仍可审查');
+      } finally {
+        deadline.clear();
+        record.deadline = null;
+      }
+    })();
+    return { run: record.view, accepted: true, reason: null };
+  }
+
+  private updateCollaborationControl(input: {
+    runId: string;
+    mode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
+    stopAfterStep?: boolean;
+  }): { run: RunView; accepted: boolean; reason: string | null } {
+    const record = this.require(input.runId);
+    if (!record.task.collaboration || !record.collaborationMode) {
+      return { run: record.view, accepted: false, reason: '该 Run 未启用双 Agent 协作' };
+    }
+    if (record.view.restored || isTerminal(record.view.status)) {
+      return { run: record.view, accepted: false, reason: '该 Run 已没有可控制的活动执行器' };
+    }
+    if (input.mode === undefined && input.stopAfterStep === undefined) {
+      return { run: record.view, accepted: false, reason: '没有提交协作控制变更' };
+    }
+    if (input.mode) record.collaborationMode = input.mode;
+    if (input.stopAfterStep !== undefined) record.stopAfterStepRequested = input.stopAfterStep;
+    record.view = {
+      ...record.view,
+      collaborationControl: {
+        mode: record.collaborationMode,
+        stopAfterStepRequested: record.stopAfterStepRequested,
+      },
+      updatedAt: nowIso(),
+    };
+    this.emit(
+      record,
+      'NOTE',
+      `协作控制已更新：${record.collaborationMode === 'MANUAL_HANDOFF' ? '逐步交接' : '有界自动'}${record.stopAfterStepRequested ? '，将在下一安全边界停靠' : ''}`,
+      {
+        mode: record.collaborationMode,
+        stopAfterStepRequested: record.stopAfterStepRequested,
+      },
+    );
+    return { run: record.view, accepted: true, reason: null };
+  }
+
+  /**
+   * 任务墙钟在人工交接时暂停，因此交接 TTL 必须由独立 timer 驱动。过期会终止
+   * 当前活执行器并释放等待 Promise；先落 BLOCKED，异步栈随后醒来时不得把它复活。
+   */
+  private expireCollaborationHandoff(
+    record: RunRecord,
+    handoff: CollaborationHandoff,
+    reason: string,
+  ): void {
+    if (
+      record.pendingHandoff?.handoffId !== handoff.handoffId ||
+      record.view.status !== 'AWAITING_HANDOFF'
+    ) {
+      return;
+    }
+    this.clearHandoffExpiry(record);
+    record.pendingHandoff = null;
+    record.view = { ...record.view, pendingHandoff: null };
+    record.abort.abort();
+    record.handoffContinuation?.resolve();
+    record.handoffContinuation = null;
+    this.cleanupPendingApprovals(record);
+    this.setStatus(record, 'BLOCKED', reason, 'APPROVAL_EXPIRED');
+  }
+
+  private clearHandoffExpiry(record: RunRecord): void {
+    if (record.handoffExpiryTimer) clearTimeout(record.handoffExpiryTimer);
+    record.handoffExpiryTimer = null;
   }
 
   /**
@@ -2969,6 +3794,16 @@ export class RunAuthority {
       return { run: record.view, reason: `当前状态 ${record.view.status} 不接受补丁决定` };
     }
 
+    const unresolvedFindings = record.crossReview?.findingDispositions?.filter(
+      (finding) => finding.disposition === 'OPEN' || finding.disposition === 'REMEDIATED_PENDING_REVIEW',
+    ) ?? [];
+    if (input.decision === 'ACCEPT' && unresolvedFindings.length > 0 && input.note.trim().length === 0) {
+      return {
+        run: record.view,
+        reason: `仍有 ${unresolvedFindings.length} 条审核发现未被复审确认解决；接受即表示用户显式忽略，必须填写理由`,
+      };
+    }
+
     const acceptanceId = newId('acc');
     this.emit(record, 'PATCH_DECISION', `用户决定：${input.decision}`, {
       patchId: record.patch.patchId,
@@ -2978,6 +3813,22 @@ export class RunAuthority {
     });
 
     if (input.decision === 'ACCEPT') {
+      if (record.crossReview && unresolvedFindings.length > 0) {
+        const unresolvedFingerprints = new Set(unresolvedFindings.map((finding) => finding.fingerprint));
+        record.crossReview = {
+          ...record.crossReview,
+          findingDispositions: record.crossReview.findingDispositions?.map((finding) =>
+            unresolvedFingerprints.has(finding.fingerprint)
+              ? {
+                  ...finding,
+                  disposition: 'USER_ACCEPTED' as const,
+                  reason: input.note.trim(),
+                  patchDigest: record.patch!.digest,
+                }
+              : finding,
+          ),
+        };
+      }
       /*
        * 这是整套设计里最后一条不肯让步的规则：
        *   有通过的验证 + 用户接受 → SUCCEEDED
@@ -3383,6 +4234,11 @@ export class RunAuthority {
       return record.view;
     }
     record.abort.abort();
+    this.clearHandoffExpiry(record);
+    record.handoffContinuation?.resolve();
+    record.handoffContinuation = null;
+    record.pendingHandoff = null;
+    record.view = { ...record.view, pendingHandoff: null };
     this.cleanupPendingApprovals(record);
     this.setStatus(record, 'CANCELLED', reason, 'USER_CANCELLED');
     return record.view;
@@ -3438,6 +4294,17 @@ export class RunAuthority {
     record.priorPatches.push(previous);
     record.patch = null;
     record.plan = null;
+    record.collaborationCycleId = record.task.collaboration ? newId('cycle') : null;
+    if (record.view.collaborationProjection) {
+      record.view = {
+        ...record.view,
+        collaborationProjection: {
+          ...record.view.collaborationProjection,
+          cycleId: record.collaborationCycleId,
+          currentCycle: { reviewerInvocations: 0, remediations: 0 },
+        },
+      };
+    }
     this.cleanupPendingApprovals(record); // 旧审批一律失效（正常此时已无 pending）
     record.approvals.clear();
     record.deadline?.clear();

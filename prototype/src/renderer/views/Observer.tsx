@@ -11,6 +11,9 @@ import { Badge, Banner, Card, relativeTime } from '../components/common';
 
 const SESSION_REFRESH_MS = 3_000;
 const ATTENTION_QUEUE_LIMIT = 8;
+type AttentionDisposition = 'SEEN' | 'SNOOZED' | 'HANDED_OFF';
+const ATTENTION_STORAGE_KEY = 'repopilot.observer.attention.v1';
+const ALIAS_STORAGE_KEY = 'repopilot.observer.aliases.v1';
 
 /**
  * 观察与交接面板（PRD-WKB-002/003/004）：本机 Claude / Codex 会话的只读镜像。
@@ -47,6 +50,23 @@ export function ObserverView({
   const [prepared, setPrepared] = useState<ObserverHandoffArtifact | null>(null);
   const [copied, setCopied] = useState(false);
   const [focusTarget, setFocusTarget] = useState<string | null>(null);
+  const [aliases, setAliases] = useState<Readonly<Record<string, string>>>(() => {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(ALIAS_STORAGE_KEY) ?? '{}') as unknown;
+      return typeof parsed === 'object' && parsed !== null ? parsed as Record<string, string> : {};
+    } catch {
+      return {};
+    }
+  });
+  const [aliasDrafts, setAliasDrafts] = useState<Readonly<Record<string, string>>>({});
+  const [attention, setAttention] = useState<Readonly<Record<string, AttentionDisposition>>>(() => {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(ATTENTION_STORAGE_KEY) ?? '{}') as unknown;
+      return typeof parsed === 'object' && parsed !== null ? parsed as Record<string, AttentionDisposition> : {};
+    } catch {
+      return {};
+    }
+  });
   const activeRef = useRef(true);
   const grantedRef = useRef<string | null>(null);
   const refreshInFlightRef = useRef(false);
@@ -178,8 +198,26 @@ export function ObserverView({
   };
 
   const focusFromQueue = async (sessionId: string) => {
+    const session = sessions.find((item) => item.sessionId === sessionId);
+    if (session) setAttentionDisposition(session, 'SEEN');
     setFocusTarget(sessionId);
     if (!(await watch(sessionId))) setFocusTarget(null);
+  };
+
+  const localSessionKey = (sessionId: string) => `${granted ?? 'UNGRANTED'}:${sessionId}`;
+  const attentionKey = (session: ObserverSessionEntry) =>
+    `${localSessionKey(session.sessionId)}:${session.attentionEventId ?? `legacy:${session.completion.state}:${session.completion.evidence.join('|')}`}`;
+
+  const setAttentionDisposition = (session: ObserverSessionEntry, disposition: AttentionDisposition) => {
+    setAttention((current) => {
+      const next = { ...current, [attentionKey(session)]: disposition };
+      try {
+        window.localStorage.setItem(ATTENTION_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // 本地导航状态写不进去时不影响只读日志与 Core 事实。
+      }
+      return next;
+    });
   };
 
   const unwatchOne = async (sessionId: string) => {
@@ -217,7 +255,24 @@ export function ObserverView({
   const vendorLabel = (v: ObserverSessionEntry['vendor']) =>
     v === 'CLAUDE_JOURNAL' ? 'Claude' : 'Codex';
   const labelOf = (sessionId: string) =>
-    sessions.find((s) => s.sessionId === sessionId)?.label ?? sessionId.replace(/^[A-Z_]+:/, '');
+    aliases[localSessionKey(sessionId)]?.trim()
+    || sessions.find((s) => s.sessionId === sessionId)?.label
+    || sessionId.replace(/^[A-Z_]+:/, '');
+  const saveAlias = (sessionId: string) => {
+    const key = localSessionKey(sessionId);
+    const nextAlias = (aliasDrafts[key] ?? aliases[key] ?? '').trim().slice(0, 72);
+    setAliases((current) => {
+      const next = { ...current };
+      if (nextAlias) next[key] = nextAlias;
+      else delete next[key];
+      try {
+        window.localStorage.setItem(ALIAS_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // 别名只是本地导航偏好；存储失败不改变源日志或观察授权。
+      }
+      return next;
+    });
+  };
   const compactLabel = (label: string) =>
     label.length <= 18 ? label : `${label.slice(0, 8)}…${label.slice(-8)}`;
   const sourceLabel = (source: ObserverSessionEntry['source']) =>
@@ -234,13 +289,22 @@ export function ObserverView({
     'SPAWNED_BY_US',
     'UNKNOWN',
   ] as const;
-  const waitingSessions = sessions.filter((session) => session.completion.state === 'READY_TO_HANDOFF');
-  const visibleWaitingSessions = waitingSessions.slice(0, ATTENTION_QUEUE_LIMIT);
-  const omittedWaitingSessions = waitingSessions.length - visibleWaitingSessions.length;
+  const completedSessions = sessions.filter((session) => session.completion.state === 'READY_TO_HANDOFF');
+  const newCompletedSessions = completedSessions.filter((session) => attention[attentionKey(session)] === undefined);
+  const visibleCompletedSessions = newCompletedSessions.slice(0, ATTENTION_QUEUE_LIMIT);
+  const omittedCompletedSessions = newCompletedSessions.length - visibleCompletedSessions.length;
+  const attentionCounts = completedSessions.reduce(
+    (countsByDisposition, session) => {
+      const disposition = attention[attentionKey(session)];
+      if (disposition) countsByDisposition[disposition] += 1;
+      return countsByDisposition;
+    },
+    { SEEN: 0, SNOOZED: 0, HANDED_OFF: 0 },
+  );
   const unknownCompletionCount = sessions.filter((session) => session.completion.state === 'UNKNOWN').length;
   const completionLabel = (session: ObserverSessionEntry) =>
     session.completion.state === 'READY_TO_HANDOFF'
-      ? '待你决定'
+      ? '本轮结束可查看'
       : session.completion.state === 'RUNNING'
         ? '本轮进行中'
         : '结束状态未知';
@@ -312,27 +376,31 @@ export function ObserverView({
             </div>
             {sessions.length > 0 && (
               <section
-                aria-label="待你输入队列"
+                aria-label="会话注意队列"
                 style={{ marginTop: 10, padding: 10, border: '1px solid var(--border)', borderRadius: 8 }}
               >
                 <div className="row wrap" style={{ justifyContent: 'space-between' }}>
-                  <strong style={{ fontSize: 12 }}>待你输入 / 决定 · {waitingSessions.length}</strong>
+                  <strong style={{ fontSize: 12 }}>本轮结束可查看 · {newCompletedSessions.length}</strong>
                   <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>只用于导航</span>
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
-                  机器字段只说明本轮已经结束；不会自动交接，也不会改变任务、审批或成功状态。
+                  当前日志合同没有结构化待答问题或待批准对象，因此这里不会把“本轮结束”写成“等你回复”。
+                  明确待答 0 · 待批准 0；不会自动交接，也不会改变任务、审批或成功状态。
                 </div>
-                {visibleWaitingSessions.length > 0 ? (
+                {visibleCompletedSessions.length > 0 ? (
                   <div className="row wrap" style={{ marginTop: 7 }}>
-                    {visibleWaitingSessions.map((session) => (
-                      <button
-                        key={session.sessionId}
-                        onClick={() => void focusFromQueue(session.sessionId)}
-                        title={`${session.sessionId}\n结束依据：${session.completion.evidence.join('；')}`}
-                      >
-                        {vendorLabel(session.vendor)} / {compactLabel(session.label)}
-                        {watching.includes(session.sessionId) ? ' · 镜像中' : ''}
-                      </button>
+                    {visibleCompletedSessions.map((session) => (
+                      <div key={attentionKey(session)} className="row">
+                        <button
+                          onClick={() => void focusFromQueue(session.sessionId)}
+                          title={`${session.sessionId}\n结束依据：${session.completion.evidence.join('；')}`}
+                        >
+                          {vendorLabel(session.vendor)} / {compactLabel(labelOf(session.sessionId))}
+                          {watching.includes(session.sessionId) ? ' · 镜像中' : ''}
+                        </button>
+                        <button onClick={() => setAttentionDisposition(session, 'SEEN')}>看过</button>
+                        <button onClick={() => setAttentionDisposition(session, 'SNOOZED')}>暂缓</button>
+                      </div>
                     ))}
                   </div>
                 ) : (
@@ -340,10 +408,13 @@ export function ObserverView({
                     暂无机器字段显示本轮结束的会话。
                   </div>
                 )}
-                {(omittedWaitingSessions > 0 || unknownCompletionCount > 0) && (
+                {(omittedCompletedSessions > 0 || unknownCompletionCount > 0 || Object.values(attentionCounts).some((count) => count > 0)) && (
                   <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6 }}>
-                    {omittedWaitingSessions > 0 ? `更早的 ${omittedWaitingSessions} 个待决定会话未在队列展开。` : ''}
+                    {omittedCompletedSessions > 0 ? `更早的 ${omittedCompletedSessions} 个结束事件未在队列展开。` : ''}
                     {unknownCompletionCount > 0 ? `另有 ${unknownCompletionCount} 个会话结束状态未知。` : ''}
+                    {attentionCounts.SEEN > 0 ? `已看过 ${attentionCounts.SEEN} 个。` : ''}
+                    {attentionCounts.SNOOZED > 0 ? `暂缓 ${attentionCounts.SNOOZED} 个。` : ''}
+                    {attentionCounts.HANDED_OFF > 0 ? `已交接 ${attentionCounts.HANDED_OFF} 个。` : ''}
                   </div>
                 )}
               </section>
@@ -371,23 +442,43 @@ export function ObserverView({
                       </div>
                       {group.map((s) => {
                         const mirrored = watching.includes(s.sessionId);
+                        const key = localSessionKey(s.sessionId);
+                        const hasAlias = Boolean(aliases[key]?.trim());
                         return (
-                          <button
-                            key={s.sessionId}
-                            className={`list-item ${mirrored ? 'active' : ''}`}
-                            onClick={() => void watch(s.sessionId)}
-                            title={`${s.sessionId}\n${s.sourceEvidence.join('；')}`}
-                            aria-pressed={mirrored}
-                          >
-                            <div className="name">
-                              {vendorLabel(s.vendor)} · {s.label}
-                              {mirrored ? '　镜像中' : ''}
+                          <div key={s.sessionId} className="observer-session-entry">
+                            <button
+                              className={`list-item ${mirrored ? 'active' : ''}`}
+                              onClick={() => void watch(s.sessionId)}
+                              title={`${s.sessionId}\n${s.sourceEvidence.join('；')}`}
+                              aria-pressed={mirrored}
+                            >
+                              <div className="name">
+                                {vendorLabel(s.vendor)} · {labelOf(s.sessionId)}
+                                {mirrored ? '　镜像中' : ''}
+                              </div>
+                              <div className="meta">
+                                {sourceLabel(s.source)} · {completionLabel(s)} · {relativeTime(s.updatedAt)} ·{' '}
+                                {(s.sizeBytes / 1024).toFixed(0)}KB
+                                {` · 标题来源 ${hasAlias ? 'LOCAL_ALIAS' : s.labelSource ?? 'FILE_FALLBACK'}`}
+                                {s.labelOmissions && (s.labelOmissions.recordsOmittedAtLeast > 0 || s.labelOmissions.bytesOmitted > 0 || s.labelOmissions.labelCharactersOmitted > 0)
+                                  ? ` · 标题省略：至少 ${s.labelOmissions.recordsOmittedAtLeast} 条/${s.labelOmissions.bytesOmitted} 字节，截去 ${s.labelOmissions.labelCharactersOmitted} 字符`
+                                  : ''}
+                              </div>
+                            </button>
+                            <div className="row" style={{ marginTop: 4 }}>
+                              <input
+                                aria-label={`${s.label} 的本地别名`}
+                                placeholder="本地别名（不修改源会话）"
+                                maxLength={72}
+                                value={aliasDrafts[key] ?? aliases[key] ?? ''}
+                                onChange={(event) => setAliasDrafts((current) => ({
+                                  ...current,
+                                  [key]: event.target.value,
+                                }))}
+                              />
+                              <button onClick={() => saveAlias(s.sessionId)}>{hasAlias ? '更新别名' : '保存别名'}</button>
                             </div>
-                            <div className="meta">
-                              {sourceLabel(s.source)} · {completionLabel(s)} · {relativeTime(s.updatedAt)} ·{' '}
-                              {(s.sizeBytes / 1024).toFixed(0)}KB
-                            </div>
-                          </button>
+                          </div>
                         );
                       })}
                     </section>
@@ -510,7 +601,12 @@ export function ObserverView({
                       <button
                         className="primary"
                         disabled={!canUsePreparedAsTask}
-                        onClick={() => prepared && onUseAsReviewTask?.(prepared)}
+                        onClick={() => {
+                          if (!prepared) return;
+                          const session = sessions.find((item) => item.sessionId === prepared.sessionId);
+                          if (session) setAttentionDisposition(session, 'HANDED_OFF');
+                          onUseAsReviewTask?.(prepared);
+                        }}
                       >
                         进入 RepoPilot 有界审核
                       </button>

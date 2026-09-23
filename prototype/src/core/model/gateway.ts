@@ -86,6 +86,11 @@ export interface InvocationInput {
   readonly contextFileRefs: readonly string[];
   readonly signal: AbortSignal;
   /**
+   * 每次真正进入 adapter 前的同步闸门。调用方必须在这里持久化发送意图并预留预算；
+   * 回调抛错时本次 adapter 调用不会发生，重试同样逐次经过这道门。
+   */
+  readonly onDispatch?: (attempt: ModelDispatchAttempt) => void;
+  /**
    * 用户在 task.create 时对 DataEgressDisclosure 的同意（PRD-DATA-001）。
    * 除 CONNECTIVITY_TEST 外所有 purpose 都必须带；缺失 → CONSENT_MISSING，
    * 冻结路由不在同意覆盖范围内 → CONSENT_STALE。两者都在发送前阻断，P0 无"仍然发送"。
@@ -102,6 +107,16 @@ export interface InvocationInput {
    * 看起来像模型说过这些话。
    */
   readonly onStream?: StreamListener;
+}
+
+export interface ModelDispatchAttempt {
+  readonly invocationId: string;
+  readonly sendAttempt: number;
+  readonly requestedAt: string;
+  readonly purpose: ModelInvocationPurpose;
+  readonly resolutionId: string;
+  readonly providerId: string;
+  readonly modelId: string;
 }
 
 export interface InvocationOutput {
@@ -480,6 +495,24 @@ export class ModelGateway {
     for (let att = 1; ; att += 1) {
       const requestedAt = nowIso();
       const composed = attemptSignal(input.signal, policy.perAttemptTimeoutMs);
+      /*
+       * 预算与发送意图必须先于任何网络副作用落盘。这个回调故意放在 adapter 的
+       * try/catch 外：持久化失败属于平台拒绝，不得被包装成网络失败后继续重试。
+       */
+      try {
+        input.onDispatch?.({
+          invocationId,
+          sendAttempt: att,
+          requestedAt,
+          purpose: input.purpose,
+          resolutionId: resolution.resolutionId,
+          providerId: resolution.providerId,
+          modelId: resolution.modelId,
+        });
+      } catch (error) {
+        composed.clear();
+        throw error;
+      }
       try {
         const callCtx = {
           apiKey, // 只在这一层展开，调用结束即离开作用域
@@ -628,4 +661,3 @@ export class InvocationFailed extends Error {
     super(cause.message);
   }
 }
-

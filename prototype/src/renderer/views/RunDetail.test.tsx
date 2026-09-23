@@ -141,6 +141,47 @@ describe('RunDetail entity-owned local state', () => {
     cleanup();
   });
 
+  it('人工交接按钮提交冻结的 handoff 身份并刷新', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'crossreview.get') return { crossReview: null };
+      if (method === 'collaboration.getHandoff') return {
+        handoff: {
+          handoffId: 'handoff_1',
+          digest: 'sha256:handoff',
+          plan: { revision: 1 },
+          context: { planSummary: '修复登录按钮' },
+          patch: { patchId: 'patch_1' },
+          changedPaths: ['src/login.tsx'],
+          verificationIds: ['verification_1'],
+          verificationEligible: true,
+          findings: [],
+          budget: { modelTurnsRemaining: 5, toolCallsRemaining: 8, reviewerInvocations: 1, remediations: 0 },
+          counts: { included: 4, excluded: 0, truncated: 0, reasons: [] },
+          dataClasses: ['TASK_TEXT', 'PATCH_DIFF'],
+        },
+      };
+      if (method === 'collaboration.continue') return { accepted: true, reason: null };
+      throw new Error(`unexpected ${method}`);
+    });
+    const run = {
+      ...makeRun('run-handoff', 'AWAITING_HANDOFF'),
+      pendingHandoff: {
+        handoffId: 'handoff_1',
+        digest: 'sha256:handoff',
+        nextPhase: 'REMEDIATE' as const,
+        toRole: 'IMPLEMENTER' as const,
+        expiresAt: '2026-09-15T12:00:00.000Z',
+      },
+    };
+    render(detail(run));
+    expect(await screen.findByText(/revision 1 · 修复登录按钮/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '确认交接' }));
+    await waitFor(() => expect(requestMock).toHaveBeenCalledWith(
+      'collaboration.continue',
+      expect.objectContaining({ runId: 'run-handoff', handoffId: 'handoff_1', handoffDigest: 'sha256:handoff' }),
+    ));
+  });
+
   it('drops Run A cross-review after switching to B and exposes B read failure', async () => {
     const reviewA = deferred<{ crossReview: CrossReviewRecord | null }>();
     const reviewB = deferred<{ crossReview: CrossReviewRecord | null }>();
@@ -690,5 +731,67 @@ describe('diff 进编辑器（交互评审 v0.2 P2）', () => {
     );
     await screen.findByText(/已修复|未经机器验证/);
     expect(screen.queryByRole('button', { name: '在编辑器打开' })).toBeNull();
+  });
+});
+
+describe('未解决审核发现的人工接受', () => {
+  beforeEach(() => requestMock.mockReset());
+  afterEach(() => cleanup());
+
+  it('要求填写理由，并把理由随当前 patch digest 提交给 Core', async () => {
+    const finding = {
+      severity: 'HIGH' as const,
+      confidence: 0.9,
+      file: 'src/app.ts',
+      range: [1, 1] as const,
+      evidence: '边界分支仍未覆盖',
+      reproduction: null,
+      suggestedRemediation: '补负向用例',
+      blocking: true,
+      fingerprint: 'sha256:finding-open',
+    };
+    const crossReview: CrossReviewRecord = {
+      ...makeCrossReview(),
+      rounds: [{
+        round: 1,
+        reviewedPatchDigest: 'sha256:p-risk',
+        reviewerResolutionId: 'resolution-1',
+        verdict: 'CHANGES_REQUESTED',
+        findings: [finding],
+        resolvedFindingFingerprints: [],
+        startedAt: '2026-08-13T00:00:00.000Z',
+        finishedAt: '2026-08-13T00:00:01.000Z',
+      }],
+      findingDispositions: [{
+        fingerprint: finding.fingerprint,
+        disposition: 'OPEN',
+        reviewId: 'cycle-1:review:1',
+      }],
+    };
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'crossreview.get') return { crossReview };
+      return { run: makeRun('run-risk', 'SUCCEEDED'), reason: null };
+    });
+
+    render(detail(makeRun('run-risk', 'AWAITING_PATCH_REVIEW'), makePatch('p-risk', 'run-risk')));
+    expect(await screen.findByText((_content, element) =>
+      element?.classList.contains('banner') === true
+      && element.textContent?.includes('仍有 1 条审核发现') === true,
+    )).toBeTruthy();
+    const accept = screen.getByRole('button', { name: '接受补丁' });
+    expect((accept as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.change(screen.getByPlaceholderText('说明为何接受这些未解决发现'), {
+      target: { value: '该分支不在本次发布范围，已人工核对' },
+    });
+    expect((accept as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(accept);
+    await waitFor(() => expect(requestMock).toHaveBeenCalledWith('patch.decide', expect.objectContaining({
+      runId: 'run-risk',
+      patchId: 'p-risk',
+      patchDigest: 'sha256:p-risk',
+      decision: 'ACCEPT',
+      note: '该分支不在本次发布范围，已人工核对',
+    })));
   });
 });

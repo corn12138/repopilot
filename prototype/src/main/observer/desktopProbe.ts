@@ -1,6 +1,7 @@
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
+import type { WorkbenchEngineCapability, WorkbenchVendor } from '@shared/workbenchProtocol';
 
 /**
  * Desktop 应用集成面探针（只读、只取形状）。
@@ -71,6 +72,86 @@ export interface DesktopProbeReport {
   readonly vmArtifacts: readonly FsArtifact[];
   readonly indexedDb: readonly LevelDbPresence[];
   readonly journalProvenance: readonly JournalProvenance[];
+}
+
+export interface EngineDiscoveryCandidate {
+  readonly vendor: WorkbenchVendor;
+  readonly path: string;
+  readonly source: WorkbenchEngineCapability['source'];
+}
+
+export interface EngineDiscoveryResult {
+  readonly vendor: WorkbenchVendor;
+  readonly binaryPath: string | null;
+  readonly source: WorkbenchEngineCapability['source'];
+  readonly checkedPaths: readonly string[];
+  readonly omittedCandidates: number;
+  readonly reason: string | null;
+}
+
+/**
+ * 发现只证明可执行文件存在，协议和认证保持 UNKNOWN。候选由调用方构建，因此应用 bundle、
+ * PATH 和测试 fixture 使用同一规则，也不会把某个本机绝对路径固化成唯一入口。
+ */
+export function discoverEngineBinary(
+  vendor: WorkbenchVendor,
+  candidates: readonly EngineDiscoveryCandidate[],
+  maxCandidates = 24,
+): EngineDiscoveryResult {
+  const relevant = candidates.filter((candidate) => candidate.vendor === vendor);
+  const checked = relevant.slice(0, maxCandidates);
+  const found = checked.find((candidate) => {
+    if (safeStat(candidate.path) === null) return false;
+    try {
+      accessSync(candidate.path, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  return {
+    vendor,
+    binaryPath: found?.path ?? null,
+    source: found?.source ?? 'NOT_FOUND',
+    checkedPaths: checked.map((candidate) => basename(candidate.path)),
+    omittedCandidates: Math.max(0, relevant.length - checked.length),
+    reason: found
+      ? null
+      : relevant.length > checked.length
+        ? `未在前 ${checked.length} 个候选中发现可执行文件，另有 ${relevant.length - checked.length} 个未检查`
+        : `已检查 ${checked.length} 个候选，未发现可执行文件`,
+  };
+}
+
+export function defaultEngineCandidates(opts: {
+  applicationsDir?: string;
+  claudeAppSupport?: string;
+  pathEntries?: readonly string[];
+} = {}): EngineDiscoveryCandidate[] {
+  const applications = opts.applicationsDir ?? '/Applications';
+  const claudeSupport = opts.claudeAppSupport ?? desktopAppSupportPath('claude');
+  const fromPath = opts.pathEntries ?? (process.env.PATH ?? '').split(':').filter(Boolean);
+  const out: EngineDiscoveryCandidate[] = [
+    {
+      vendor: 'CODEX',
+      path: join(applications, 'ChatGPT.app', 'Contents', 'Resources', 'codex'),
+      source: 'APP_BUNDLE',
+    },
+    {
+      vendor: 'CODEX',
+      path: join(applications, 'Codex.app', 'Contents', 'Resources', 'codex'),
+      source: 'APP_BUNDLE',
+    },
+  ];
+  const bundled = findBundledCli(claudeSupport, 'claude');
+  for (const binary of [...(bundled?.binaries ?? [])].reverse()) {
+    out.push({ vendor: 'CLAUDE', path: binary, source: 'APP_BUNDLE' });
+  }
+  for (const dir of fromPath) {
+    out.push({ vendor: 'CODEX', path: join(dir, 'codex'), source: 'PATH' });
+    out.push({ vendor: 'CLAUDE', path: join(dir, 'claude'), source: 'PATH' });
+  }
+  return out;
 }
 
 /**

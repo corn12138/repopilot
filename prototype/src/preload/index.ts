@@ -6,6 +6,12 @@ import {
   type ObserverBridge,
   type ObserverPushEvent,
 } from '@shared/observerProtocol';
+import {
+  WORKBENCH_CHANNEL,
+  WORKBENCH_PROTOCOL_VERSION,
+  type WorkbenchBridge,
+  type WorkbenchEvent,
+} from '@shared/workbenchProtocol';
 
 /**
  * Typed Preload Bridge。
@@ -58,3 +64,17 @@ const observerBridge: ObserverBridge = {
 };
 
 contextBridge.exposeInMainWorld('repopilotObserver', observerBridge);
+
+const workbenchBridge: WorkbenchBridge = {
+  protocolVersion: WORKBENCH_PROTOCOL_VERSION,
+  request(method, payload) {
+    return ipcRenderer.invoke(WORKBENCH_CHANNEL.request, { method, payload });
+  },
+  subscribe(handler: (event: WorkbenchEvent) => void) {
+    const listener = (_e: unknown, event: WorkbenchEvent): void => handler(event);
+    ipcRenderer.on(WORKBENCH_CHANNEL.event, listener);
+    return () => ipcRenderer.removeListener(WORKBENCH_CHANNEL.event, listener);
+  },
+};
+
+contextBridge.exposeInMainWorld('repopilotWorkbench', workbenchBridge);

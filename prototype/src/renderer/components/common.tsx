@@ -23,6 +23,7 @@ const RUN_STATUS_TEXT: Record<RunStatus, string> = {
   EXECUTING: '执行中',
   VERIFYING: '验证中',
   CROSS_REVIEWING: '交叉审核中',
+  AWAITING_HANDOFF: '待继续下一步',
   AWAITING_PATCH_REVIEW: '待你审查补丁',
   SUCCEEDED: '成功',
   ACCEPTED_UNVERIFIED: '已接受·未验证',
@@ -44,7 +45,7 @@ export function runStatusTone(status: RunStatus): 'ok' | 'warn' | 'err' | 'purpl
         ? 'err'
         : status === 'BLOCKED' || status === 'CANCELLED' || status === 'INTERRUPTED'
           ? 'warn'
-          : status === 'AWAITING_PLAN_APPROVAL' || status === 'AWAITING_PATCH_REVIEW'
+          : status === 'AWAITING_PLAN_APPROVAL' || status === 'AWAITING_HANDOFF' || status === 'AWAITING_PATCH_REVIEW'
             ? 'purple'
             : 'info';
 }

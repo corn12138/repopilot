@@ -1,6 +1,6 @@
 import { closeSync, lstatSync, openSync, readSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { basename, isAbsolute, join, normalize, relative } from 'node:path';
+import { isAbsolute, join, normalize, relative } from 'node:path';
 import type {
   JournalVendor,
   ObserverCompletion,
@@ -23,6 +23,7 @@ import {
 } from './journalShape';
 import claudeBaselineRaw from './claude-journal.shape.json';
 import codexBaselineRaw from './codex-rollout.shape.json';
+import { redactText } from '@shared/dlp';
 
 /**
  * 观察面板、等待队列与人工交接的 Main 侧服务（PRD-WKB-002/003/004 的产品种子实现）。
@@ -102,6 +103,10 @@ interface SessionInspection {
   readonly source: ObserverSessionSource;
   readonly sourceEvidence: readonly string[];
   readonly completion: ObserverCompletion;
+  readonly attentionEventId: string | null;
+  readonly label: string;
+  readonly labelSource: NonNullable<ObserverSessionEntry['labelSource']>;
+  readonly labelOmissions: NonNullable<ObserverSessionEntry['labelOmissions']>;
 }
 
 function isPlainRecord(v: unknown): v is Record<string, unknown> {
@@ -135,6 +140,96 @@ function readHeadRecords(path: string): Record<string, unknown>[] {
   } catch {
     return [];
   }
+}
+
+function redactLabel(raw: string): string {
+  return redactText(raw).text
+    .replace(/\b(?:sk|pk|api)[-_][A-Za-z0-9_-]{12,}\b/gi, '[凭据已隐藏]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{12,}=*\b/gi, 'Bearer [凭据已隐藏]');
+}
+
+function isInjectedTitleFrame(line: string): boolean {
+  const normalized = line.trim().toLowerCase();
+  return [
+    '# agents.md instructions',
+    '<environment_context',
+    '<codex_internal_context',
+    '<recommended_plugins',
+    '<skills_instructions',
+    '<permissions instructions',
+    '<collaboration_mode',
+    '<multi_agent_',
+    '## memory',
+  ].some((prefix) => normalized.startsWith(prefix));
+}
+
+function officialTitleFromRecord(record: Record<string, unknown>): string {
+  const payload = isPlainRecord(record.payload) ? record.payload : null;
+  const candidates = [
+    record.title,
+    record.sessionTitle,
+    record.session_name,
+    payload?.title,
+    payload?.sessionTitle,
+    payload?.session_name,
+  ];
+  for (const value of candidates) {
+    if (typeof value !== 'string') continue;
+    const line = redactLabel(value).split(/\r?\n/, 1)[0]?.trim() ?? '';
+    if (line && !isInjectedTitleFrame(line)) return line;
+  }
+  return '';
+}
+
+/** 标题只从有限头部提取首条用户需求；文件名 UUID 仅作为内部句柄。 */
+export function sessionLabelFromRecords(
+  vendor: JournalVendor,
+  records: readonly Record<string, unknown>[],
+  updatedAt: string,
+): {
+  label: string;
+  source: NonNullable<ObserverSessionEntry['labelSource']>;
+  charactersOmitted: number;
+} {
+  const bound = (raw: string) => {
+    const characters = [...raw];
+    const charactersOmitted = Math.max(0, characters.length - 72);
+    return {
+      label: charactersOmitted > 0 ? `${characters.slice(0, 72).join('')}…` : raw,
+      charactersOmitted,
+    };
+  };
+  for (const rec of records) {
+    const title = officialTitleFromRecord(rec);
+    if (title) {
+      const bounded = bound(title);
+      return {
+        label: bounded.label,
+        source: 'OFFICIAL_TITLE',
+        charactersOmitted: bounded.charactersOmitted,
+      };
+    }
+  }
+  for (const rec of records) {
+    let content: unknown = null;
+    if (vendor === 'CLAUDE_JOURNAL' && rec.type === 'user' && isPlainRecord(rec.message)) {
+      content = rec.message.content;
+    } else if (vendor === 'CODEX_ROLLOUT' && rec.type === 'response_item' && isPlainRecord(rec.payload)) {
+      if (rec.payload.type === 'message' && rec.payload.role === 'user') content = rec.payload.content;
+      if (rec.payload.type === 'user_message') content = rec.payload.message ?? rec.payload.content;
+    }
+    const firstLine = redactLabel(textFromContent(content)).split(/\r?\n/, 1)[0]?.trim() ?? '';
+    if (firstLine && !isInjectedTitleFrame(firstLine)) {
+      const bounded = bound(firstLine);
+      return {
+        label: bounded.label,
+        source: 'FIRST_USER_REQUEST',
+        charactersOmitted: bounded.charactersOmitted,
+      };
+    }
+  }
+  const when = Number.isNaN(Date.parse(updatedAt)) ? '时间未知' : updatedAt.slice(0, 16).replace('T', ' ');
+  return { label: `未命名会话 · ${when}`, source: 'UNNAMED', charactersOmitted: 0 };
 }
 
 /** 归属值域来自两家日志的显式启动字段；多种来源同时出现时 fail closed。 */
@@ -219,19 +314,26 @@ function advanceCompletion(
 function completionFromLines(
   vendor: JournalVendor,
   lines: readonly string[],
-): ObserverCompletion {
+): { completion: ObserverCompletion; attentionEventId: string | null } {
   let completion: ObserverCompletion = { state: 'UNKNOWN', evidence: ['有限尾部没有发现机器结束字段'] };
+  let attentionEventId: string | null = null;
   for (const rawLine of lines) {
     const line = rawLine.replace(/^\uFEFF/, '').trim();
     if (!line) continue;
     try {
       const parsed: unknown = JSON.parse(line);
-      if (isPlainRecord(parsed)) completion = advanceCompletion(vendor, parsed, completion);
+      if (isPlainRecord(parsed)) {
+        const next = advanceCompletion(vendor, parsed, completion);
+        if (next !== completion && next.state === 'READY_TO_HANDOFF') {
+          attentionEventId = handoffDigestOf(`${vendor}\n${line}`);
+        }
+        completion = next;
+      }
     } catch {
       // 队列只采用完整 JSON 机器字段；坏行不会被猜成运行中或待输入。
     }
   }
-  return completion;
+  return { completion, attentionEventId };
 }
 
 /** 控制字符剥离 + 长度封顶。Renderer 按纯文本渲染，这里是纵深的第二道 */
@@ -683,24 +785,44 @@ export class ObserverService {
       } catch {
         return null;
       }
-      const base = basename(path);
       const sessionId = `${vendor}:${relative(scanRoot, path)}`;
       const cached = this.inspections.get(path);
       const inspection =
         cached && cached.sizeBytes === stat.size && cached.mtimeMs === stat.mtimeMs
           ? cached
           : (() => {
-              const provenance = sessionSourceFromRecords(vendor, readHeadRecords(path));
+              const records = readHeadRecords(path);
+              const provenance = sessionSourceFromRecords(vendor, records);
               const tail = readTailLines(path, MAX_COMPLETION_BYTES);
+              const updatedAt = new Date(stat.mtimeMs).toISOString();
+              const title = sessionLabelFromRecords(vendor, records, updatedAt);
+              const completionScan = tail === null
+                ? {
+                    completion: { state: 'UNKNOWN', evidence: ['会话尾部读取失败'] } as ObserverCompletion,
+                    attentionEventId: null,
+                  }
+                : completionFromLines(vendor, tail.lines);
               const nextInspection: SessionInspection = {
                 sizeBytes: stat.size,
                 mtimeMs: stat.mtimeMs,
                 source: provenance.source,
                 sourceEvidence: provenance.evidence,
-                completion:
-                  tail === null
-                    ? { state: 'UNKNOWN', evidence: ['会话尾部读取失败'] }
-                    : completionFromLines(vendor, tail.lines),
+                completion: completionScan.completion,
+                attentionEventId: completionScan.attentionEventId,
+                label: title.label,
+                labelSource: title.source,
+                labelOmissions: {
+                  recordsScanned: records.length,
+                  recordsOmittedAtLeast: records.length >= MAX_PROVENANCE_RECORDS ? 1 : 0,
+                  bytesOmitted: Math.max(0, stat.size - MAX_PROVENANCE_BYTES),
+                  labelCharactersOmitted: title.charactersOmitted,
+                  reason:
+                    stat.size > MAX_PROVENANCE_BYTES
+                      ? `标题提取只读取前 ${MAX_PROVENANCE_BYTES} 字节`
+                      : records.length >= MAX_PROVENANCE_RECORDS
+                        ? `标题提取最多解析 ${MAX_PROVENANCE_RECORDS} 条记录`
+                        : null,
+                },
               };
               this.inspections.set(path, nextInspection);
               return nextInspection;
@@ -708,12 +830,15 @@ export class ObserverService {
       return {
         sessionId,
         vendor,
-        label: base.replace(/\.jsonl$/, ''),
+        label: inspection.label,
+        labelSource: inspection.labelSource,
+        labelOmissions: inspection.labelOmissions,
         updatedAt: new Date(stat.mtimeMs).toISOString(),
         sizeBytes: stat.size,
         source: inspection.source,
         sourceEvidence: inspection.sourceEvidence,
         completion: inspection.completion,
+        attentionEventId: inspection.attentionEventId,
         path,
       };
     };

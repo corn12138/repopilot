@@ -44,8 +44,8 @@ describe('观察面板边界契约', () => {
     expect(read('shared/ipcContract.ts')).not.toMatch(/observer/i);
   });
 
-  it('观察模块只依赖 node 内建、zod、electron（仅 ipc 接线）、@shared/observerProtocol 与同目录文件', () => {
-    const allowed = /^(node:|zod$|electron$|@shared\/observerProtocol$|\.\/)/;
+  it('观察模块只依赖 node 内建、zod、electron（仅 ipc 接线）、共享只读合同/DLP 与同目录文件', () => {
+    const allowed = /^(node:|zod$|electron$|@shared\/(observerProtocol|dlp)$|\.\/)/;
     for (const rel of [
       'main/observer/observerService.ts',
       'main/observer/observerIpc.ts',
@@ -72,14 +72,15 @@ describe('观察面板边界契约', () => {
     expect(s).not.toMatch(/projectPath|hostPath/);
   });
 
-  it('Preload 恰好暴露两座桥，且都不含通用 invoke(channel, …)', () => {
+  it('Preload 只暴露三座类型化桥，且都不含通用 invoke(channel, …)', () => {
     const s = read('preload/index.ts');
     const exposed = [...s.matchAll(/exposeInMainWorld\('([^']+)'/g)].map((m) => m[1]);
-    expect(exposed).toEqual(['repopilot', 'repopilotObserver']);
+    expect(exposed).toEqual(['repopilot', 'repopilotObserver', 'repopilotWorkbench']);
     // request(method, payload) 只允许打到写死的 channel 常量上
     expect(s).toMatch(/ipcRenderer\.invoke\(IPC_CHANNEL\.request/);
     expect(s).toMatch(/ipcRenderer\.invoke\(OBSERVER_CHANNEL\.request/);
-    expect((s.match(/ipcRenderer\.invoke\(/g) ?? []).length).toBe(2);
+    expect(s).toMatch(/ipcRenderer\.invoke\(WORKBENCH_CHANNEL\.request/);
+    expect((s.match(/ipcRenderer\.invoke\(/g) ?? []).length).toBe(3);
   });
 
   it('Renderer 的观察视图只经 observerBridge 说话，不直接碰 Core 的 call/subscribe', () => {

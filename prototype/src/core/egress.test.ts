@@ -100,6 +100,21 @@ describe('buildDisclosure', () => {
     expect(buildDisclosure({ ...base, author: { connector: connector('CODEX_CLI') } }).digest).not.toBe(d0);
     expect(buildDisclosure({ ...base, snapshotId: 'snap_2' }).digest).not.toBe(d0);
     expect(buildDisclosure({ ...base, handoffDigest: 'sha256:handoff' }).digest).not.toBe(d0);
+    expect(buildDisclosure({ ...base, planner: { profile: profile('anthropic'), resolution: resolution('anthropic') } }).digest).not.toBe(d0);
+  });
+
+  it('独立规划方是单独目的地并进入 consent 覆盖集合', () => {
+    const d = buildDisclosure({
+      ...base,
+      planner: { profile: profile('anthropic'), resolution: resolution('anthropic') },
+    });
+    expect(d.destinations.map((destination) => destination.role)).toEqual(['PLANNER', 'IMPLEMENTER']);
+    expect(d.destinations[0]!.dataClasses).toEqual([
+      'TASK_TEXT',
+      'REPOSITORY_SNAPSHOT_EXCERPTS',
+      'COMMAND_OUTPUT',
+    ]);
+    expect(consentedResolutionDigests(d)).toEqual(['sha256:route-anthropic', 'sha256:route-deepseek']);
   });
 
   it('观察会话交接单独披露给每个实际目的地，并绑定交接摘要', () => {

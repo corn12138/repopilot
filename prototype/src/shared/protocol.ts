@@ -17,6 +17,7 @@ import type {
   ApprovalDecisionKind,
   ApprovalRequest,
   CrossReviewRecord,
+  CollaborationHandoff,
   DoctorCheck,
   FileTreeEntry,
   ModelConnectionProfile,
@@ -53,7 +54,8 @@ import type {
  * 它们的模型正文仍会以 NOTE 的形态显示成"平台"。这一层只对新 Run 生效。
  */
 /* 0.7.0：观察交接可选字段进入 task.create/egress.disclosure；披露升级为 v3。 */
-export const PROTOCOL_VERSION = '0.7.0';
+/* 0.8.0：双角色协作加入独立 planner、协作模式与 AWAITING_HANDOFF 状态投影。 */
+export const PROTOCOL_VERSION = '0.8.0';
 
 export type ImportOutcome =
   | {
@@ -172,6 +174,9 @@ export interface RequestMap {
       snapshotId: string;
       profileId: string;
       modelProfileId: string;
+      /** 显式协作任务的独立规划方；缺失时保持旧单路由任务。 */
+      plannerModelProfileId?: string;
+      collaborationMode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
       goal: string;
       taskClass: TaskClass;
       allowedPaths: string[];
@@ -302,6 +307,8 @@ export interface RequestMap {
     req: {
       snapshotId: string;
       modelProfileId: string;
+      plannerModelProfileId?: string;
+      collaborationMode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
       reviewerModelProfileId?: string;
       reviewerConnectorId?: string;
       authorConnectorId?: string;
@@ -311,6 +318,18 @@ export interface RequestMap {
   };
   'crossreview.continue': {
     req: { runId: string };
+    res: { run: RunView; accepted: boolean; reason: string | null };
+  };
+  'collaboration.getHandoff': {
+    req: { runId: string };
+    res: { handoff: CollaborationHandoff | null };
+  };
+  'collaboration.continue': {
+    req: { runId: string; handoffId: string; handoffDigest: string; decisionId: string };
+    res: { run: RunView; accepted: boolean; reason: string | null };
+  };
+  'collaboration.control': {
+    req: { runId: string; mode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO'; stopAfterStep?: boolean };
     res: { run: RunView; accepted: boolean; reason: string | null };
   };
   'patch.decide': {

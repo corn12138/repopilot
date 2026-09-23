@@ -560,6 +560,15 @@ class ScriptedModel implements ModelInvoker {
       );
     }
     this.index += 1;
+    input.onDispatch?.({
+      invocationId: `inv_fake_${this.index}`,
+      sendAttempt: 1,
+      requestedAt: nowIso(),
+      purpose: input.purpose,
+      resolutionId: input.resolution.resolutionId,
+      providerId: input.resolution.providerId,
+      modelId: input.resolution.modelId,
+    });
     const response = responder({ lastUserText, purpose: input.purpose });
 
     return {
@@ -714,9 +723,10 @@ class Recorder implements AgentHost {
     }
   }
 
-  chargeModelTurn(): void {
+  reserveModelTurn(): void {
     this.ledger.modelTurns += 1;
   }
+  settleModelTurn(): void {}
   chargeToolCall(): void {
     this.ledger.toolCalls += 1;
   }

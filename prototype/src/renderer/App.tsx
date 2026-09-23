@@ -1,4 +1,3 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   ApprovalRequest,
   DoctorCheck,
@@ -11,38 +10,38 @@ import type {
   RunView,
   SubPackageCandidate,
 } from '@shared/domain';
-import { TERMINAL_RUN_STATUSES } from '@shared/domain';
+import { TERMINAL_RUN_STATUSES, isTerminal } from '@shared/domain';
 import type { ObserverHandoffArtifact } from '@shared/observerProtocol';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RequestError, call, setCoreEpoch, subscribe } from './bridge';
 import {
   Badge,
   Banner,
   Card,
-  DoctorBadge,
   RestoredBadge,
   RunStatusBadge,
   relativeTime,
   runStatusText,
-  runStatusTone,
+  runStatusTone
 } from './components/common';
-import { isTerminal } from '@shared/domain';
 import { isOwnedReady } from './ownedAsync';
 import { useApprovalAction, type ApprovalActionController } from './useApprovalAction';
-import { useStickToBottom } from './useStickToBottom';
 import {
   useProjectImport,
   useRunDetail,
   type ProjectImportState,
   type RunDetailState,
 } from './useRendererOrchestration';
-import { Composer } from './views/TaskForm';
+import { useStickToBottom } from './useStickToBottom';
 import { CommandPalette, type PaletteCommand } from './views/CommandPalette';
-import { RunDetail } from './views/RunDetail';
-import { FileTreePanel } from './views/FileTree';
 import { EditorPane, type EditorTab } from './views/Editor';
-import { SettingsView } from './views/Settings';
 import { EvidenceView } from './views/Evidence';
+import { FileTreePanel } from './views/FileTree';
 import { ObserverView } from './views/Observer';
+import { RunDetail } from './views/RunDetail';
+import { SettingsView } from './views/Settings';
+import { Composer } from './views/TaskForm';
+import { WorkbenchView } from './views/Workbench';
 
 interface ImportRequest {
   subPath?: string;
@@ -154,6 +153,7 @@ export function App() {
    * 这里只有开关 —— 第三个全屏视图，与设置/证据同级互斥。
    */
   const [showObserver, setShowObserver] = useState(false);
+  const [showWorkbench, setShowWorkbench] = useState(false);
   /** 观察面的人为交接只在内存里等待；真正建 Run 后由 Core 绑定 digest 并收进任务证据。 */
   const [handoffDraft, setHandoffDraft] = useState<ObserverHandoffArtifact | null>(null);
   /**
@@ -164,7 +164,7 @@ export function App() {
   const [settingsFocus, setSettingsFocus] = useState<'retention' | null>(null);
   // 设置与证据都是全屏视图：选中 Run 的顶栏/新事件提示/审批停靠条/Composer 一律让位。
   // 只判 showSettings 会让证据页下仍可发任务、批准计划（交互评审 v0.2 N1）。
-  const fullScreenView = showSettings || showEvidence || showObserver;
+  const fullScreenView = showSettings || showEvidence || showObserver || showWorkbench;
   /** ⌘K 命令面板（v0.1 #10）：动作/运行/项目/文件的统一入口 */
   const [paletteOpen, setPaletteOpen] = useState(false);
 
@@ -180,11 +180,12 @@ export function App() {
         setPaletteOpen((v) => !v);
         return;
       }
-      if (e.key === 'Escape' && !paletteOpen && (showSettings || showEvidence || showObserver)) {
+      if (e.key === 'Escape' && !paletteOpen && (showSettings || showEvidence || showObserver || showWorkbench)) {
         // 设置/证据是"层"：Esc 退回之前的运行/项目视图（v0.1 病根 B 的"只进不出"）
         setShowSettings(false);
         setShowEvidence(false);
         setShowObserver(false);
+        setShowWorkbench(false);
         return;
       }
       if (e.key === 'F6') {
@@ -205,7 +206,7 @@ export function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [paletteOpen, showSettings, showEvidence, showObserver]);
+  }, [paletteOpen, showSettings, showEvidence, showObserver, showWorkbench]);
 
   const coreStatusRef = useRef(coreStatus);
   coreStatusRef.current = coreStatus;
@@ -226,10 +227,10 @@ export function App() {
    * 也应该回到底部，而不是继承上一次的未读计数。计数来源是 durable events 的数量 ——
    * 它对应时间线上真实存在的行，不是估算出来的进度。
    */
-  const followOwnerKey = showSettings ? '__settings__' : showEvidence ? '__evidence__' : showObserver ? '__observer__' : selectedRunId;
+  const followOwnerKey = showSettings ? '__settings__' : showEvidence ? '__evidence__' : showObserver ? '__observer__' : showWorkbench ? '__workbench__' : selectedRunId;
   const follow = useStickToBottom<HTMLDivElement>({
     ownerKey: followOwnerKey,
-    itemCount: showSettings || showEvidence || showObserver ? 0 : (selectedRunDetail?.events.length ?? 0),
+    itemCount: showSettings || showEvidence || showObserver || showWorkbench ? 0 : (selectedRunDetail?.events.length ?? 0),
   });
 
   const report = useCallback((err: unknown) => {
@@ -398,6 +399,7 @@ export function App() {
       setShowSettings(false);
       setShowEvidence(false);
       setShowObserver(false);
+      setShowWorkbench(false);
       setSelectedProject(project);
       setSelectedRunId(null);
       void importProject(project);
@@ -416,6 +418,7 @@ export function App() {
       setShowSettings(false);
       setShowEvidence(false);
       setShowObserver(false);
+      setShowWorkbench(false);
       setError(null);
       setSelectedRunId(run.runId);
       // 换 Run 就丢掉上一个 Run 的实时缓冲 —— 它属于那一次调用，不属于这个视图
@@ -566,6 +569,7 @@ export function App() {
           setShowSettings(false);
           setShowEvidence(false);
           setShowObserver(false);
+          setShowWorkbench(false);
           // Composer 常驻主栏底部；等全屏视图退场后聚焦输入框
           setTimeout(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(), 0);
         },
@@ -580,6 +584,7 @@ export function App() {
         setShowSettings(true);
         setShowEvidence(false);
         setShowObserver(false);
+        setShowWorkbench(false);
       },
     });
     actions.push({
@@ -590,6 +595,7 @@ export function App() {
         setShowEvidence(true);
         setShowObserver(false);
         setShowSettings(false);
+        setShowWorkbench(false);
       },
     });
     actions.push({
@@ -601,6 +607,7 @@ export function App() {
         setShowObserver(true);
         setShowSettings(false);
         setShowEvidence(false);
+        setShowWorkbench(false);
       },
     });
     actions.push({
@@ -613,6 +620,7 @@ export function App() {
         setShowSettings(true);
         setShowEvidence(false);
         setShowObserver(false);
+        setShowWorkbench(false);
       },
     });
     if (canShowFiles && coreStatus === 'READY') {
@@ -750,98 +758,99 @@ export function App() {
             </div>
           </div>
         ) : (
-        <div className="sidebar-scroll" onKeyDown={onListKeyDown}>
-          {projects.length === 0 && (
-            <div style={{ color: 'var(--text-tertiary)', fontSize: 11.5, padding: '10px 8px' }}>
-              还没有项目
-            </div>
-          )}
-
-          {projects.map((p) => {
-            const projectRuns = runsByProject.get(p.projectId) ?? [];
-            const isCurrent = selectedProject?.projectId === p.projectId;
-            return (
-              <div key={p.projectId} className="project-group">
-                <button
-                  disabled={coreStatus !== 'READY'}
-                  className={`list-item ${isCurrent && !selectedRunId && !showSettings && !showEvidence ? 'active' : ''}`}
-                  onClick={() => openProject(p)}
-                >
-                  <div className="name">{p.name}</div>
-                  <div className="meta">{p.displayPath}</div>
-                </button>
-                {(() => {
-                  /*
-                   * 列表层降噪（交互评审 P0-#1）：一行 = 状态点 + 标题 + 相对时间。
-                   * 证据徽章（状态落后于事件 / 损坏）移到详情页头部 —— 移动，不是删除；
-                   * 行内保留在 title 提示与 aria-label 里，可及性不因降噪而降级。
-                   * 待人决定的状态额外带文字 chip：等用户的东西不允许只靠颜色。
-                   */
-                  const runRow = (r: RunView) => {
-                    const evidenceNote =
-                      r.evidence === 'DAMAGED' ? '证据损坏' : r.evidence === 'EVENTS_AHEAD' ? '状态落后于事件' : null;
-                    const awaiting = r.status === 'AWAITING_PLAN_APPROVAL' || r.status === 'AWAITING_PATCH_REVIEW';
-                    const label = `${runStatusText(r.status)}${evidenceNote ? `｜${evidenceNote}` : ''}｜${r.title || r.runId}`;
-                    return (
-                      <button
-                        key={r.runId}
-                        disabled={coreStatus !== 'READY'}
-                        className={`run-item ${selectedRunId === r.runId ? 'active' : ''}`}
-                        onClick={() => openRun(r)}
-                        title={label}
-                        aria-label={label}
-                      >
-                        <span className={`run-dot ${runStatusTone(r.status)}`} aria-hidden="true" />
-                        <span className="run-title">{r.title || r.runId}</span>
-                        {awaiting && <span className="run-await">待你决定</span>}
-                        <span className="run-time">{relativeTime(r.updatedAt)}</span>
-                      </button>
-                    );
-                  };
-                  const activeRuns = projectRuns.filter((r) => !isTerminal(r.status));
-                  const doneRuns = projectRuns.filter((r) => isTerminal(r.status));
-                  const recentDone = doneRuns.slice(0, 5);
-                  const olderDone = doneRuns.slice(5);
-                  return (
-                    <>
-                      {activeRuns.map(runRow)}
-                      {recentDone.map(runRow)}
-                      {olderDone.length > 0 && (
-                        // 折叠 + 报数 = 合规省略：更早的终态 Run 收起，但数量如实
-                        <details className="run-history">
-                          <summary>更早的 {olderDone.length} 条</summary>
-                          {olderDone.map(runRow)}
-                          {/* 历史的真删除走保留策略（证据按天龄回收）—— 出口放在数据所在之处 */}
-                          <button
-                            className="linklike run-history-clean"
-                            onClick={() => {
-                              setSettingsFocus('retention');
-                              setShowSettings(true);
-                              setShowEvidence(false);
-                              setShowObserver(false);
-                              setError(null);
-                            }}
-                          >
-                            清理历史记录 → 设置 · 数据保留
-                          </button>
-                        </details>
-                      )}
-                    </>
-                  );
-                })()}
+          <div className="sidebar-scroll" onKeyDown={onListKeyDown}>
+            {projects.length === 0 && (
+              <div style={{ color: 'var(--text-tertiary)', fontSize: 11.5, padding: '10px 8px' }}>
+                还没有项目
               </div>
-            );
-          })}
+            )}
 
-          <button
-            className="list-item"
-            disabled={coreStatus !== 'READY'}
-            onClick={pickProject}
-            style={{ color: 'var(--accent-interactive)' }}
-          >
-            <div className="name">+ 授权本地仓库…</div>
-          </button>
-        </div>
+            {projects.map((p) => {
+              const projectRuns = runsByProject.get(p.projectId) ?? [];
+              const isCurrent = selectedProject?.projectId === p.projectId;
+              return (
+                <div key={p.projectId} className="project-group">
+                  <button
+                    disabled={coreStatus !== 'READY'}
+                    className={`list-item ${isCurrent && !selectedRunId && !showSettings && !showEvidence ? 'active' : ''}`}
+                    onClick={() => openProject(p)}
+                  >
+                    <div className="name">{p.name}</div>
+                    <div className="meta">{p.displayPath}</div>
+                  </button>
+                  {(() => {
+                    /*
+                     * 列表层降噪（交互评审 P0-#1）：一行 = 状态点 + 标题 + 相对时间。
+                     * 证据徽章（状态落后于事件 / 损坏）移到详情页头部 —— 移动，不是删除；
+                     * 行内保留在 title 提示与 aria-label 里，可及性不因降噪而降级。
+                     * 待人决定的状态额外带文字 chip：等用户的东西不允许只靠颜色。
+                     */
+                    const runRow = (r: RunView) => {
+                      const evidenceNote =
+                        r.evidence === 'DAMAGED' ? '证据损坏' : r.evidence === 'EVENTS_AHEAD' ? '状态落后于事件' : null;
+                      const awaiting = r.status === 'AWAITING_PLAN_APPROVAL' || r.status === 'AWAITING_PATCH_REVIEW';
+                      const label = `${runStatusText(r.status)}${evidenceNote ? `｜${evidenceNote}` : ''}｜${r.title || r.runId}`;
+                      return (
+                        <button
+                          key={r.runId}
+                          disabled={coreStatus !== 'READY'}
+                          className={`run-item ${selectedRunId === r.runId ? 'active' : ''}`}
+                          onClick={() => openRun(r)}
+                          title={label}
+                          aria-label={label}
+                        >
+                          <span className={`run-dot ${runStatusTone(r.status)}`} aria-hidden="true" />
+                          <span className="run-title">{r.title || r.runId}</span>
+                          {awaiting && <span className="run-await">待你决定</span>}
+                          <span className="run-time">{relativeTime(r.updatedAt)}</span>
+                        </button>
+                      );
+                    };
+                    const activeRuns = projectRuns.filter((r) => !isTerminal(r.status));
+                    const doneRuns = projectRuns.filter((r) => isTerminal(r.status));
+                    const recentDone = doneRuns.slice(0, 5);
+                    const olderDone = doneRuns.slice(5);
+                    return (
+                      <>
+                        {activeRuns.map(runRow)}
+                        {recentDone.map(runRow)}
+                        {olderDone.length > 0 && (
+                          // 折叠 + 报数 = 合规省略：更早的终态 Run 收起，但数量如实
+                          <details className="run-history">
+                            <summary>更早的 {olderDone.length} 条</summary>
+                            {olderDone.map(runRow)}
+                            {/* 历史的真删除走保留策略（证据按天龄回收）—— 出口放在数据所在之处 */}
+                            <button
+                              className="linklike run-history-clean"
+                              onClick={() => {
+                                setSettingsFocus('retention');
+                                setShowSettings(true);
+                                setShowEvidence(false);
+                                setShowObserver(false);
+                                setShowWorkbench(false);
+                                setError(null);
+                              }}
+                            >
+                              清理历史记录 → 设置 · 数据保留
+                            </button>
+                          </details>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+              );
+            })}
+
+            <button
+              className="list-item"
+              disabled={coreStatus !== 'READY'}
+              onClick={pickProject}
+              style={{ color: 'var(--accent-interactive)' }}
+            >
+              <div className="name">+ 授权本地仓库…</div>
+            </button>
+          </div>
         )}
 
         <div className="sidebar-foot">
@@ -852,6 +861,7 @@ export function App() {
               setShowSettings(true);
               setShowEvidence(false);
               setShowObserver(false);
+              setShowWorkbench(false);
               setError(null);
             }}
           >
@@ -864,6 +874,7 @@ export function App() {
               setShowEvidence(true);
               setShowObserver(false);
               setShowSettings(false);
+              setShowWorkbench(false);
               setError(null);
             }}
             title="跨 Run 证据聚合（观察性事实，不构成 A/B 结论）"
@@ -876,11 +887,25 @@ export function App() {
               setShowObserver(true);
               setShowSettings(false);
               setShowEvidence(false);
+              setShowWorkbench(false);
               setError(null);
             }}
             title="本机 Claude/Codex 会话只读镜像（Herdr 式 · 内容零出站）"
           >
             👁 观察
+          </button>
+          <button
+            className={showWorkbench ? 'primary' : ''}
+            onClick={() => {
+              setShowWorkbench(true);
+              setShowObserver(false);
+              setShowSettings(false);
+              setShowEvidence(false);
+              setError(null);
+            }}
+            title="RepoPilot 新建的 Codex / Claude 受管会话"
+          >
+            ⇄ 双 Agent
           </button>
         </div>
       </aside>
@@ -923,7 +948,25 @@ export function App() {
               aria-disabled={coreStatus !== 'READY'}
               style={{ border: 0, margin: 0, padding: 0, minInlineSize: 0 }}
             >
-              {showObserver ? (
+              {showWorkbench ? (
+                <WorkbenchView
+                  projectId={selectedProject?.projectId ?? null}
+                  run={selectedRun ?? null}
+                  detail={selectedRunDetail}
+                  approvalAction={approvalAction}
+                  onError={report}
+                  onRefresh={() => selectedRunId && void loadRunDetail(selectedRunId)}
+                  onOpenDiff={openDiffInEditor}
+                  onSelectProject={(targetProjectId) => {
+                    if (targetProjectId === null || selectedProject?.projectId === targetProjectId) return;
+                    const project = projects.find((p) => p.projectId === targetProjectId);
+                    if (!project) return;
+                    setSelectedProject(project);
+                    setSelectedRunId(null);
+                    void importProject(project);
+                  }}
+                />
+              ) : showObserver ? (
                 <ObserverView
                   reviewProjectDisplayPath={importedProject ? selectedProject?.displayPath ?? null : null}
                   onUseAsReviewTask={(artifact) => {
@@ -985,7 +1028,12 @@ export function App() {
                   checks={checks}
                   enabledModelCount={enabledModelCount}
                   onPick={pickProject}
-                  onSettings={() => { setSettingsFocus(null); setShowSettings(true); setShowObserver(false); }}
+                  onSettings={() => {
+                    setSettingsFocus(null);
+                    setShowSettings(true);
+                    setShowObserver(false);
+                    setShowWorkbench(false);
+                  }}
                 />
               )}
             </fieldset>
@@ -1059,7 +1107,12 @@ export function App() {
               }}
               onReimport={() => importProject(selectedProject)}
               onOpenRun={openRun}
-              onOpenSettings={() => { setSettingsFocus(null); setShowSettings(true); setShowObserver(false); }}
+              onOpenSettings={() => {
+                setSettingsFocus(null);
+                setShowSettings(true);
+                setShowObserver(false);
+                setShowWorkbench(false);
+              }}
               onError={report}
             />
           </fieldset>
@@ -1154,6 +1207,7 @@ export function App() {
             setShowSettings(true);
             setShowEvidence(false);
             setShowObserver(false);
+            setShowWorkbench(false);
           }}
           title="模型连接在「设置 · API」里配置"
         >
@@ -1171,6 +1225,7 @@ export function App() {
           setShowSettings(false);
           setShowEvidence(false);
           setShowObserver(false);
+          setShowWorkbench(false);
           openFileInEditor(path);
         }}
       />
@@ -1263,32 +1318,32 @@ const SHAPE_BANNERS: ReadonlyArray<{
   tone: 'warn' | 'err';
   text: string;
 }> = [
-  {
-    reason: 'LFS_POINTER',
-    tone: 'err',
-    text:
-      '磁盘上是一段引用文本、不是文件真内容。收进来的话模型会把指针当源码改，' +
-      '而那个补丁在你的仓库上 git apply 会成功 —— 真正的指针就被覆盖了。' +
-      '要让 Agent 看到真内容：git lfs install && git lfs pull，然后重新导入。',
-  },
-  {
-    reason: 'SUBMODULE',
-    tone: 'warn',
-    text: '子模块是另一个仓库的引用。要改它里面的代码，请把那个仓库单独导入成一个项目。',
-  },
-  {
-    reason: 'NOT_CHECKED_OUT',
-    tone: 'warn',
-    text:
-      '索引里有、工作区没有（通常是 sparse checkout）。Agent 看不到这些路径；' +
-      '要修的代码若在其中，先 git sparse-checkout disable 或调整范围，再重新导入。',
-  },
-  {
-    reason: 'CASE_COLLISION',
-    tone: 'warn',
-    text: '这些路径只有大小写不同、在当前文件系统上指向同一个文件，无法无歧义寻址，整组都没进快照。',
-  },
-];
+    {
+      reason: 'LFS_POINTER',
+      tone: 'err',
+      text:
+        '磁盘上是一段引用文本、不是文件真内容。收进来的话模型会把指针当源码改，' +
+        '而那个补丁在你的仓库上 git apply 会成功 —— 真正的指针就被覆盖了。' +
+        '要让 Agent 看到真内容：git lfs install && git lfs pull，然后重新导入。',
+    },
+    {
+      reason: 'SUBMODULE',
+      tone: 'warn',
+      text: '子模块是另一个仓库的引用。要改它里面的代码，请把那个仓库单独导入成一个项目。',
+    },
+    {
+      reason: 'NOT_CHECKED_OUT',
+      tone: 'warn',
+      text:
+        '索引里有、工作区没有（通常是 sparse checkout）。Agent 看不到这些路径；' +
+        '要修的代码若在其中，先 git sparse-checkout disable 或调整范围，再重新导入。',
+    },
+    {
+      reason: 'CASE_COLLISION',
+      tone: 'warn',
+      text: '这些路径只有大小写不同、在当前文件系统上指向同一个文件，无法无歧义寻址，整组都没进快照。',
+    },
+  ];
 
 /**
  * 按原因分组报数。
@@ -1478,9 +1533,8 @@ function UsagePanel({ run, events }: { run: RunView; events: RunEvent[] }) {
             ? '尚无出站'
             : cacheRead === null
               ? unreportedCacheReason(lastProvider)
-              : `${cacheRead} tok · ${
-                  cachePct === null ? '占比未知（本轮输入未回报）' : `本轮输入的 ${cachePct}`
-                }`}
+              : `${cacheRead} tok · ${cachePct === null ? '占比未知（本轮输入未回报）' : `本轮输入的 ${cachePct}`
+              }`}
         </span>
       </div>
       <div className="usage-note">
@@ -1850,9 +1904,8 @@ function SnapshotPanel({
           <dd>
             {snapshot.baseKind === 'NO_VCS'
               ? '（不在 git 管理下）'
-              : `${snapshot.baseSha.slice(0, 12)} (${snapshot.branch})${
-                  snapshot.baseKind === 'DIRTY_WORKTREE' ? ' + 未提交改动' : ''
-                }`}
+              : `${snapshot.baseSha.slice(0, 12)} (${snapshot.branch})${snapshot.baseKind === 'DIRTY_WORKTREE' ? ' + 未提交改动' : ''
+              }`}
           </dd>
           <dt>tree digest</dt>
           <dd>{snapshot.treeDigest.slice(0, 26)}…</dd>

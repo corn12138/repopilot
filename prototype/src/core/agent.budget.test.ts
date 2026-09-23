@@ -42,6 +42,7 @@ vi.mock('./paths', async () => {
 
 import type {
   CommandDefinition,
+  ModelEgressManifest,
   ModelRouteResolution,
   MutationReadReceipt,
   RepositoryHarnessProfile,
@@ -54,8 +55,9 @@ import type {
 } from '@shared/domain';
 import { digestOf, newId, nowIso, sha256 } from '@shared/ids';
 import { AgentCancelled, PlanningFailed, type AgentHost, type ModelInvoker, runAgent } from './agent';
+import { InvocationFailed } from './model/gateway';
 import type { ContentBlock, ModelMessage, ModelResponse } from './model/types';
-import { findOrphanToolUse, findWireViolation, toolUsesOf } from './model/types';
+import { findOrphanToolUse, findWireViolation, ModelCallError, toolUsesOf } from './model/types';
 import { DEFAULT_MUTATION_POLICY } from './mutation';
 import { type MaterializedWorkspace, listTree, resolveManaged } from './workspace';
 
@@ -175,6 +177,7 @@ class TestHost implements AgentHost {
   readonly toolCalls: RecordedToolCall[] = [];
   readonly ledger = { modelTurns: 0, toolCalls: 0, selfFixRounds: 0 };
   planDecision: 'APPROVE' | 'REJECT' = 'APPROVE';
+  planDecisions: Array<Awaited<ReturnType<AgentHost['awaitPlanApproval']>>> = [];
   planApprovals = 0;
   /** 模型轮次达到这个数就判定预算耗尽（模拟 authority 里的 ledger >= limit 语义） */
   budgetAfterModelTurns = Number.POSITIVE_INFINITY;
@@ -187,9 +190,9 @@ class TestHost implements AgentHost {
     this.statuses.push({ status, reason });
   }
 
-  async awaitPlanApproval(): Promise<'APPROVE' | 'REJECT'> {
+  async awaitPlanApproval(): Promise<Awaited<ReturnType<AgentHost['awaitPlanApproval']>>> {
     this.planApprovals += 1;
-    return this.planDecision;
+    return this.planDecisions.shift() ?? this.planDecision;
   }
 
   beginToolCall(input: { toolName: string; risk: ToolRisk; argsSummary: string }): string {
@@ -218,9 +221,10 @@ class TestHost implements AgentHost {
     call.preview = preview;
   }
 
-  chargeModelTurn(): void {
+  reserveModelTurn(): void {
     this.ledger.modelTurns += 1;
   }
+  settleModelTurn(): void {}
   chargeToolCall(): void {
     this.ledger.toolCalls += 1;
   }
@@ -282,6 +286,15 @@ class ScriptedModel implements ModelInvoker {
     if (orphan) {
       throw new Error(`第 ${this.calls.length} 次调用（${input.purpose}）收到非法消息序列：${orphan}`);
     }
+    input.onDispatch?.({
+      invocationId: `inv_stub_${this.calls.length}`,
+      sendAttempt: 1,
+      requestedAt: nowIso(),
+      purpose: input.purpose,
+      resolutionId: input.resolution.resolutionId,
+      providerId: input.resolution.providerId,
+      modelId: 'TEST_ONLY_FAKE',
+    });
     const response = this.script(this.calls.length, input);
     return {
       invocationId: `inv_stub_${this.calls.length}`,
@@ -482,7 +495,7 @@ function makeTask(over: Partial<TaskSpec> = {}): TaskSpec {
 }
 
 function run(
-  gateway: ScriptedModel,
+  gateway: ModelInvoker,
   task: TaskSpec,
   signal: AbortSignal = new AbortController().signal,
 ) {
@@ -781,7 +794,7 @@ describe('发给模型的消息序列必须合法', () => {
     expect(findOrphanToolUse(half)).toContain('submit_plan(tu_2)');
   });
 
-  it('计划获批后的第一次执行调用，历史里不能有孤儿 tool_use', async () => {
+  it('规划与执行各自历史合法，执行方不继承 submit_plan 或规划上下文', async () => {
     workspace.changed = ['src/a.ts'];
     const gateway = new ScriptedModel((n) =>
       n === 1 ? toolUse('submit_plan', VALID_PLAN) : endTurn('改完了'),
@@ -789,39 +802,40 @@ describe('发给模型的消息序列必须合法', () => {
 
     await run(gateway, makeTask({ verificationCommandIds: [] }));
 
-    // 前提：确实发生了「规划提交 → 执行」的跨阶段历史复用，
-    // 否则下面那句断言什么都没验证。
+    const planning = gateway.calls.filter((c) => c.purpose === 'PLANNING');
+    expect(planning.length).toBeGreaterThan(0);
+    expect(findOrphanToolUse(planning[0]!.messages)).toBeNull();
     const exec = gateway.calls.filter((c) => c.purpose === 'EXECUTION');
     expect(exec.length).toBeGreaterThan(0);
     const first = exec[0]!;
     expect(
       first.messages.some((m) => toolUsesOf(m.content).some((u) => u.name === 'submit_plan')),
-    ).toBe(true);
+    ).toBe(false);
 
     expect(findOrphanToolUse(first.messages)).toBeNull();
   });
 
   it('submit_plan 与别的工具同轮出现时，两个 id 都要被回填', async () => {
     workspace.changed = ['src/a.ts'];
+    host.planDecisions = [{ decision: 'REVISE', note: '复查后重提' }, 'APPROVE'];
     const gateway = new ScriptedModel((n) =>
       n === 1
         ? multiToolUse(
             { name: 'fs_read', input: { path: 'src/a.ts' } },
             { name: 'submit_plan', input: VALID_PLAN },
           )
-        : endTurn('改完了'),
+        : n === 2
+          ? toolUse('submit_plan', VALID_PLAN)
+          : endTurn('改完了'),
     );
 
     await run(gateway, makeTask({ verificationCommandIds: [] }));
 
-    const exec = gateway.calls.filter((c) => c.purpose === 'EXECUTION');
-    expect(exec.length).toBeGreaterThan(0);
-
-    // 前提：那一轮确实有两个 tool_use
-    const planTurn = exec[0]!.messages.find((m) => toolUsesOf(m.content).length === 2);
+    const planning = gateway.calls.filter((c) => c.purpose === 'PLANNING');
+    expect(planning).toHaveLength(2);
+    const planTurn = planning[1]!.messages.find((m) => toolUsesOf(m.content).length === 2);
     expect(planTurn).toBeDefined();
-
-    expect(findOrphanToolUse(exec[0]!.messages)).toBeNull();
+    expect(findOrphanToolUse(planning[1]!.messages)).toBeNull();
   });
 
   it('每一次模型调用的历史都合法，不只是第一次', async () => {
@@ -926,6 +940,54 @@ describe('规划阶段不会无限重试', () => {
 // ---------------------------------------------------------------------------
 
 describe('AbortSignal 取消', () => {
+  it('第一次已派发、退避中取消：最终 NOT_SENT 不抹掉已消费的模型轮次', async () => {
+    const gateway: ModelInvoker = {
+      invoke: async (input) => {
+        input.onDispatch?.({
+          invocationId: 'inv-retry-cancel',
+          sendAttempt: 1,
+          requestedAt: nowIso(),
+          purpose: input.purpose,
+          resolutionId: input.resolution.resolutionId,
+          providerId: input.resolution.providerId,
+          modelId: input.resolution.modelId,
+        });
+        const manifest = {
+          invocationId: 'inv-retry-cancel',
+          runId: input.runId,
+          attemptId: input.attemptId,
+          purpose: input.purpose,
+          resolutionId: input.resolution.resolutionId,
+          providerId: input.resolution.providerId,
+          origin: input.resolution.origin,
+          modelId: input.resolution.modelId,
+          sent: false,
+          blockReason: null,
+          contextFileRefs: [],
+          inputTokens: null,
+          outputTokens: null,
+          requestedAt: nowIso(),
+          settledAt: nowIso(),
+          errorKind: 'CANCELLED',
+          sendAttempt: 2,
+          sendState: 'NOT_SENT',
+        } satisfies ModelEgressManifest;
+        throw new InvocationFailed(
+          new ModelCallError('cancelled during retry delay', 'CANCELLED', null, { sendState: 'NOT_SENT' }),
+          manifest,
+        );
+      },
+    };
+
+    await expect(run(gateway, makeTask())).rejects.toBeInstanceOf(AgentCancelled);
+
+    expect(host.ledger.modelTurns).toBe(1);
+    expect(host.events).toContainEqual(expect.objectContaining({
+      kind: 'MODEL_INVOCATION',
+      payload: expect.objectContaining({ phase: 'DISPATCH_SETTLED', sendAttempt: 1 }),
+    }));
+  });
+
   it('起手就已取消（有验证）：抛 AgentCancelled，不 spawn 命令，也不伪造"基线完成"事件', async () => {
     const controller = new AbortController();
     controller.abort();
@@ -1672,16 +1734,15 @@ describe('响应不完整就不能据此执行工具', () => {
 
     await run(gateway, makeTask({ verificationCommandIds: [] }));
 
-    // 前提：确实发生了跨阶段历史复用，否则下面的断言什么都没验证
-    const exec = gateway.calls.filter((c) => c.purpose === 'EXECUTION');
-    expect(exec.length).toBeGreaterThan(0);
+    const planning = gateway.calls.filter((c) => c.purpose === 'PLANNING');
+    expect(planning).toHaveLength(2);
 
     // 两个 id 都要有 tool_result，少一个就是孤儿（此后每一次请求都 400）
-    expect(findOrphanToolUse(exec[0]!.messages)).toBeNull();
-    expect(findWireViolation(exec[0]!.messages)).toBeNull();
+    expect(findOrphanToolUse(planning[1]!.messages)).toBeNull();
+    expect(findWireViolation(planning[1]!.messages)).toBeNull();
 
     // 回填必须如实说"未执行"，不能伪造成成功，也不能含糊成"执行被中断"
-    const results = allBlocks(exec[0]!.messages).filter(
+    const results = allBlocks(planning[1]!.messages).filter(
       (b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result',
     );
     for (const id of ['tu_read_trunc', 'tu_plan_trunc']) {

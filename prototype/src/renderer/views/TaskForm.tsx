@@ -76,6 +76,8 @@ export function Composer({
     commandIds.includes('build') ? ['build'] : commandIds.slice(0, 1),
   );
   const [modelProfileId, setModelProfileId] = useState(enabledModels[0]?.profileId ?? '');
+  const [collaborationMode, setCollaborationMode] = useState<'' | 'MANUAL_HANDOFF' | 'BOUNDED_AUTO'>('');
+  const [plannerModelProfileId, setPlannerModelProfileId] = useState(enabledModels[0]?.profileId ?? '');
   /** 多行文本原文；空 = 不做交叉审核。解析后**精确匹配** —— 不做模糊匹配是本项目的底线 */
   const [reviewerInput, setReviewerInput] = useState('');
   /**
@@ -234,6 +236,9 @@ export function Composer({
         const res = await call('egress.disclosure', {
           snapshotId: snapshot.snapshotId,
           modelProfileId: effectiveModelId,
+          ...(collaborationMode
+            ? { plannerModelProfileId, collaborationMode }
+            : {}),
           ...(reviewerModelForDisclosure ? { reviewerModelProfileId: reviewerModelForDisclosure } : {}),
           ...(reviewerCliForDisclosure ? { reviewerConnectorId: reviewerCliForDisclosure } : {}),
           ...(authorConnectorId ? { authorConnectorId } : {}),
@@ -256,7 +261,7 @@ export function Composer({
     return () => {
       cancelled = true;
     };
-  }, [snapshot.snapshotId, effectiveModelId, reviewerModelForDisclosure, reviewerCliForDisclosure, authorConnectorId, handoffDraft]);
+  }, [snapshot.snapshotId, effectiveModelId, plannerModelProfileId, collaborationMode, reviewerModelForDisclosure, reviewerCliForDisclosure, authorConnectorId, handoffDraft]);
   const consented = disclosure !== null && consentedDigest === disclosure.digest;
 
   /**
@@ -273,6 +278,7 @@ export function Composer({
     if (reviewerProfileId && reviewerResolved) {
       out.push({ label: '交叉审核', value: reviewerProfileId });
     }
+    if (collaborationMode) out.push({ label: '双 Agent', value: collaborationMode === 'MANUAL_HANDOFF' ? '逐步交接' : '有界自动' });
     if (authorOption) out.push({ label: '作者', value: `${authorOption.label}（外部 CLI）` });
     if (handoffDraft) out.push({ label: '会话交接', value: handoffDraft.digest.slice(0, 20) });
     return out;
@@ -303,6 +309,7 @@ export function Composer({
     effectiveModelId.length > 0 &&
     // 填了但填错 / 填了多个都不放行：静默忽略等于"我以为开了交叉审核，其实没开"
     (reviewerLines.length === 0 || (reviewerLines.length === 1 && reviewerResolved)) &&
+    (!collaborationMode || (plannerModelProfileId.length > 0 && reviewerResolved)) &&
     // 出站同意：没看到披露或没点头，就不能发 —— 这是 P0 契约，不是可选项
     consented &&
     // 自填命令高于 R1 时：可批准的要先批（否则提交必被 Core 拒），不可批准的直接挡住
@@ -318,6 +325,8 @@ export function Composer({
         ? '先在「设置 · API」配置一个模型'
         : !(reviewerLines.length === 0 || (reviewerLines.length === 1 && reviewerResolved))
           ? '审核方填写有误（多行或不在候选里）'
+          : collaborationMode && (!plannerModelProfileId || !reviewerResolved)
+            ? '双 Agent 协作需要计划方和可证明异构的审核方'
           : !consented
             ? '先确认上方的数据出站披露'
             : hasCustom && risk && risk.risk !== 'R1' && !(risk.approvable && approvedNow)
@@ -333,6 +342,7 @@ export function Composer({
         snapshotId: snapshot.snapshotId,
         profileId: profile.profileId,
         modelProfileId: effectiveModelId,
+        ...(collaborationMode ? { plannerModelProfileId, collaborationMode } : {}),
         goal: goal.trim(),
         /*
          * 字段保留、UI 删除。taskClass 在 Core 里**只被写入、从无读取**
@@ -563,7 +573,7 @@ export function Composer({
               <ul className="plain">
                 {disclosure.destinations.map((d, i) => (
                   <li key={`${d.role}-${i}`}>
-                    <b>{d.role === 'IMPLEMENTER' ? '实现方' : d.role === 'REVIEWER' ? '审核方' : '作者'}</b> {d.label}：
+                    <b>{d.role === 'PLANNER' ? '计划方' : d.role === 'IMPLEMENTER' ? '实现方' : d.role === 'REVIEWER' ? '审核方' : '作者'}</b> {d.label}：
                     {d.dataClasses.map((c) => DATA_CLASS_LABEL[c] ?? c).join('、')}
                   </li>
                 ))}
@@ -697,6 +707,24 @@ export function Composer({
                 )}
               </div>
 
+
+              <div className="field">
+                <label>协作推进</label>
+                <div className="suggest-row">
+                  <button type="button" className={`chip ${collaborationMode === '' ? 'selected' : ''}`} aria-pressed={collaborationMode === ''} onClick={() => setCollaborationMode('')}>普通任务</button>
+                  <button type="button" className={`chip ${collaborationMode === 'MANUAL_HANDOFF' ? 'selected' : ''}`} aria-pressed={collaborationMode === 'MANUAL_HANDOFF'} onClick={() => setCollaborationMode('MANUAL_HANDOFF')}>双 Agent · 逐步交接</button>
+                  <button type="button" className={`chip ${collaborationMode === 'BOUNDED_AUTO' ? 'selected' : ''}`} aria-pressed={collaborationMode === 'BOUNDED_AUTO'} onClick={() => setCollaborationMode('BOUNDED_AUTO')}>双 Agent · 有界自动</button>
+                </div>
+                {collaborationMode && (
+                  <>
+                    <label htmlFor="planner-route">计划方</label>
+                    <select id="planner-route" value={plannerModelProfileId} onChange={(event) => setPlannerModelProfileId(event.target.value)}>
+                      {enabledModels.map((model) => <option key={model.profileId} value={model.profileId}>{model.label} · {model.modelId}</option>)}
+                    </select>
+                    <div className="help">计划方只读；实施方和审核方仍由各自冻结身份执行。逐步交接会在下一次模型阶段前停靠。</div>
+                  </>
+                )}
+              </div>
 
               <div className="field">
                 <label>实现方（作者）：谁来改代码</label>

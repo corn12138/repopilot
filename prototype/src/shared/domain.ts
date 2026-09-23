@@ -247,6 +247,14 @@ export interface TaskSpec {
   readonly goal: string;
   /** 来自观察面的人为交接；只在 Core 重算 payload 摘要一致后写入。 */
   readonly handoffDigest?: Digest;
+  /** 缺失表示历史/普通任务；只有显式配置才启用双角色协作门禁。 */
+  readonly collaboration?: {
+    readonly mode: CollaborationMode;
+    readonly planner: CollaborationRoleBinding;
+    readonly implementer: CollaborationRoleBinding;
+    readonly reviewer: CollaborationRoleBinding;
+    readonly roleBindingDigest: Digest;
+  };
   readonly taskClass: TaskClass;
   readonly allowedPaths: readonly string[];
   readonly protectedPaths: readonly string[];
@@ -370,6 +378,13 @@ export type RunStatus =
    * 不进可跨重启存活白名单：它需要活的执行器。
    */
   | 'CROSS_REVIEWING'
+  /**
+   * 当前阶段已完整落账，Core 正等待用户或有界自动策略消费下一份交接决定。
+   *
+   * 这是进程内安全边界，不是可恢复 checkpoint：应用重启后没有活执行器，必须转为
+   * INTERRUPTED，不能从这项状态推导出上一条模型请求可安全重发。
+   */
+  | 'AWAITING_HANDOFF'
   | 'AWAITING_PATCH_REVIEW'
   | 'SUCCEEDED'
   /** 用户接受了补丁，但没有任何机器验证支撑 —— 与 SUCCEEDED 严格区分 */
@@ -446,6 +461,24 @@ export interface RunView {
   readonly createdAt: Iso8601;
   readonly updatedAt: Iso8601;
   readonly terminalFacts: RunTerminalFacts | null;
+  readonly pendingHandoff?: Pick<CollaborationHandoff, 'handoffId' | 'digest' | 'nextPhase' | 'toRole' | 'expiresAt'> | null;
+  readonly collaborationControl?: {
+    readonly mode: CollaborationMode;
+    readonly stopAfterStepRequested: boolean;
+  } | null;
+  /** Core 投影的角色与审核计数；Renderer 不从事件文案反推。 */
+  readonly collaborationProjection?: {
+    readonly roles: readonly Pick<CollaborationRoleBinding, 'role' | 'executionKind' | 'label'>[];
+    readonly cycleId: string | null;
+    readonly currentCycle: {
+      readonly reviewerInvocations: number;
+      readonly remediations: number;
+    };
+    readonly taskTotals: {
+      readonly reviewerInvocations: number;
+      readonly remediations: number;
+    };
+  } | null;
   /**
    * 该 Run 是从磁盘恢复的，不是本次进程创建的。
    *
@@ -510,6 +543,8 @@ export type RunEventKind =
   | 'CROSS_REVIEW_ROUND'
   /** 交叉审核整体结束（stopReason） */
   | 'CROSS_REVIEW_FINISHED'
+  | 'HANDOFF_CREATED'
+  | 'HANDOFF_DECIDED'
   | 'NOTE';
 
 export interface RunEvent {
@@ -584,7 +619,7 @@ export interface ApprovalRequest {
   readonly expiresAt: Iso8601;
 }
 
-export type ApprovalDecisionKind = 'APPROVE' | 'REJECT';
+export type ApprovalDecisionKind = 'APPROVE' | 'REJECT' | 'REVISE';
 
 // ---------------------------------------------------------------------------
 // 计划
@@ -873,11 +908,17 @@ export type CrossReviewVerdict = 'PASS' | 'CHANGES_REQUESTED' | 'INCONCLUSIVE';
 /** 一次 reviewer invocation 的不可变记录 */
 export interface CrossReviewRound {
   readonly round: number;
+  /** 本轮所属的协作循环；旧持久化记录可能没有。 */
+  readonly cycleId?: string;
+  /** 本次审核调用的稳定身份；跨续期不能复用。 */
+  readonly reviewId?: string;
   /** 审核所针对的补丁 digest —— 用来判定"整改后 digest 是否真的变了" */
   readonly reviewedPatchDigest: Digest;
   readonly reviewerResolutionId: string;
   readonly verdict: CrossReviewVerdict;
   readonly findings: readonly ReviewFinding[];
+  /** 复审明确确认已经解决的上一轮 finding 指纹；缺失表示当时未记录该合同。 */
+  readonly resolvedFindingFingerprints?: readonly string[];
   readonly startedAt: Iso8601;
   readonly finishedAt: Iso8601;
 }
@@ -990,6 +1031,15 @@ export interface CrossReviewRecord {
   readonly reviewerInvocations: number;
   /** 已消耗的 remediation 次数。累计值：跨用户续期只增不清 */
   readonly remediations: number;
+  readonly findingDispositions?: readonly {
+    readonly fingerprint: Digest;
+    readonly disposition: CollaborationFindingRef['disposition'];
+    readonly reviewId: string;
+    /** USER_ACCEPTED 时必有；旧记录与模型处置为空。 */
+    readonly reason?: string;
+    /** USER_ACCEPTED 绑定用户当时实际看到的补丁，防止理由漂到后续 patch。 */
+    readonly patchDigest?: Digest;
+  }[];
   /**
    * 用户显式授权的续期次数。防死循环的闸门：自动轮次每循环硬上限
    * （CROSS_REVIEW_LIMITS），跨循环只能由人推进 —— 平台绝不自己"再试一次"。
@@ -1188,8 +1238,102 @@ export type EgressDataClass =
   /** 外部 CLI 当作者时，它在一次性副本里可读取**整个仓库**并自行决定送什么给其供应商 */
   | 'REPOSITORY_FULL_COPY_VIA_CLI';
 
+export type CollaborationRole = 'PLANNER' | 'IMPLEMENTER' | 'REVIEWER';
+
+export type CollaborationExecutionKind = 'MODEL_API' | 'MANAGED_ENGINE';
+
+/** 三个职责分别冻结；缺少该对象的历史任务继续沿用旧单路由语义。 */
+export interface CollaborationRoleBinding {
+  readonly role: CollaborationRole;
+  readonly executionKind: CollaborationExecutionKind;
+  readonly profileId: string | null;
+  readonly connectorId: string | null;
+  readonly identityDigest: Digest;
+  readonly label: string;
+}
+
+export type CollaborationMode = 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
+export type CollaborationPhase =
+  | 'IMPLEMENT'
+  | 'SELF_FIX'
+  | 'FIRST_REVIEW'
+  | 'REMEDIATE'
+  | 'SECOND_REVIEW'
+  | 'HUMAN_REVIEW';
+
+export interface CollaborationFindingRef {
+  readonly findingId: string;
+  readonly fingerprint: Digest;
+  readonly reviewId: string;
+  readonly blocking: boolean;
+  readonly evidenceRefs: readonly string[];
+  readonly disposition: 'OPEN' | 'REMEDIATED_PENDING_REVIEW' | 'RESOLVED' | 'USER_ACCEPTED';
+}
+
+/**
+ * Core 持有的阶段交接工件。正文只包含下一角色所需的最小上下文；聊天历史和工具权限
+ * 不随角色继承。digest 由不含自身的规范化 payload 计算。
+ */
+export interface CollaborationHandoff {
+  readonly schemaVersion: 1;
+  readonly handoffId: string;
+  readonly taskId: string;
+  readonly runId: string;
+  readonly attemptId: string;
+  readonly cycleId: string;
+  readonly fromRole: CollaborationRole;
+  readonly toRole: CollaborationRole | 'USER';
+  readonly nextPhase: CollaborationPhase;
+  readonly plan: { readonly planId: string; readonly revision: number; readonly digest: Digest };
+  readonly snapshotId: string;
+  readonly baseTreeDigest: Digest;
+  readonly generation: number;
+  readonly treeDigest: Digest;
+  readonly roleBindingDigest: Digest;
+  readonly patch: { readonly patchId: string; readonly digest: Digest } | null;
+  readonly changedPaths: readonly string[];
+  readonly verificationIds: readonly string[];
+  readonly verificationInputDigest: Digest | null;
+  readonly verificationEligible: boolean;
+  readonly findings: readonly CollaborationFindingRef[];
+  readonly context: {
+    readonly goal: string;
+    readonly acceptance: readonly string[];
+    readonly allowedPaths: readonly string[];
+    readonly planSummary: string;
+    readonly provenance: readonly string[];
+  };
+  readonly disclosureDigest: Digest;
+  readonly recipientIdentityDigest: Digest;
+  readonly dataClasses: readonly EgressDataClass[];
+  readonly counts: {
+    readonly included: number;
+    readonly excluded: number;
+    readonly truncated: number;
+    readonly reasons: readonly string[];
+  };
+  readonly budget: {
+    readonly modelTurnsRemaining: number;
+    readonly toolCallsRemaining: number;
+    readonly reviewerInvocations: number;
+    readonly remediations: number;
+  };
+  readonly createdAt: Iso8601;
+  readonly expiresAt: Iso8601;
+  readonly coreEpoch: number;
+  readonly digest: Digest;
+}
+
+export interface CollaborationHandoffDecision {
+  readonly decisionId: string;
+  readonly handoffId: string;
+  readonly handoffDigest: Digest;
+  readonly action: 'CONTINUE' | 'PAUSE' | 'CANCEL';
+  readonly decidedAt: Iso8601;
+}
+
 export interface EgressDestination {
-  readonly role: 'IMPLEMENTER' | 'REVIEWER' | 'AUTHOR';
+  readonly role: 'PLANNER' | 'IMPLEMENTER' | 'REVIEWER' | 'AUTHOR';
   /** MODEL_API：RepoPilot 自己经 ModelGateway 出站；EXTERNAL_CLI：本机外部 CLI 自行出站 */
   readonly channel: 'MODEL_API' | 'EXTERNAL_CLI';
   readonly label: string;

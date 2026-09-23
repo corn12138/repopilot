@@ -18,7 +18,7 @@
  * 校验 schema 放在 main/observer/observerSchema.ts，不进 Preload 包。
  */
 
-export const OBSERVER_PROTOCOL_VERSION = 3;
+export const OBSERVER_PROTOCOL_VERSION = 4;
 
 /** 独立通道名 —— 刻意不与 `repopilot:request/event`（Core 契约）共用 */
 export const OBSERVER_CHANNEL = {
@@ -54,6 +54,19 @@ export interface ObserverSessionEntry {
   readonly vendor: JournalVendor;
   /** 展示名（文件 basename 去扩展名），不是宿主路径 */
   readonly label: string;
+  /** 本地显示名的依据；永不调用供应商改名接口。旧条目没有该字段时按 FILE_FALLBACK 展示。 */
+  readonly labelSource?: 'LOCAL_ALIAS' | 'OFFICIAL_TITLE' | 'FIRST_USER_REQUEST' | 'UNNAMED' | 'FILE_FALLBACK';
+  readonly labelOmissions?: {
+    readonly recordsScanned: number;
+    /** 命中记录上限时只能证明至少还省略一条；不能把未知总数伪装成精确值。 */
+    readonly recordsOmittedAtLeast: number;
+    readonly bytesOmitted: number;
+    /** 最终标题因 72 字符展示上限删掉的 Unicode 字符数。 */
+    readonly labelCharactersOmitted: number;
+    readonly reason: string | null;
+  };
+  /** 产生当前 READY_TO_HANDOFF 的稳定机器事件身份；后续仅 mtime 变化不会改变。 */
+  readonly attentionEventId?: string | null;
   readonly updatedAt: string;
   readonly sizeBytes: number;
   readonly source: ObserverSessionSource;

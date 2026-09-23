@@ -23,6 +23,7 @@ import type { RequestMethod } from './protocol';
 export type FieldSpec =
   | { readonly kind: 'string'; readonly optional?: boolean; readonly maxLength?: number; readonly allowEmpty?: boolean }
   | { readonly kind: 'enum'; readonly values: readonly string[]; readonly optional?: boolean }
+  | { readonly kind: 'boolean'; readonly optional?: boolean }
   | {
       readonly kind: 'integer';
       readonly optional?: boolean;
@@ -118,6 +119,8 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
       snapshotId: ID,
       profileId: ID,
       modelProfileId: ID,
+      plannerModelProfileId: OPTIONAL_ID,
+      collaborationMode: { kind: 'enum', values: ['MANUAL_HANDOFF', 'BOUNDED_AUTO'], optional: true },
       goal: { kind: 'string', maxLength: 20_000 },
       // TaskClass 是自由文本元数据（不设门禁、不进提示词），所以只限长度。
       taskClass: { kind: 'string', maxLength: 200, allowEmpty: true },
@@ -157,6 +160,8 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
     fields: {
       snapshotId: ID,
       modelProfileId: ID,
+      plannerModelProfileId: OPTIONAL_ID,
+      collaborationMode: { kind: 'enum', values: ['MANUAL_HANDOFF', 'BOUNDED_AUTO'], optional: true },
       reviewerModelProfileId: OPTIONAL_ID,
       reviewerConnectorId: OPTIONAL_ID,
       authorConnectorId: OPTIONAL_ID,
@@ -179,7 +184,7 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
   'approval.decide': {
     fields: {
       approvalId: ID,
-      decision: { kind: 'enum', values: ['APPROVE', 'REJECT'] },
+      decision: { kind: 'enum', values: ['APPROVE', 'REJECT', 'REVISE'] },
       subjectDigest: DIGEST,
       note: NOTE,
     },
@@ -192,6 +197,19 @@ export const IPC_CONTRACT: Readonly<Record<RequestMethod, MethodContract>> = {
   'evidence.summary': { fields: NONE, timeoutMs: QUICK },
   'crossreview.reviewers': { fields: NONE, timeoutMs: SLOW },
   'crossreview.continue': { fields: { runId: ID }, timeoutMs: SLOW },
+  'collaboration.getHandoff': { fields: { runId: ID }, timeoutMs: QUICK },
+  'collaboration.continue': {
+    fields: { runId: ID, handoffId: ID, handoffDigest: DIGEST, decisionId: ID },
+    timeoutMs: SLOW,
+  },
+  'collaboration.control': {
+    fields: {
+      runId: ID,
+      mode: { kind: 'enum', values: ['MANUAL_HANDOFF', 'BOUNDED_AUTO'], optional: true },
+      stopAfterStep: { kind: 'boolean', optional: true },
+    },
+    timeoutMs: QUICK,
+  },
   'patch.decide': {
     fields: {
       runId: ID,
@@ -368,6 +386,10 @@ function checkField(path: string, spec: FieldSpec, value: unknown): ValidationFa
       }
       return null;
     }
+    case 'boolean':
+      return typeof value === 'boolean'
+        ? null
+        : fail(`字段 ${path} 类型错误`, `期望 boolean，收到 ${describe(value)}`);
     case 'integer': {
       if (value === null) {
         return spec.nullable ? null : fail(`字段 ${path} 不允许为 null`, '期望整数');

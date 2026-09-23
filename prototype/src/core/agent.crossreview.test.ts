@@ -43,6 +43,7 @@ vi.mock('./paths', async () => {
 import type {
   ModelRouteResolution,
   PatchArtifact,
+  ReviewFinding,
   RunEventKind,
   RunStatus,
   TaskSpec,
@@ -123,9 +124,10 @@ class ReviewHost implements AgentHost {
     c.resolution = resolution;
     c.reason = reason;
   }
-  chargeModelTurn(): void {
+  reserveModelTurn(): void {
     this.modelTurns += 1;
   }
+  settleModelTurn(): void {}
   chargeToolCall(): void {}
   chargeSelfFixRound(): void {}
   /** 达到该轮次数后报"预算耗尽"；null = 永不耗尽（默认，既有用例不受影响） */
@@ -174,6 +176,15 @@ class ScriptedReviewer implements ModelInvoker {
     this.turn += 1;
     const orphan = findWireViolation(input.request.messages);
     if (orphan) throw new Error(`审核方收到非法消息序列：${orphan}`);
+    input.onDispatch?.({
+      invocationId: `inv_${this.turn}`,
+      sendAttempt: 1,
+      requestedAt: nowIso(),
+      purpose: input.purpose,
+      resolutionId: input.resolution.resolutionId,
+      providerId: input.resolution.providerId,
+      modelId: 'reviewer-model',
+    });
     const response = this.script(this.turn);
     return {
       invocationId: `inv_${this.turn}`,
@@ -390,6 +401,15 @@ describe('runReviewPass', () => {
       async invoke(input) {
         const orphan = findWireViolation(input.request.messages);
         if (orphan) throw new Error(orphan);
+        input.onDispatch?.({
+          invocationId: 'inv',
+          sendAttempt: 1,
+          requestedAt: nowIso(),
+          purpose: input.purpose,
+          resolutionId: input.resolution.resolutionId,
+          providerId: input.resolution.providerId,
+          modelId: 'reviewer-model',
+        });
         return {
           invocationId: 'inv',
           response: { content: [{ type: 'text', text: '我还在看' }], stopReason: 'END_TURN', inputTokens: 1, outputTokens: 1 },
@@ -463,6 +483,16 @@ class ScriptedDuo implements ModelInvoker {
     if (orphan) throw new Error(`非法消息序列：${orphan}`);
     this.purposes.push(input.purpose);
     this.resolutionIds.push(input.resolution.resolutionId);
+    const invocationId = `inv_${this.purposes.length}`;
+    input.onDispatch?.({
+      invocationId,
+      sendAttempt: 1,
+      requestedAt: nowIso(),
+      purpose: input.purpose,
+      resolutionId: input.resolution.resolutionId,
+      providerId: input.resolution.providerId,
+      modelId: input.resolution.modelId,
+    });
     const isReview = input.purpose === 'CROSS_REVIEW';
     if (!isReview) {
       const first = input.request.messages[0]?.content.find((b) => b.type === 'text');
@@ -470,10 +500,10 @@ class ScriptedDuo implements ModelInvoker {
     }
     const response = isReview ? this.review(++this.reviewTurn) : this.exec(++this.execTurn);
     return {
-      invocationId: `inv_${this.purposes.length}`,
+      invocationId,
       response,
       manifest: {
-        invocationId: `inv_${this.purposes.length}`,
+        invocationId,
         runId: input.runId,
         attemptId: input.attemptId,
         purpose: input.purpose,
@@ -494,8 +524,11 @@ class ScriptedDuo implements ModelInvoker {
   }
 }
 
-const submitReview = (verdict: 'PASS' | 'CHANGES_REQUESTED' | 'INCONCLUSIVE', findings: unknown[]) =>
-  toolUse('submit_review', { verdict, findings });
+const submitReview = (
+  verdict: 'PASS' | 'CHANGES_REQUESTED' | 'INCONCLUSIVE',
+  findings: unknown[],
+  resolvedFindingFingerprints: string[] = [],
+) => toolUse('submit_review', { verdict, findings, resolvedFindingFingerprints });
 
 /** 两条可复用的阻断发现。指纹由平台按 (severity,file,range,evidence) 算，字段一致 → 指纹重现 */
 const FINDING_A = {
@@ -527,6 +560,12 @@ const FINDING_C = {
   evidence: '整改引入的新问题',
   blocking: true,
 };
+const FINGERPRINT_A = digestOf({
+  severity: FINDING_A.severity,
+  file: FINDING_A.file,
+  range: [FINDING_A.startLine, FINDING_A.endLine],
+  evidence: FINDING_A.evidence,
+});
 
 function makeHooks(opts: { reverify?: 'pass' | 'fail' | 'disabled'; resealDigest?: string } = {}) {
   const calls = { reverify: 0, reseal: 0, adopt: 0, restore: 0 };
@@ -570,6 +609,31 @@ const cycleInput = (deps: AgentDeps) => ({
 });
 
 describe('runCrossReviewCycle：终止语义与 counter', () => {
+  it('续期首审遗漏既有未解决问题时不能用空 PASS 清账', async () => {
+    const host = new ReviewHost();
+    const deps = makeDeps(new ScriptedDuo(() => submitReview('PASS', [])), host, IMPLEMENTER);
+    const { hooks } = makeHooks();
+    const inherited: ReviewFinding = {
+      severity: 'HIGH',
+      confidence: 0.9,
+      file: 'src/app.ts',
+      range: [1, 1],
+      evidence: 'app.ts 未处理空输入',
+      reproduction: null,
+      suggestedRemediation: '增加空值分支',
+      blocking: true,
+      fingerprint: FINGERPRINT_A,
+    };
+    const out = await runCrossReviewCycle(
+      deps,
+      { ...cycleInput(deps), priorFindings: [inherited] },
+      hooks,
+    );
+
+    expect(out.stopReason).toBe('REVIEWER_INCONCLUSIVE');
+    expect(out.reviewerInvocations).toBe(1);
+    expect(out.remediations).toBe(0);
+  });
   it('第 1 轮 PASS → REVIEWER_PASSED，零整改、零钩子调用', async () => {
     const host = new ReviewHost();
     const duo = new ScriptedDuo(() => submitReview('PASS', []));
@@ -638,7 +702,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     const host = new ReviewHost();
     let ws: ReviewWorkspace | null = null;
     const duo = new ScriptedDuo(
-      (turn) => (turn === 1 ? submitReview('PASS', [FINDING_A]) : submitReview('PASS', [])),
+      (turn) => (turn === 1 ? submitReview('PASS', [FINDING_A]) : submitReview('PASS', [], [FINGERPRINT_A])),
       () => {
         ws!.activeGeneration += 1;
         return textResponse('已按发现修复');
@@ -675,7 +739,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     const host = new ReviewHost();
     let ws: ReviewWorkspace | null = null;
     const duo = new ScriptedDuo(
-      (turn) => (turn === 1 ? submitReview('CHANGES_REQUESTED', [FINDING_A]) : submitReview('PASS', [])),
+      (turn) => (turn === 1 ? submitReview('CHANGES_REQUESTED', [FINDING_A]) : submitReview('PASS', [], [FINGERPRINT_A])),
       () => {
         ws!.activeGeneration += 1; // 模拟整改真的推进了一代
         return textResponse('已按发现修复');
@@ -897,7 +961,7 @@ describe('runCrossReviewCycle：终止语义与 counter', () => {
     const host = new ReviewHost();
     let ws: ReviewWorkspace | null = null;
     const duo = new ScriptedDuo(
-      (turn) => (turn === 1 ? submitReview('CHANGES_REQUESTED', [FINDING_A]) : submitReview('PASS', [])),
+      (turn) => (turn === 1 ? submitReview('CHANGES_REQUESTED', [FINDING_A]) : submitReview('PASS', [], [FINGERPRINT_A])),
       () => {
         ws!.activeGeneration += 1;
         return textResponse('修好了');

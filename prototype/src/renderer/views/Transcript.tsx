@@ -211,7 +211,11 @@ function describeActivity(
   toolCalls: readonly ToolCallView[],
 ): string | null {
   // 等人做决定不是"进行中"：球在用户那边，审批卡自己会说话
-  if (status === 'AWAITING_PLAN_APPROVAL' || status === 'AWAITING_PATCH_REVIEW') return null;
+  if (
+    status === 'AWAITING_PLAN_APPROVAL' ||
+    status === 'AWAITING_HANDOFF' ||
+    status === 'AWAITING_PATCH_REVIEW'
+  ) return null;
 
   const pending = toolCalls.find((t) => t.resolution === null);
   if (pending) return `正在${toolNameText(pending.toolName)}：${pending.argsSummary}`;

@@ -268,6 +268,15 @@ class ScriptedModel implements ModelInvoker {
     const orphan = findWireViolation(input.request.messages);
     if (orphan) throw new Error(`${input.purpose} 调用收到非法消息序列：${orphan}`);
     this.turn += 1;
+    input.onDispatch?.({
+      invocationId: `inv_fake_${this.turn}`,
+      sendAttempt: 1,
+      requestedAt: nowIso(),
+      purpose: input.purpose,
+      resolutionId: input.resolution.resolutionId,
+      providerId: input.resolution.providerId,
+      modelId: 'TEST_ONLY_FAKE',
+    });
     const response = this.script(input.purpose, input);
     return {
       invocationId: `inv_fake_${this.turn}`,
@@ -402,9 +411,10 @@ class Recorder implements AgentHost {
     if (call) call.resolution = resolution;
   }
 
-  chargeModelTurn(): void {
+  reserveModelTurn(): void {
     this.ledger.modelTurns += 1;
   }
+  settleModelTurn(): void {}
   chargeToolCall(): void {
     this.ledger.toolCalls += 1;
   }

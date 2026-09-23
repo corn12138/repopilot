@@ -116,6 +116,7 @@ function disclosureFor(payload: Record<string, unknown>) {
   const withHandoff = (items: string[]) =>
     payload.handoffDigest ? [...items, 'OBSERVED_SESSION_HANDOFF'] : items;
   const destinations = [
+    ...(payload.plannerModelProfileId ? [{ role: 'PLANNER', channel: 'MODEL_API', label: 'DeepSeek · deepseek-chat', providerId: 'deepseek', origin: 'https://api.deepseek.com', isRelay: false, modelId: 'deepseek-chat', resolutionDigest: 'sha256:r1', dataClasses: withHandoff(['TASK_TEXT']) }] : []),
     { role: 'IMPLEMENTER', channel: 'MODEL_API', label: 'DeepSeek · deepseek-chat', providerId: 'deepseek', origin: 'https://api.deepseek.com', isRelay: false, modelId: 'deepseek-chat', resolutionDigest: 'sha256:r1', dataClasses: withHandoff(['TASK_TEXT', 'REPOSITORY_SNAPSHOT_EXCERPTS']) },
     ...(payload.reviewerConnectorId ? [{ role: 'REVIEWER', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: withHandoff(['PATCH_DIFF']) }] : []),
     ...(payload.authorConnectorId ? [{ role: 'AUTHOR', channel: 'EXTERNAL_CLI', label: 'Codex · 0.1（本机 CLI）', providerId: 'openai', origin: null, isRelay: false, modelId: null, resolutionDigest: null, dataClasses: withHandoff(['REPOSITORY_FULL_COPY_VIA_CLI']) }] : []),
@@ -186,6 +187,22 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe('外部作者与外部 CLI 审核方：可达且传对字段', () => {
+  it('双 Agent 模式把同一 planner/mode 输入用于披露和 task.create', async () => {
+    render(composer());
+    await openOptions();
+    fireEvent.click(screen.getByRole('button', { name: '双 Agent · 逐步交接' }));
+    fireEvent.click(screen.getByRole('button', { name: /Codex · 0\.1（CLI）/ }));
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
+    fireEvent.change(screen.getByPlaceholderText(/描述要修的问题/), { target: { value: '修一下构建' } });
+    await waitFor(() => expect(screen.getByTestId('egress-disclosure').textContent).toContain('计划方'));
+    await consent();
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: '开始' })));
+    const disclosure = callMock.mock.calls.find((call) => call[0] === 'egress.disclosure' && call[1].collaborationMode);
+    const create = callMock.mock.calls.find((call) => call[0] === 'task.create');
+    expect(disclosure?.[1]).toMatchObject({ plannerModelProfileId: 'model-1', collaborationMode: 'MANUAL_HANDOFF' });
+    expect(create?.[1]).toMatchObject({ plannerModelProfileId: 'model-1', collaborationMode: 'MANUAL_HANDOFF', reviewerConnectorId: 'codex-cli' });
+  });
+
   it('连接器列表来自 crossreview.reviewers；不可用的显示为禁用并带原因', async () => {
     render(composer());
     await openOptions();

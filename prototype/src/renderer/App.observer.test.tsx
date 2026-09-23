@@ -2,19 +2,20 @@
 
 /**
  * 观察面板在 App 壳里的接线（PRD-WKB-002 spike）：
- *   - 入口是 sidebar-foot 第三颗按钮，打开后是第三个全屏视图；
+ *   - 入口是 sidebar-foot 的观察按钮，打开后占用主区；
  *   - 与设置/证据互斥：任一开启，其余关闭 —— 12 处互斥点是脚本机械补齐的，这里逐条钉；
  *   - Esc 关层；打开项目/运行也会关掉观察（不能盖在 Run 详情上）；
  *   - ⌘K 里有它的命令。
  * 布局恒定（N12）：观察面板不新增 grid 列 —— `.app` 不因它带上 `ide`。
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ProjectRef, RepositoryHarnessProfile, RepositorySnapshot } from '@shared/domain';
+import type { ObserverBridge } from '@shared/observerProtocol';
 import type { ImportOutcome, IpcResult, RepoPilotBridge, RequestMethod } from '@shared/protocol';
 import { PROTOCOL_VERSION } from '@shared/protocol';
-import type { ObserverBridge } from '@shared/observerProtocol';
+import type { WorkbenchBridge } from '@shared/workbenchProtocol';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 
 const NOW = '2026-09-05T00:00:00.000Z';
@@ -77,7 +78,7 @@ function installBridges(): { observerRequest: ReturnType<typeof vi.fn> } {
           throw new Error(`Unexpected request: ${method}`);
       }
     }) as RepoPilotBridge['request'],
-    subscribe: () => () => {},
+    subscribe: () => () => { },
   } satisfies Partial<RepoPilotBridge> as RepoPilotBridge;
 
   const observerRequest = vi.fn(async (method: string) => {
@@ -88,7 +89,7 @@ function installBridges(): { observerRequest: ReturnType<typeof vi.fn> } {
   window.repopilotObserver = {
     protocolVersion: 3,
     request: observerRequest as unknown as ObserverBridge['request'],
-    subscribe: () => () => {},
+    subscribe: () => () => { },
   };
   return { observerRequest };
 }
@@ -169,5 +170,32 @@ describe('观察面板的 App 接线', () => {
     const input = await screen.findByLabelText('命令面板输入');
     fireEvent.change(input, { target: { value: '观察' } });
     expect(await screen.findByText('打开观察面板')).toBeTruthy();
+  });
+});
+
+describe('双 Agent 工作台与其他主区视图互斥', () => {
+  it.each([
+    { name: /⚙ 设置/ },
+    { name: /👁 观察/ },
+    { name: /📊 证据/ },
+  ])('打开工作台后点击 $name 会切换主区', async ({ name }) => {
+    installBridges();
+    window.repopilotWorkbench = {
+      protocolVersion: 1,
+      request: vi.fn(async (method) => {
+        if (method === 'workbench.probe') return { ok: true, data: { capabilities: [] } };
+        if (method === 'workbench.summary') return { ok: true, data: { projects: [] } };
+        return { ok: true, data: { sessions: [] } };
+      }) as WorkbenchBridge['request'],
+      subscribe: () => () => { },
+    };
+    render(<App />);
+    await screen.findByLabelText('状态栏');
+
+    fireEvent.click(screen.getByRole('button', { name: /⇄ 双 Agent/ }));
+    await screen.findByRole('region', { name: '双 Agent 工作台' });
+    fireEvent.click(screen.getByRole('button', { name }));
+
+    expect(screen.queryByRole('region', { name: '双 Agent 工作台' })).toBeNull();
   });
 });

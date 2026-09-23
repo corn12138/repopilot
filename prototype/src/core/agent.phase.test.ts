@@ -90,6 +90,7 @@ afterEach(() => {
 class RogueModel implements ModelInvoker {
   turn = 0;
   readonly attempted: string[] = [];
+  readonly routes: Array<{ purpose: string; resolutionId: string }> = [];
 
   async invoke(input: Parameters<ModelInvoker['invoke']>[0]) {
     // 真实 provider 会对孤儿 tool_use 返回 400，测试替身不会 —— 所以这里
@@ -97,6 +98,16 @@ class RogueModel implements ModelInvoker {
     const orphan = findWireViolation(input.request.messages);
     if (orphan) throw new Error(`${input.purpose} 调用收到非法消息序列：${orphan}`);
     this.turn += 1;
+    this.routes.push({ purpose: input.purpose, resolutionId: input.resolution.resolutionId });
+    input.onDispatch?.({
+      invocationId: `inv_phase_${this.turn}`,
+      sendAttempt: 1,
+      requestedAt: nowIso(),
+      purpose: input.purpose,
+      resolutionId: input.resolution.resolutionId,
+      providerId: input.resolution.providerId,
+      modelId: input.resolution.modelId,
+    });
     const last = JSON.stringify(input.request.messages.at(-1)?.content ?? '');
     let content: ContentBlock[];
 
@@ -186,7 +197,8 @@ class Recorder implements AgentHost {
       c.reason = reason;
     }
   }
-  chargeModelTurn(): void {}
+  reserveModelTurn(): void {}
+  settleModelTurn(): void {}
   chargeToolCall(): void {}
   chargeSelfFixRound(): void {}
   budgetExceeded(): { exceeded: boolean; reason: string } {
@@ -244,6 +256,15 @@ describe('规划阶段由平台强制只读', () => {
         frozenAt: nowIso(),
         digest: digestOf({ t: 1 }),
       },
+      plannerResolution: {
+        resolutionId: 'r-planner',
+        profileId: 'p-planner',
+        providerId: 'anthropic',
+        origin: 'https://planner.invalid/v1',
+        modelId: 'TEST_PLANNER',
+        frozenAt: nowIso(),
+        digest: digestOf({ t: 'planner' }),
+      },
       mutationPolicy: { ...DEFAULT_MUTATION_POLICY, allowedPaths: ['src/**'], protectedPaths: [] },
       runId,
       attemptId: newId('att'),
@@ -253,6 +274,8 @@ describe('规划阶段由平台强制只读', () => {
 
     // 前提：模型确实尝试了 —— 否则这条测试什么都没验证
     expect(model.attempted).toEqual(['workspace_mutate', 'run_command']);
+    expect(model.routes.filter((route) => route.purpose === 'PLANNING').every((route) => route.resolutionId === 'r-planner')).toBe(true);
+    expect(model.routes.filter((route) => route.purpose === 'EXECUTION').every((route) => route.resolutionId === 'r')).toBe(true);
 
     const denied = host.calls.filter((c) => c.resolution === 'DENIED');
     expect(denied.map((c) => c.toolName).sort()).toEqual(['run_command', 'workspace_mutate']);

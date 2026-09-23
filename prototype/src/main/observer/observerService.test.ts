@@ -10,6 +10,7 @@ import {
   mungeClaudeProjectDir,
   projectionLineOf,
   readCodexSessionCwd,
+  sessionLabelFromRecords,
 } from './observerService';
 
 /**
@@ -78,6 +79,57 @@ afterEach(() => {
 });
 
 describe('授权与会话发现', () => {
+  it('显示名从有限首条用户需求提取并脱敏，缺失时不用 UUID 冒充标题', () => {
+    expect(
+      sessionLabelFromRecords(
+        'CLAUDE_JOURNAL',
+        [{ type: 'user', message: { content: '修复登录 sk-test_abcdefghijklmnop\n补充说明' } }],
+        '2026-09-15T08:00:00.000Z',
+      ),
+    ).toEqual({ label: '修复登录 [凭据已隐藏]', source: 'FIRST_USER_REQUEST', charactersOmitted: 0 });
+    expect(sessionLabelFromRecords('CODEX_ROLLOUT', [], '2026-09-15T08:00:00.000Z')).toEqual({
+      label: '未命名会话 · 2026-09-15 08:00',
+      source: 'UNNAMED',
+      charactersOmitted: 0,
+    });
+  });
+
+  it('标题优先采用官方标题，并跳过注入的 AGENTS 与环境帧', () => {
+    expect(
+      sessionLabelFromRecords(
+        'CODEX_ROLLOUT',
+        [
+          { type: 'session_meta', payload: { title: '修复工作台导航' } },
+          { type: 'response_item', payload: { type: 'message', role: 'user', content: '# AGENTS.md instructions for /repo' } },
+        ],
+        '2026-09-15T08:00:00.000Z',
+      ),
+    ).toEqual({ label: '修复工作台导航', source: 'OFFICIAL_TITLE', charactersOmitted: 0 });
+    expect(
+      sessionLabelFromRecords(
+        'CODEX_ROLLOUT',
+        [
+          { type: 'response_item', payload: { type: 'message', role: 'user', content: '# AGENTS.md instructions for /repo' } },
+          { type: 'response_item', payload: { type: 'message', role: 'user', content: '<environment_context>...' } },
+          { type: 'response_item', payload: { type: 'message', role: 'user', content: '修复登录按钮' } },
+        ],
+        '2026-09-15T08:00:00.000Z',
+      ),
+    ).toEqual({ label: '修复登录按钮', source: 'FIRST_USER_REQUEST', charactersOmitted: 0 });
+  });
+
+  it('标题截断按实际 Unicode 字符数报告省略量', () => {
+    const title = `${'甲'.repeat(75)}🙂`;
+    const result = sessionLabelFromRecords(
+      'CODEX_ROLLOUT',
+      [{ type: 'session_meta', payload: { title } }],
+      '2026-09-15T08:00:00.000Z',
+    );
+
+    expect(result.label).toBe(`${'甲'.repeat(72)}…`);
+    expect(result.charactersOmitted).toBe(4);
+  });
+
   it('未授权时 listSessions/watch 一律 NOT_GRANTED —— 不是空列表，是拒绝', () => {
     expect(() => service.listSessions()).toThrow(ObserverError);
     expect(() => service.watch('CLAUDE_JOURNAL:x.jsonl')).toThrow(/尚未授权/);
@@ -129,14 +181,14 @@ describe('授权与会话发现', () => {
     );
     writeCodexRollout('rollout-desktop.jsonl', PROJECT, [], { originator: 'Codex Desktop', source: 'vscode' });
     const { sessions } = service.enable(PROJECT, PROJECT);
-    const sources = Object.fromEntries(sessions.map((s) => [s.label, s.source]));
+    const sources = Object.fromEntries(sessions.map((s) => [s.sessionId, s.source]));
     expect(sources).toMatchObject({
-      'claude-desktop': 'DESKTOP_LOCAL_AGENT',
-      'claude-cli': 'USER_CLI',
-      'claude-conflict': 'UNKNOWN',
-      'rollout-desktop': 'DESKTOP_LOCAL_AGENT',
+      'CLAUDE_JOURNAL:claude-desktop.jsonl': 'DESKTOP_LOCAL_AGENT',
+      'CLAUDE_JOURNAL:claude-cli.jsonl': 'USER_CLI',
+      'CLAUDE_JOURNAL:claude-conflict.jsonl': 'UNKNOWN',
+      'CODEX_ROLLOUT:2026/09/02/rollout-desktop.jsonl': 'DESKTOP_LOCAL_AGENT',
     });
-    expect(sessions.find((s) => s.label === 'claude-conflict')?.sourceEvidence).toContain('来源字段互相冲突');
+    expect(sessions.find((s) => s.sessionId.endsWith('claude-conflict.jsonl'))?.sourceEvidence).toContain('来源字段互相冲突');
   });
 
   it('列表用有限尾部给出导航完成态；文件变化后缓存失效，后续 user 会把待输入降回运行中', () => {
@@ -153,11 +205,13 @@ describe('授权与会话发现', () => {
     );
 
     let sessions = service.enable(PROJECT, PROJECT).sessions;
-    expect(sessions.find((s) => s.label === 'claude-ready')?.completion).toEqual({
+    const ready = sessions.find((s) => s.sessionId.endsWith('claude-ready.jsonl'))!;
+    expect(ready.completion).toEqual({
       state: 'READY_TO_HANDOFF',
       evidence: ['message.stop_reason=end_turn'],
     });
-    expect(sessions.find((s) => s.label === 'rollout-ready')?.completion.state).toBe('READY_TO_HANDOFF');
+    expect(ready.attentionEventId).toMatch(/^sha256:/);
+    expect(sessions.find((s) => s.sessionId.endsWith('rollout-ready.jsonl'))?.completion.state).toBe('READY_TO_HANDOFF');
 
     writeClaudeSession(
       'claude-ready.jsonl',
@@ -168,10 +222,34 @@ describe('授权与会话发现', () => {
       2_000,
     );
     sessions = service.listSessions().sessions;
-    expect(sessions.find((s) => s.label === 'claude-ready')?.completion).toEqual({
+    expect(sessions.find((s) => s.sessionId.endsWith('claude-ready.jsonl'))?.completion).toEqual({
       state: 'RUNNING',
       evidence: ['最后一个意图记录为 user'],
     });
+  });
+
+  it('仅追加非完成元数据不会生成新的注意事件身份', () => {
+    const completed = j({
+      type: 'assistant',
+      entrypoint: 'claude-desktop',
+      message: { content: 'done', stop_reason: 'end_turn' },
+    });
+    writeClaudeSession('claude-stable.jsonl', [completed], 1_000);
+    const first = service.enable(PROJECT, PROJECT).sessions.find(
+      (session) => session.sessionId.endsWith('claude-stable.jsonl'),
+    )!;
+
+    writeClaudeSession(
+      'claude-stable.jsonl',
+      [completed, j({ type: 'system', subtype: 'token_count', value: 12 })],
+      2_000,
+    );
+    const second = service.listSessions().sessions.find(
+      (session) => session.sessionId.endsWith('claude-stable.jsonl'),
+    )!;
+
+    expect(second.updatedAt).not.toBe(first.updatedAt);
+    expect(second.attentionEventId).toBe(first.attentionEventId);
   });
 });
 
@@ -442,7 +520,10 @@ describe('边界与对抗输入', () => {
     writeFileSync(join(dir, 'real.jsonl'), `${j({ type: 'spec' })}\n`);
     symlinkSync(join(dir, 'real.jsonl'), join(dir, 'link.jsonl'));
     const { sessions } = service.enable(PROJECT, PROJECT);
-    expect(sessions.map((s) => s.label).sort()).toEqual(['crlf', 'real']);
+    expect(sessions.map((s) => s.sessionId).sort()).toEqual([
+      'CLAUDE_JOURNAL:crlf.jsonl',
+      'CLAUDE_JOURNAL:real.jsonl',
+    ]);
 
     service.watch('CLAUDE_JOURNAL:crlf.jsonl');
     const ev = events.findLast((e) => e.kind === 'observer.projection');

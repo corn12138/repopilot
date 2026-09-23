@@ -210,9 +210,14 @@ describe('invoke: 有界同 route 重试 + 单次尝试超时', () => {
   it('连接被拒一次后成功：第 2 次尝试返回，第 1 次独立落账且如实 sent=false', async () => {
     const fetchMock = scriptFetch([connRefused(), ok()]);
     const gw = new ModelGateway(FAST);
-    const out = await gw.invoke(makeInput(gw));
+    const dispatched: number[] = [];
+    const out = await gw.invoke({
+      ...makeInput(gw),
+      onDispatch: (attempt) => dispatched.push(attempt.sendAttempt),
+    });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(dispatched).toEqual([1, 2]);
     expect(out.response.inputTokens).toBe(3);
     expect(out.manifest.sendAttempt).toBe(2);
     expect(out.manifest.sendState).toBe('RESPONDED');
@@ -229,6 +234,20 @@ describe('invoke: 有界同 route 重试 + 单次尝试超时', () => {
     expect(mid[0]!.stopReason).toBeUndefined();
     // 中间尝试与最终结果共享同一 invocationId —— 是同一次调用的多次发送
     expect(mid[0]!.invocationId).toBe(out.invocationId);
+  });
+
+  it('派发前持久化回调失败：一次请求都不发送，也不包装成可重试网络错误', async () => {
+    const fetchMock = scriptFetch([ok()]);
+    const gw = new ModelGateway(FAST);
+    const failure = new Error('state persistence failed');
+
+    const error = await gw.invoke({
+      ...makeInput(gw),
+      onDispatch: () => { throw failure; },
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBe(failure);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   /*

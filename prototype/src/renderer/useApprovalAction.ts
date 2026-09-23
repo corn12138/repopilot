@@ -22,6 +22,7 @@ export interface ApprovalActionError extends ApprovalActionTarget {
 export type ApprovalDecisionInvoker = (
   approval: ApprovalRequest,
   decision: ApprovalDecisionKind,
+  note?: string,
 ) => Promise<ResponsePayload<'approval.decide'>>;
 
 interface ApprovalActionState {
@@ -39,6 +40,7 @@ interface FailedAction {
   readonly scope: ActionScope;
   readonly approval: ApprovalRequest;
   readonly decision: ApprovalDecisionKind;
+  readonly note: string;
 }
 
 interface InFlightAction {
@@ -51,12 +53,12 @@ class ApprovalNotAcceptedError extends Error {
   readonly code = 'NOT_ACCEPTED';
 }
 
-const defaultInvoker: ApprovalDecisionInvoker = (approval, decision) =>
+const defaultInvoker: ApprovalDecisionInvoker = (approval, decision, note = '') =>
   call('approval.decide', {
     approvalId: approval.approvalId,
     decision,
     subjectDigest: approval.subjectDigest,
-    note: '',
+    note,
   });
 
 function emptyState(ownerRunId: string | null): ApprovalActionState {
@@ -130,7 +132,7 @@ export function useApprovalAction(
   }, [ownerRunId]);
 
   const decide = useCallback(
-    (approval: ApprovalRequest, decision: ApprovalDecisionKind): Promise<boolean> => {
+    (approval: ApprovalRequest, decision: ApprovalDecisionKind, note = ''): Promise<boolean> => {
       const scope = scopeRef.current;
       const target: ApprovalActionTarget = { approvalId: approval.approvalId, decision };
 
@@ -185,7 +187,9 @@ export function useApprovalAction(
        */
       let invocation: Promise<ResponsePayload<'approval.decide'>>;
       try {
-        invocation = Promise.resolve(invoke(approval, decision));
+        invocation = Promise.resolve(
+          note.length > 0 ? invoke(approval, decision, note) : invoke(approval, decision),
+        );
       } catch (caught) {
         invocation = Promise.reject(caught);
       }
@@ -202,7 +206,7 @@ export function useApprovalAction(
         } catch (caught) {
           if (scopeRef.current !== scope) return false;
           const error = failureFrom(caught, ownerRunId, target);
-          failedRef.current = { scope, approval, decision };
+          failedRef.current = { scope, approval, decision, note };
           setState((previous) =>
             previous.ownerRunId === ownerRunId ? { ...previous, error } : previous,
           );
@@ -236,7 +240,7 @@ export function useApprovalAction(
   const retry = useCallback((): Promise<boolean> => {
     const failed = failedRef.current;
     if (failed === null || failed.scope !== scopeRef.current) return Promise.resolve(false);
-    return decide(failed.approval, failed.decision);
+    return decide(failed.approval, failed.decision, failed.note);
   }, [decide]);
 
   const clearError = useCallback(() => {

@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { digestOf } from '@shared/ids';
 
 // 受管数据根重定向到进程私有临时目录（与 authority.e2e.test.ts 同一手法）
 vi.mock('./paths', async () => {
@@ -174,6 +175,7 @@ class Harness {
     reviewerModelProfileId?: string;
     reviewerConnectorId?: string;
     allowedPaths?: string[];
+    collaborationMode?: 'MANUAL_HANDOFF' | 'BOUNDED_AUTO';
   }): Promise<{ runId: string }> {
     const reg = await this.call<{ project: { projectId: string } }>('__project.register', { hostPath: input.hostPath });
     const imported = await this.call<{
@@ -188,6 +190,7 @@ class Harness {
       ...(input.authorConnectorId ? { authorConnectorId: input.authorConnectorId } : {}),
       ...(input.reviewerModelProfileId ? { reviewerModelProfileId: input.reviewerModelProfileId } : {}),
       ...(input.reviewerConnectorId ? { reviewerConnectorId: input.reviewerConnectorId } : {}),
+      ...(input.collaborationMode ? { plannerModelProfileId: 'profile_deepseek', collaborationMode: input.collaborationMode } : {}),
     });
     const { run } = await this.call<{ run: RunView }>('task.create', {
       projectId: reg.project.projectId,
@@ -204,6 +207,7 @@ class Harness {
       ...(input.authorConnectorId ? { authorConnectorId: input.authorConnectorId } : {}),
       ...(input.reviewerModelProfileId ? { reviewerModelProfileId: input.reviewerModelProfileId } : {}),
       ...(input.reviewerConnectorId ? { reviewerConnectorId: input.reviewerConnectorId } : {}),
+      ...(input.collaborationMode ? { plannerModelProfileId: 'profile_deepseek', collaborationMode: input.collaborationMode } : {}),
     });
     return { runId: run.runId };
   }
@@ -366,7 +370,16 @@ describe('外部作者 e2e：Codex 写、平台归一化、真验证、人收口
               },
             ],
           }),
-        () => oaToolCall('submit_review', { verdict: 'PASS', findings: [] }),
+        () => oaToolCall('submit_review', {
+          verdict: 'PASS',
+          findings: [],
+          resolvedFindingFingerprints: [digestOf({
+            severity: 'HIGH',
+            file: APP_FILE,
+            range: [1, 1],
+            evidence: '修复缺少说明注释，无法审计意图',
+          })],
+        }),
       ]);
       const hostPath = makeFixtureRepo();
       const { runId } = await harness.createRun({
@@ -501,6 +514,18 @@ describe('外部作者 e2e：Codex 写、平台归一化、真验证、人收口
     await expect(
       harness.createRun({ hostPath, authorConnectorId: 'codex-cli', reviewerModelProfileId: 'profile_openai' }),
     ).rejects.toThrow(/同为 OPENAI|异构/);
+  });
+
+  it('原生引擎角色未证明逐工具治理时拒绝进入双 Agent 协作', async () => {
+    installFakeCodex('true');
+    const hostPath = makeFixtureRepo();
+    process.env.MOONSHOT_API_KEY = 'sk-e2e-reviewer';
+    await expect(harness.createRun({
+      hostPath,
+      authorConnectorId: 'codex-cli',
+      reviewerModelProfileId: 'profile_moonshot-cn',
+      collaborationMode: 'BOUNDED_AUTO',
+    })).rejects.toThrow(/工具治理准入/);
   });
 
   it('连接器不可用时 task.create 拒绝，而不是悄悄换成内部模型去写', async () => {

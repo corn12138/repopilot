@@ -25,6 +25,8 @@ export interface DisclosureInput {
   readonly snapshotId: string;
   readonly snapshotFileCount: number;
   readonly implementer: { profile: ModelConnectionProfile; resolution: ModelRouteResolution };
+  /** 缺失表示旧任务仍由 implementer route 承担规划，不改变历史披露语义。 */
+  readonly planner?: { profile: ModelConnectionProfile; resolution: ModelRouteResolution } | null;
   readonly reviewer:
     | { kind: 'MODEL_API'; profile: ModelConnectionProfile; resolution: ModelRouteResolution }
     | { kind: 'EXTERNAL_CLI'; connector: ExternalConnectorProfile }
@@ -45,6 +47,11 @@ const IMPLEMENTER_CLASSES: readonly EgressDataClass[] = [
   'COMMAND_OUTPUT',
   'REVIEW_FINDINGS',
 ];
+const PLANNER_CLASSES: readonly EgressDataClass[] = [
+  'TASK_TEXT',
+  'REPOSITORY_SNAPSHOT_EXCERPTS',
+  'COMMAND_OUTPUT',
+];
 const REVIEWER_CLASSES: readonly EgressDataClass[] = ['TASK_TEXT', 'PATCH_DIFF', 'COMMAND_OUTPUT'];
 const AUTHOR_CLI_CLASSES: readonly EgressDataClass[] = [
   'TASK_TEXT',
@@ -57,6 +64,20 @@ export function buildDisclosure(input: DisclosureInput): DataEgressDisclosure {
   const destinations: EgressDestination[] = [];
   const classes = (base: readonly EgressDataClass[]): readonly EgressDataClass[] =>
     input.handoffDigest ? [...base, 'OBSERVED_SESSION_HANDOFF'] : base;
+  if (input.planner) {
+    const p = input.planner;
+    destinations.push({
+      role: 'PLANNER',
+      channel: 'MODEL_API',
+      label: `${p.profile.label} · ${p.resolution.modelId}`,
+      providerId: p.resolution.providerId,
+      origin: p.resolution.origin,
+      isRelay: p.profile.isRelay || p.profile.kind === 'RELAY',
+      modelId: p.resolution.modelId,
+      resolutionDigest: p.resolution.digest,
+      dataClasses: classes(PLANNER_CLASSES),
+    });
+  }
   const impl = input.implementer;
   destinations.push({
     role: 'IMPLEMENTER',

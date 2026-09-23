@@ -538,6 +538,7 @@ export interface ExternalInvocationManifest {
 export interface ExternalReviewSubmission {
   readonly verdict: CrossReviewVerdict;
   readonly findings: readonly Record<string, unknown>[];
+  readonly resolvedFindingFingerprints: readonly string[];
 }
 
 export interface ExternalReviewResult {
@@ -596,7 +597,7 @@ export function parseReviewOutput(raw: string): ExternalReviewSubmission | null 
     } catch {
       continue;
     }
-    const obj = parsed as { verdict?: unknown; findings?: unknown };
+    const obj = parsed as { verdict?: unknown; findings?: unknown; resolvedFindingFingerprints?: unknown };
     const verdict = obj?.verdict;
     if (verdict !== 'PASS' && verdict !== 'CHANGES_REQUESTED' && verdict !== 'INCONCLUSIVE') {
       continue;
@@ -616,7 +617,14 @@ export function parseReviewOutput(raw: string): ExternalReviewSubmission | null 
     const findingsUnreadable =
       (obj.findings !== undefined && !Array.isArray(obj.findings)) || findings.length !== raw.length;
     if (findingsUnreadable && verdict !== 'PASS') continue;
-    return { verdict, findings };
+    const resolvedFindingFingerprints = Array.isArray(obj.resolvedFindingFingerprints)
+      ? obj.resolvedFindingFingerprints.filter((value): value is string => typeof value === 'string')
+      : [];
+    if (
+      obj.resolvedFindingFingerprints !== undefined
+      && resolvedFindingFingerprints.length !== (obj.resolvedFindingFingerprints as unknown[]).length
+    ) continue;
+    return { verdict, findings, resolvedFindingFingerprints };
   }
   return null;
 }
@@ -633,7 +641,7 @@ export function renderCliReviewPrompt(brief: string): string {
   {"severity":"INFO|LOW|MEDIUM|HIGH|CRITICAL","confidence":0.0-1.0,
    "file":"相对路径","startLine":1,"endLine":1,
    "evidence":"你依据的具体事实","blocking":true|false}
-]}
+],"resolvedFindingFingerprints":["上一轮已确认修复的 finding fingerprint"]}
 
 规则：
 - 没有阻断问题就用 PASS，findings 可以为空数组。
