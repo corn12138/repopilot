@@ -1,3 +1,4 @@
+import { sha256 } from '@shared/ids';
 import {
   existsSync,
   lstatSync,
@@ -11,7 +12,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { sha256 } from '@shared/ids';
+import { snapshotDir } from './paths';
 import {
   MaterializedWorkspace,
   PathViolation,
@@ -20,7 +21,6 @@ import {
   listTree,
   resolveManaged,
 } from './workspace';
-import { snapshotDir } from './paths';
 
 /**
  * MaterializedWorkspace 自身的语义测试（mutation 引擎由 mutation.test.ts 覆盖）。
@@ -702,12 +702,17 @@ describe('isGeneratedPath', () => {
     ['.turbo/log.txt', true],
     ['.next/static/x.js', true],
     ['node_modules/react/index.js', true],
-    // 下面这些必须是 false：吞掉它们等于丢用户代码
+    // 名为 dist/build 的目录段在任意深度都是构建产物（含 monorepo 嵌套）——
+    // 整段匹配而非子串；仍逐条进 excludedGeneratedFiles 报数，不构成静默省略（不变式 8）
+    ['src/dist/bundle.js', true],
+    ['packages/foo/dist/bundle.js', true],
+    ['apps/web/build/main.js', true],
+    // 下面这些必须是 false：吞掉它们等于丢用户代码（前缀相似但目录段不同）
     ['distribution/plan.ts', false],
     ['distance.ts', false],
     ['outbound/mail.ts', false],
     ['builder/config.ts', false],
-    ['src/dist/bundle.js', false],
+    ['src/dist-helper.ts', false],
     ['src/app.ts', false],
     ['', false],
   ])('%s → %s', (path, expected) => {

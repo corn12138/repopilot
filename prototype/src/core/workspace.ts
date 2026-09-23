@@ -1,3 +1,5 @@
+import type { Digest, MutationReadReceipt } from '@shared/domain';
+import { digestOf, newId, nowIso, sha256 } from '@shared/ids';
 import { execFileSync } from 'node:child_process';
 import {
   cpSync,
@@ -11,8 +13,7 @@ import {
   symlinkSync,
 } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
-import type { Digest, MutationReadReceipt } from '@shared/domain';
-import { digestOf, newId, nowIso, sha256 } from '@shared/ids';
+import { isGeneratedFile } from './classify';
 import { snapshotDir, workspaceDir } from './paths';
 
 const RECEIPT_TTL_MS = 15 * 60 * 1000;
@@ -39,7 +40,7 @@ export class MaterializedWorkspace {
     readonly root: string,
     /** 宿主仓库路径，只用于只读复用已安装依赖；不用于任何写入 */
     private readonly hostRepoPath: string | null,
-  ) {}
+  ) { }
 
   static create(
     runId: string,
@@ -344,9 +345,15 @@ export function resolveManaged(root: string, relPath: string): string {
   return abs;
 }
 
-/** 由构建/测试命令产出，而非 Agent 编辑意图的路径 */
+/**
+ * 是否为构建产物 / 生成代码 / lockfile —— 这类**硬排除**出补丁正文（进 `excludedGeneratedFiles` 报数）。
+ *
+ * 判据在 `classify.ts`：目录整段匹配（任意深度，含 monorepo 嵌套 `packages/foo/dist/`）∪ lockfile
+ * 精确文件名 ∪ 压缩/打包后缀 ∪ 生成代码文件名形状。刻意比 Claude 保守（不含 vendored 目录、
+ * 不含 `.d.ts`、不含 `.snap`），因为这里是硬排除、误判即静默丢用户代码 —— 详见 classify.ts 文件头。
+ */
 export function isGeneratedPath(relPath: string): boolean {
-  return /^(dist|build|out|coverage|\.vite|\.turbo|\.next|node_modules)(\/|$)/.test(relPath);
+  return isGeneratedFile(relPath);
 }
 
 export class PathViolation extends Error {
